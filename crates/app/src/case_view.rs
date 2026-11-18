@@ -1,7 +1,8 @@
-//! Draws the PC case: a panel of fan circles whose fill and speed wedge
-//! reflect each fan's commanded speed, coloured by airflow direction.
+//! Draws the PC case: fan shapes whose fill reflects each fan's
+//! commanded speed, coloured by airflow direction — circles for fan
+//! headers, a card-like rectangle for a whole graphics cooler.
 //!
-//! Dragging a fan circle moves it on the canvas (kept in the engine and
+//! Dragging a fan shape moves it on the canvas (kept in the engine and
 //! persisted by Save config).
 
 use biggest_fan_core as core;
@@ -55,7 +56,12 @@ pub fn install(engine_rc: Rc<RefCell<core::Engine>>) -> DrawingArea {
         if let Some(view) = engine.case_fans().into_iter().find(|view| {
             let dx = view.slot.x - canvas_x;
             let dy = view.slot.y - canvas_y;
-            dx.hypot(dy) <= view.slot.diameter / 2.0
+            if view.slot.is_rectangular() {
+                let (half_width, half_height) = view.slot.half_extents();
+                dx.abs() <= half_width && dy.abs() <= half_height
+            } else {
+                dx.hypot(dy) <= view.slot.diameter / 2.0
+            }
         }) {
             *begin_drag.borrow_mut() = Some((view.id, view.slot));
         }
@@ -79,11 +85,12 @@ pub fn install(engine_rc: Rc<RefCell<core::Engine>>) -> DrawingArea {
             f64::from(update_area.height()),
             case,
         );
-        let radius = start.diameter / 2.0;
+        let (half_width, half_height) = start.half_extents();
         let slot = core::FanSlot {
-            x: (start.x + offset_x / scale).clamp(radius, case.width - radius),
-            y: (start.y + offset_y / scale).clamp(radius, case.height - radius),
+            x: (start.x + offset_x / scale).clamp(half_width, case.width - half_width),
+            y: (start.y + offset_y / scale).clamp(half_height, case.height - half_height),
             diameter: start.diameter,
+            rect: start.rect,
             airflow: start.airflow,
         };
         if engine.set_fan_slot(&fan_id, slot).is_err() {
@@ -159,6 +166,10 @@ fn draw(engine: &core::Engine, cr: &cairo::Context, width: f64, height: f64) {
 }
 
 fn draw_fan(cr: &cairo::Context, view: &core::CaseFanView) {
+    if view.slot.is_rectangular() {
+        draw_card(cr, view);
+        return;
+    }
     let (red, green, blue) = airflow_colour(view.slot.airflow);
     let (cx, cy) = (view.slot.x, view.slot.y);
     let radius = view.slot.diameter / 2.0;
@@ -219,6 +230,99 @@ fn draw_fan(cr: &cairo::Context, view: &core::CaseFanView) {
         cr.set_source_rgb(0.95, 0.75, 0.20);
         cr.set_font_size(12.0);
         let _ = draw_centered(cr, cx, cy - radius - 6.0, "⚠");
+    }
+}
+
+/// Draws a whole rectangular object (a graphics-card cooler): the card
+/// body brightens with the commanded speed, decorative cooler fans sit
+/// across it, and the name/percent ride in the middle.
+fn draw_card(cr: &cairo::Context, view: &core::CaseFanView) {
+    let (red, green, blue) = airflow_colour(view.slot.airflow);
+    let (width, height) = view
+        .slot
+        .rect
+        .unwrap_or((view.slot.diameter, view.slot.diameter));
+    let (left, top) = (view.slot.x - width / 2.0, view.slot.y - height / 2.0);
+
+    // Card body, brighter as the cooler spins faster.
+    cr.set_source_rgba(red, green, blue, 0.45_f64.mul_add(view.speed, 0.15));
+    rounded_rect(cr, left, top, width, height, 8.0);
+    let _ = cr.fill_preserve();
+    cr.set_source_rgb(red, green, blue);
+    cr.set_line_width(1.4);
+    let _ = cr.stroke();
+
+    // Decorative cooler fans, spaced across the card's width.
+    let fan_count = (width / 110.0).round().clamp(1.0, 3.0);
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "already clamped to 1..=3"
+    )]
+    let cooler_fans = fan_count as usize;
+    let fan_radius = (height / 2.0 - 10.0).max(4.0);
+    cr.set_source_rgba(red, green, blue, 0.5_f64.mul_add(view.speed, 0.2));
+    for index in 0..cooler_fans {
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "index and fan count are tiny integers"
+        )]
+        let fraction = (index as f64 + 0.5) / fan_count;
+        let centre_x = fraction.mul_add(width, left);
+        circle(cr, centre_x, view.slot.y, fan_radius.min(width / 2.0 - 4.0));
+        let _ = cr.fill_preserve();
+        cr.set_source_rgb(red, green, blue);
+        cr.set_line_width(1.0);
+        let _ = cr.stroke();
+        // Same speed wedge as a plain fan circle, so one glance shows
+        // how fast the cooler is running.
+        if view.speed > 0.005 && fan_radius > 8.0 {
+            cr.set_source_rgba(red, green, blue, 0.9);
+            cr.move_to(centre_x, view.slot.y);
+            cr.arc(
+                centre_x,
+                view.slot.y,
+                fan_radius * 0.72,
+                -std::f64::consts::FRAC_PI_2,
+                TAU.mul_add(view.speed, -std::f64::consts::FRAC_PI_2),
+            );
+            cr.close_path();
+            let _ = cr.fill();
+        }
+    }
+
+    // Name near the top edge, percent near the bottom.
+    cr.select_font_face(
+        "sans-serif",
+        cairo::FontSlant::Normal,
+        cairo::FontWeight::Normal,
+    );
+    cr.set_source_rgb(0.85, 0.85, 0.88);
+    let font_size = (height / 5.0).clamp(9.0, 15.0);
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "clamped to a small positive range first"
+    )]
+    let name_chars = (width / 7.0).clamp(4.0, 32.0) as usize;
+    cr.set_font_size(font_size);
+    let short_name = clip(&view.name, name_chars);
+    let _ = draw_centered(cr, view.slot.x, top + font_size + 4.0, &short_name);
+    let percent = format!("{:.0}%", view.speed * 100.0);
+    let _ = draw_centered(cr, view.slot.x, top + height - 6.0, &percent);
+    if let Some(rpm) = view.rpm {
+        cr.set_font_size(10.0);
+        let _ = draw_centered(
+            cr,
+            view.slot.x,
+            top + height + 12.0,
+            &format!("{rpm:.0} RPM"),
+        );
+    }
+    if view.note.is_some() {
+        cr.set_source_rgb(0.95, 0.75, 0.20);
+        cr.set_font_size(12.0);
+        let _ = draw_centered(cr, view.slot.x, top - 6.0, "⚠");
     }
 }
 

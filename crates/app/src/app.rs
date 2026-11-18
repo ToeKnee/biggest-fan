@@ -8,8 +8,8 @@ use biggest_fan_core as core;
 use glib::{ControlFlow, SourceId};
 use gtk4::prelude::*;
 use gtk4::{
-    Application, ApplicationWindow, Box as GtkBox, Button, HeaderBar, Label, ListBox, ListBoxRow,
-    Orientation, PolicyType, ScrolledWindow, SpinButton, gio,
+    Application, ApplicationWindow, Box as GtkBox, Button, ComboBoxText, HeaderBar, Label, ListBox,
+    ListBoxRow, Orientation, PolicyType, ScrolledWindow, SpinButton, gio,
 };
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -20,7 +20,13 @@ use std::time::Duration;
 /// Everything the periodic tick needs to touch.
 struct GuiState {
     engine: Rc<RefCell<core::Engine>>,
-    fan_controls: Vec<FanControls>,
+    /// Fan rows, in panel order; "Add fan" appends more at runtime.
+    fan_controls: RefCell<Vec<FanControls>>,
+    /// The box fan rows live in (new rows are appended to it).
+    fans_box: GtkBox,
+    /// Unmanaged headers offered by "Add fan", and its button.
+    unclaimed_combo: ComboBoxText,
+    add_button: Button,
     /// Display name and value label for each sensor row.
     sensor_rows: BTreeMap<core::SensorId, (String, Label)>,
     case_area: gtk4::DrawingArea,
@@ -94,17 +100,14 @@ fn build_window(
     // `pack_end` stacks right-to-left, so this puts Detect left of Save.
     header.pack_end(&save_button);
     header.pack_end(&detect_button);
-    let badge = Label::builder()
-        .label("via the running service (root)")
-        .build();
-    header.pack_start(&badge);
     window.set_titlebar(Some(&header));
-    window.set_title(Some("Biggest Fan — changes go through the running service"));
 
     // Left: the case drawing plus a short legend.
     let case_area = case_view::install(Rc::clone(engine_rc));
     let legend = Label::builder()
-        .label("Circles: blue intake · red exhaust · yellow internal.\nThe wedge shows commanded speed.")
+        .label(
+            "Circles: blue intake · red exhaust · yellow internal.\nA rectangle is a whole graphics card.\nThe wedge shows commanded speed.",
+        )
         .wrap(true)
         .max_width_chars(38)
         .build();
@@ -118,7 +121,7 @@ fn build_window(
 
     // Right: fan control rows and the sensor list.
     let right = GtkBox::new(Orientation::Vertical, 12);
-    let fan_controls = append_fans_panel(&right, engine_rc, &case_area, client);
+    let fan_panel = append_fans_panel(&right, engine_rc, &case_area, client);
     let sensor_rows = append_sensors_panel(&right, engine_rc);
     let right_scroll = ScrolledWindow::builder()
         .vexpand(true)
@@ -158,13 +161,21 @@ fn build_window(
     bottom.append(&status_label);
 
     let root = GtkBox::new(Orientation::Vertical, 6);
+    // Keep panels off the window edges.
+    root.set_margin_start(12);
+    root.set_margin_end(12);
+    root.set_margin_top(12);
+    root.set_margin_bottom(12);
     root.append(&paned);
     root.append(&bottom);
     window.set_child(Some(&root));
 
     let state = Rc::new(GuiState {
         engine: Rc::clone(engine_rc),
-        fan_controls,
+        fan_controls: RefCell::new(fan_panel.controls),
+        fans_box: fan_panel.fans_box,
+        unclaimed_combo: fan_panel.unclaimed_combo,
+        add_button: fan_panel.add_button,
         sensor_rows,
         case_area,
         status_label,
@@ -173,6 +184,14 @@ fn build_window(
     });
     let tick_source = Rc::new(RefCell::new(None::<SourceId>));
     schedule_tick(&state, &tick_source);
+
+    // Add fan: take a header the machine exposes but no fan drives yet
+    // (a parked one, or a graphics-card cooler missing from an older
+    // config) under management.
+    let add_state = Rc::clone(&state);
+    state
+        .add_button
+        .connect_clicked(move |_| on_add_fan_clicked(&add_state));
 
     // Detect fans: spin every header up briefly and disable the ones with
     // nothing connected (no RPM) or whose driver refuses the spin-up.
@@ -207,12 +226,62 @@ fn on_detect_clicked(state: &GuiState) {
 
 /// Hides the control rows of fans that left the managed set.
 fn hide_control_rows(state: &GuiState, ids: &[core::FanId]) {
-    for controls in &state.fan_controls {
+    for controls in state.fan_controls.borrow().iter() {
         if ids.contains(controls.fan_id()) {
             controls.container.set_visible(false);
         }
     }
     state.case_area.queue_draw();
+}
+
+/// Takes a discovered-but-unmanaged header (for example the
+/// graphics-card cooler missing from a config written before GPU
+/// coolers existed, or a header detection had parked) under
+/// management: the mirror engine adopts it at once, the service is
+/// asked to do the same and save, and a control row appears
+/// immediately.
+fn on_add_fan_clicked(state: &GuiState) {
+    let Some(header_id) = state.unclaimed_combo.active_id() else {
+        return;
+    };
+    let fan_id = core::FanId::new(header_id.to_string());
+    let display_name = {
+        let mut engine = state.engine.borrow_mut();
+        match engine.add_fan(&fan_id) {
+            Ok(()) => engine
+                .managed_fans()
+                .into_iter()
+                .find(|(managed_id, _)| *managed_id == fan_id)
+                .map_or_else(|| header_id.to_string(), |(_, name)| name),
+            Err(error) => {
+                state
+                    .status_label
+                    .set_text(&format!("could not add {fan_id}: {error}"));
+                return;
+            }
+        }
+    };
+    state.client.send(dbus::FanRequest::AddFan {
+        fan: fan_id.to_string(),
+    });
+    let controls = FanControls::new(
+        &state.engine,
+        &fan_id,
+        &display_name,
+        &state.case_area,
+        &state.client,
+    );
+    state.fans_box.append(&controls.container);
+    state.fan_controls.borrow_mut().push(controls);
+    populate_addable_headers(
+        &state.unclaimed_combo,
+        &state.add_button,
+        &state.engine.borrow(),
+    );
+    state.case_area.queue_draw();
+    state.status_label.set_text(&format!(
+        "{display_name} added — the service has taken over its header"
+    ));
 }
 
 /// Asks the service to apply and save the GUI's current config (mode and
@@ -286,14 +355,23 @@ fn wire_interval_spin(
     });
 }
 
-/// Appends the fan section (header + one control row per managed fan
-/// group) to `panel`, returning the controls for live updates.
+/// The "Fans" panel: one control row per managed fan group (in a box new
+/// rows can be appended to) with an "add a fan header" row underneath.
+struct FanPanel {
+    controls: Vec<FanControls>,
+    fans_box: GtkBox,
+    unclaimed_combo: ComboBoxText,
+    add_button: Button,
+}
+
+/// Appends the fan section (header, one control row per managed fan
+/// group, then the add row under them all) to `panel`.
 fn append_fans_panel(
     panel: &GtkBox,
     engine_rc: &Rc<RefCell<core::Engine>>,
     case_area: &gtk4::DrawingArea,
     client: &dbus::Client,
-) -> Vec<FanControls> {
+) -> FanPanel {
     panel.append(
         &Label::builder()
             .label("<b>Fans</b>")
@@ -301,14 +379,53 @@ fn append_fans_panel(
             .xalign(0.0)
             .build(),
     );
+    let fans_box = GtkBox::new(Orientation::Vertical, 12);
+    panel.append(&fans_box);
     let fan_ids_and_names = engine_rc.borrow().managed_fans();
     let mut fan_controls = Vec::new();
     for (fan_id, name) in fan_ids_and_names {
         let controls = FanControls::new(engine_rc, &fan_id, &name, case_area, client);
-        panel.append(&controls.container);
+        fans_box.append(&controls.container);
         fan_controls.push(controls);
     }
-    fan_controls
+    // The add row sits below the existing fans: new rows join the list
+    // above it, and adding is a rare setup action, not the panel's focus.
+    let add_row = GtkBox::new(Orientation::Horizontal, 8);
+    let unclaimed_combo = ComboBoxText::new();
+    let add_button = Button::builder()
+        .label("Add fan")
+        .tooltip_text("take over a fan header nothing drives yet (also revives parked ones)")
+        .build();
+    add_row.append(&Label::builder().label("add:").build());
+    add_row.append(&unclaimed_combo);
+    add_row.append(&add_button);
+    panel.append(&add_row);
+    let panel = FanPanel {
+        controls: fan_controls,
+        fans_box,
+        unclaimed_combo,
+        add_button,
+    };
+    populate_addable_headers(
+        &panel.unclaimed_combo,
+        &panel.add_button,
+        &engine_rc.borrow(),
+    );
+    panel
+}
+
+/// Refills the "add fan" dropdown with headers no managed fan drives
+/// yet; the button only works while there is something to add.
+fn populate_addable_headers(combo: &ComboBoxText, button: &Button, engine: &core::Engine) {
+    combo.remove_all();
+    let headers = engine.unclaimed_headers();
+    for header in &headers {
+        combo.append(Some(header.id.as_str()), &header.default_name);
+    }
+    if !headers.is_empty() {
+        combo.set_active(Some(0));
+    }
+    button.set_sensitive(!headers.is_empty());
 }
 
 /// Appends the sensor section (header + readout per discovered sensor)
@@ -370,7 +487,7 @@ fn tick_once(state: &GuiState) {
     };
 
     let mut notes = Vec::new();
-    for controls in &state.fan_controls {
+    for controls in state.fan_controls.borrow().iter() {
         match report.fans.iter().find(|fan| fan.id == *controls.fan_id()) {
             Some(status) => {
                 controls.update(status);

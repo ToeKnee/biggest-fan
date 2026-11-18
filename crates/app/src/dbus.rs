@@ -27,7 +27,7 @@ pub const BUS_NAME: &str = "net.ynottony.ten.biggestfan";
 pub const OBJECT_PATH: &str = "/net/ynottony/ten/biggestfan";
 
 /// A change the GUI asks the running service to apply to its engine.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum FanRequest {
     /// Set one fan group's mode; `mode_json` is a [`core::FanMode`] in
     /// JSON, the same shape the config file writes.
@@ -51,15 +51,30 @@ pub enum FanRequest {
         /// New display name; empty restores the hardware default.
         name: String,
     },
-    /// Correct a tachometer that reports double (or half).
+    /// Corrects a tachometer that reports double (or half).
     SetRpmFactor {
         /// Fan group id.
         fan: String,
         /// Measured RPM is multiplied by this.
         factor: f64,
     },
+    /// Sets a fan's speed floor: the smallest fraction the engine may command
+    /// in fixed or auto mode, for something that must keep turning (an AIO
+    /// pump). _Off_ mode still stops the fan.
+    SetMinSpeed {
+        /// Fan group id.
+        fan: String,
+        /// Floor as a fraction of full speed (0.0 = no floor).
+        speed: f64,
+    },
     /// Spin every header up and park the ones with nothing connected.
     Detect,
+    /// Take over a discovered header no managed fan drives yet (or revive
+    /// a parked one) as a managed fan, and save the config.
+    AddFan {
+        /// Header id to take over.
+        fan: String,
+    },
     /// Ask for the full config text the service runs with.
     GetConfig,
     /// Replace the service's config with the GUI's edited TOML text and
@@ -237,9 +252,25 @@ impl ControlService {
         })
     }
 
+    /// Sets a fan's speed floor (0.0 clears it).
+    fn set_fan_min_speed(&self, fan_id: &str, speed: f64) -> String {
+        self.dispatch(FanRequest::SetMinSpeed {
+            fan: fan_id.to_string(),
+            speed,
+        })
+    }
+
     /// Spins every header up and parks the ones that do not spin.
     fn detect_fans(&self) -> String {
         self.dispatch(FanRequest::Detect)
+    }
+
+    /// Takes over an unclaimed header (or revives a parked one) as a
+    /// managed fan.
+    fn add_fan(&self, fan_id: &str) -> String {
+        self.dispatch(FanRequest::AddFan {
+            fan: fan_id.to_string(),
+        })
     }
 
     /// The complete config the service currently runs with.
@@ -293,6 +324,12 @@ pub fn apply_request(engine: &mut core::Engine, request: FanRequest) -> String {
                 Err(error) => envelope_err(&error.to_string()),
             }
         }
+        FanRequest::SetMinSpeed { fan, speed } => {
+            match engine.set_fan_min_speed(&core::FanId::new(fan), speed) {
+                Ok(()) => envelope_ok(),
+                Err(error) => envelope_err(&error.to_string()),
+            }
+        }
         FanRequest::Detect => {
             match engine.detect_unconnected_fans(Duration::from_millis(900)) {
                 Ok(hidden) => {
@@ -303,6 +340,16 @@ pub fn apply_request(engine: &mut core::Engine, request: FanRequest) -> String {
                         Err(error) => envelope_err(&error.to_string()),
                     }
                 }
+                Err(error) => envelope_err(&error.to_string()),
+            }
+        }
+        FanRequest::AddFan { fan } => {
+            // The added fan must survive restarts, so save like `Detect` does.
+            match engine
+                .add_fan(&core::FanId::new(fan))
+                .and_then(|()| engine.save_config())
+            {
+                Ok(()) => envelope_ok(),
                 Err(error) => envelope_err(&error.to_string()),
             }
         }
@@ -438,7 +485,9 @@ trait Control {
     async fn set_fan_members(&self, leader_id: &str, members: Vec<String>) -> zbus::Result<String>;
     async fn set_fan_name(&self, fan_id: &str, name: &str) -> zbus::Result<String>;
     async fn set_fan_rpm_factor(&self, fan_id: &str, factor: f64) -> zbus::Result<String>;
+    async fn set_fan_min_speed(&self, fan_id: &str, speed: f64) -> zbus::Result<String>;
     async fn detect_fans(&self) -> zbus::Result<String>;
+    async fn add_fan(&self, fan_id: &str) -> zbus::Result<String>;
     async fn get_config(&self) -> zbus::Result<String>;
     async fn save_config(&self, toml_text: &str) -> zbus::Result<String>;
     async fn set_poll_interval_ms(&self, interval_ms: u64) -> zbus::Result<String>;
@@ -454,7 +503,9 @@ async fn call_service(proxy: &ControlProxy<'_>, request: &FanRequest) -> zbus::R
         }
         FanRequest::SetName { fan, name } => proxy.set_fan_name(fan, name).await,
         FanRequest::SetRpmFactor { fan, factor } => proxy.set_fan_rpm_factor(fan, *factor).await,
+        FanRequest::SetMinSpeed { fan, speed } => proxy.set_fan_min_speed(fan, *speed).await,
         FanRequest::Detect => proxy.detect_fans().await,
+        FanRequest::AddFan { fan } => proxy.add_fan(fan).await,
         FanRequest::GetConfig => proxy.get_config().await,
         FanRequest::Save { toml_text } => proxy.save_config(toml_text).await,
         FanRequest::SetInterval { ms } => proxy.set_poll_interval_ms(*ms).await,
@@ -575,6 +626,31 @@ mod tests {
             serde_json::from_str::<core::FanMode>(&text).expect("parse"),
             mode
         );
+    }
+
+    #[test]
+    fn the_fan_requests_round_trip_through_json() {
+        // Anything that logs, queues or replays a request keeps the same
+        // shape, including the speed floor an AIO pump needs.
+        let requests = [
+            FanRequest::SetMinSpeed {
+                fan: "nct6795-p4".to_string(),
+                speed: 0.4,
+            },
+            FanRequest::SetRpmFactor {
+                fan: "nct6795-p1".to_string(),
+                factor: 0.5,
+            },
+            FanRequest::SetInterval { ms: 250 },
+        ];
+        for request in requests {
+            let text = serde_json::to_string(&request).expect("serialise");
+            assert_eq!(
+                serde_json::from_str::<FanRequest>(&text).expect("parse"),
+                request,
+                "{text}"
+            );
+        }
     }
 
     #[test]

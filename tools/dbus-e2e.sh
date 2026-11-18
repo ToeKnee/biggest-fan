@@ -75,6 +75,17 @@ else
     fail "GetConfig did not answer"
 fi
 
+# AddFan must answer with an envelope (not a D-Bus error) even for a
+# header this machine does not have; a fresh default config claims every
+# discovered header, so the machine-independent path is the rejection.
+# (busctl escapes the envelope's quotes, so match across the backslash.)
+if timeout 5 busctl --no-pager call "$BUS_NAME" "$OBJ_PATH" "$IFACE" AddFan \
+        s "biggest-fan-e2e-does-not-exist-p1" | grep -q 'ok[^,]*false'; then
+    pass "AddFan rejects a header the machine does not have"
+else
+    fail "AddFan did not reject an unknown header"
+fi
+
 timeout 5 busctl --no-pager call "$BUS_NAME" "$OBJ_PATH" "$IFACE" \
     SetPollIntervalMs t 250 || fail "SetPollIntervalMs failed"
 sleep 1
@@ -83,6 +94,17 @@ if timeout 5 busctl --no-pager call "$BUS_NAME" "$OBJ_PATH" "$IFACE" GetConfig \
     pass "SetPollIntervalMs took effect"
 else
     fail "SetPollIntervalMs did not take effect"
+fi
+
+# SetFanMinSpeed (an AIO pump's speed floor) must reach the engine and answer
+# with an envelope. The fan named here exists on no machine, so the
+# machine-independent path is the engine's rejection — proof the method is on
+# the bus rather than a D-Bus "unknown method" error.
+if timeout 5 busctl --no-pager call "$BUS_NAME" "$OBJ_PATH" "$IFACE" SetFanMinSpeed \
+        s d "biggest-fan-e2e-does-not-exist-p1" 0.4 | grep -q 'ok[^,]*false'; then
+    pass "SetFanMinSpeed answers an envelope for a fan the machine does not have"
+else
+    fail "SetFanMinSpeed did not answer an envelope"
 fi
 
 # --- scenario 2: GUI without a service exits fast with the right error ----
@@ -122,6 +144,26 @@ if [ -n "${WAYLAND_DISPLAY:-}${DISPLAY:-}" ]; then
         kill -TERM "$GUI_PID" 2>/dev/null || true
     else
         fail "GUI with service died early, see $SMOKE/e2e-gui.log"
+    fi
+
+    # --- scenario 3b: the IMPORTANT contract — closing the GUI must not
+    # disturb the daemon: it stays up, keeps ticking and keeps answering.
+    i=0
+    while kill -0 "$GUI_PID" 2>/dev/null && [ $i -lt 50 ]; do sleep 0.2; i=$((i + 1)); done
+    GUI_PID=
+    if ! kill -0 "$DAEMON_PID" 2>/dev/null; then
+        fail "daemon died when the GUI exited (see $SMOKE/e2e-daemon2.log)"
+    else
+        lines_before=$(wc -l < "$SMOKE/e2e-daemon2.log")
+        sleep 2
+        lines_after=$(wc -l < "$SMOKE/e2e-daemon2.log")
+        if [ "$lines_after" -gt "$lines_before" ] &&
+           timeout 5 busctl --no-pager call "$BUS_NAME" "$OBJ_PATH" "$IFACE" GetConfig \
+               | grep -q poll_interval_ms; then
+            pass "daemon keeps ticking and answering once the GUI is gone"
+        else
+            fail "daemon stopped controlling fans after the GUI exited"
+        fi
     fi
 else
     echo "no display present — skipping the GUI scenarios"

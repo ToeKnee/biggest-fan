@@ -87,9 +87,14 @@ fn run(mut engine: core::Engine) -> Result<(), core::CoreError> {
                         core::FanMode::Fixed { .. } => "fixed",
                         core::FanMode::Auto { .. } => "auto",
                     };
-                    let rpm = fan
-                        .measured_rpm
-                        .map_or_else(|| "rpm -".to_string(), |rpm| format!("rpm {rpm:.0}"));
+                    // What the hardware reports: RPM where there is a
+                    // tachometer, otherwise the header's own speed reading (a
+                    // GPU cooler has no tach, so this shows it parking).
+                    let rpm = match (fan.measured_rpm, fan.measured_percent) {
+                        (Some(rpm), _) => format!("rpm {rpm:.0}"),
+                        (None, Some(percent)) => format!("hdr {:.0}%", percent * 100.0),
+                        (None, None) => "rpm -".to_string(),
+                    };
                     println!(
                         "{:<24} {:>4.0}%  {rpm:<9} [{mode}] {}",
                         fan.name,

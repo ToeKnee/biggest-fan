@@ -22,6 +22,20 @@ const CURVE_BALANCED: &str = "balanced";
 const CURVE_PERFORMANCE: &str = "performance";
 const CURVE_CUSTOM: &str = "custom";
 
+/// Case-view slot shapes: a circle per fan header, or a rectangle for a
+/// whole object such as a graphics-card cooler.
+const SHAPE_CIRCLE: &str = "circle";
+const SHAPE_RECTANGLE: &str = "rectangle";
+
+/// Placement widgets bundled so any one change can push the whole slot.
+struct PlacementWidgets {
+    airflow_combo: ComboBoxText,
+    shape_combo: ComboBoxText,
+    diameter_spin: SpinButton,
+    width_spin: SpinButton,
+    height_spin: SpinButton,
+}
+
 /// One fan group's row: name, mode dropdown, speed slider, sensor
 /// dropdown, curve preset, placement controls and a live status line.
 pub struct FanControls {
@@ -34,9 +48,14 @@ pub struct FanControls {
     sensor_combo: ComboBoxText,
     preset_combo: ComboBoxText,
     auto_row: GtkBox,
-    airflow_combo: ComboBoxText,
-    diameter_spin: SpinButton,
+    /// Airflow, shape and size widgets for the case-view slot.
+    placement: Rc<PlacementWidgets>,
+    /// Shape-dependent visibility partners of the placement widgets.
+    diameter_label: Label,
+    size_row: GtkBox,
     rpm_spin: SpinButton,
+    /// Speed floor spin: a fan can never be commanded below this.
+    floor_spin: SpinButton,
     temp_label: Label,
     status_label: Label,
     /// Case canvas to repaint when placement changes.
@@ -116,21 +135,22 @@ impl FanControls {
         let temp_label = Label::builder().xalign(0.0).hexpand(true).build();
         auto_row.append(&temp_label);
 
-        // Placement on the case drawing: drag the fan circle itself to
-        // move it; airflow direction and diameter are set here.
-        let airflow_combo = ComboBoxText::new();
-        airflow_combo.append(Some("intake"), "intake");
-        airflow_combo.append(Some("exhaust"), "exhaust");
-        airflow_combo.append(Some("internal"), "internal");
-        let diameter_spin = SpinButton::builder()
-            .digits(0)
-            .adjustment(&gtk4::Adjustment::new(120.0, 30.0, 300.0, 5.0, 10.0, 0.0))
-            .build();
-        let placement_row = Self::placement_controls(&airflow_combo, &diameter_spin);
+        // Placement on the case drawing: drag the shape itself to move
+        // it; airflow, shape (circle ↔ whole graphics card) and size are
+        // set here.
+        let (placement, diameter_label, size_row) = Self::placement_widgets();
+        let placement_row = Self::placement_controls(
+            &placement.airflow_combo,
+            &placement.shape_combo,
+            &diameter_label,
+            &placement.diameter_spin,
+            &size_row,
+        );
 
         let member_checks = Self::member_check_buttons(engine_rc, id);
         let rpm_spin = Self::tach_spin();
-        let extra_expander = Self::extras_expander(&rpm_spin, &member_checks);
+        let floor_spin = Self::floor_spin();
+        let extra_expander = Self::extras_expander(&rpm_spin, &floor_spin, &member_checks);
 
         let status_label = Label::builder().xalign(0.0).build();
         status_label.set_markup("<span size=\"small\">…</span>");
@@ -151,9 +171,11 @@ impl FanControls {
             sensor_combo,
             preset_combo,
             auto_row,
-            airflow_combo,
-            diameter_spin,
+            placement: Rc::new(placement),
+            diameter_label,
+            size_row,
             rpm_spin,
+            floor_spin,
             temp_label,
             status_label,
             case_area: case_area.clone(),
@@ -199,6 +221,57 @@ impl FanControls {
             .collect()
     }
 
+    /// Builds the airflow, shape and size widgets for the placement row,
+    /// with the labels and spin row whose visibility depends on the
+    /// shape.
+    #[must_use]
+    fn placement_widgets() -> (PlacementWidgets, Label, GtkBox) {
+        let airflow_combo = ComboBoxText::new();
+        airflow_combo.append(Some("intake"), "intake");
+        airflow_combo.append(Some("exhaust"), "exhaust");
+        airflow_combo.append(Some("internal"), "internal");
+        let shape_combo = ComboBoxText::new();
+        shape_combo.append(Some(SHAPE_CIRCLE), "circle");
+        shape_combo.append(Some(SHAPE_RECTANGLE), "rectangle");
+        shape_combo.set_tooltip_text(Some(
+            "a rectangle draws a whole object (graphics card cooler) sized by width and height",
+        ));
+        let diameter_label = Label::builder().label("diameter:").build();
+        let diameter_spin = SpinButton::builder()
+            .digits(0)
+            .adjustment(&gtk4::Adjustment::new(120.0, 30.0, 300.0, 5.0, 10.0, 0.0))
+            .build();
+        let width_spin = Self::size_spin("card width on the drawing");
+        let height_spin = Self::size_spin("card height on the drawing");
+        let size_row = GtkBox::new(Orientation::Horizontal, 4);
+        size_row.append(&Label::builder().label("card w:").build());
+        size_row.append(&width_spin);
+        size_row.append(&Label::builder().label("h:").build());
+        size_row.append(&height_spin);
+        (
+            PlacementWidgets {
+                airflow_combo,
+                shape_combo,
+                diameter_spin,
+                width_spin,
+                height_spin,
+            },
+            diameter_label,
+            size_row,
+        )
+    }
+
+    /// A width or height spin for a rectangular (graphics-card) slot.
+    #[must_use]
+    fn size_spin(tooltip: &str) -> SpinButton {
+        let spin = SpinButton::builder()
+            .digits(0)
+            .adjustment(&gtk4::Adjustment::new(120.0, 10.0, 1200.0, 5.0, 10.0, 0.0))
+            .build();
+        spin.set_tooltip_text(Some(tooltip));
+        spin
+    }
+
     /// Builds the tachometer-correction spinner. Some tachometers report
     /// exactly double (a pulses-per-revolution mismatch): 0.5 halves the
     /// reading without touching hardware.
@@ -214,18 +287,41 @@ impl FanControls {
         spin
     }
 
-    /// Wraps the tach correction and the group member checkboxes in a
-    /// collapsed section, keeping the main row simple.
+    /// Builds the speed-floor spinner, in whole percents. A fan with a floor
+    /// — an AIO pump, or a case fan that must keep the airflow going — can
+    /// never be taken below it by a curve or a ramp, though switching it to
+    /// _off_ still stops it.
+    #[must_use]
+    fn floor_spin() -> SpinButton {
+        let spin = SpinButton::builder()
+            .digits(0)
+            .numeric(true)
+            .adjustment(&gtk4::Adjustment::new(0.0, 0.0, 100.0, 5.0, 10.0, 0.0))
+            .build();
+        spin.set_tooltip_text(Some(
+            "never command this fan below this speed — set it for an AIO pump; _off_ still stops it",
+        ));
+        spin
+    }
+
+    /// Wraps the tach correction, the speed floor and the group member
+    /// checkboxes in a collapsed section, keeping the main row simple.
     #[must_use]
     fn extras_expander(
         rpm_spin: &SpinButton,
+        floor_spin: &SpinButton,
         member_checks: &[(core::FanId, CheckButton)],
     ) -> Expander {
         let rpm_row = GtkBox::new(Orientation::Horizontal, 8);
         rpm_row.append(&Label::builder().label("rpm reading ×").build());
         rpm_row.append(rpm_spin);
 
+        let floor_row = GtkBox::new(Orientation::Horizontal, 8);
+        floor_row.append(&Label::builder().label("never below %").build());
+        floor_row.append(floor_spin);
+
         let extra_box = GtkBox::new(Orientation::Vertical, 2);
+        extra_box.append(&floor_row);
         extra_box.append(&rpm_row);
         extra_box.append(
             &Label::builder()
@@ -241,17 +337,27 @@ impl FanControls {
         expander
     }
 
-    /// Builds the placement editor row for airflow and diameter widgets.
+    /// Builds the placement editor row: airflow, slot shape, and the
+    /// diameter (circle) or width/height (rectangle) widgets.
     #[must_use]
-    fn placement_controls(airflow_combo: &ComboBoxText, diameter_spin: &SpinButton) -> GtkBox {
+    fn placement_controls(
+        airflow_combo: &ComboBoxText,
+        shape_combo: &ComboBoxText,
+        diameter_label: &Label,
+        diameter_spin: &SpinButton,
+        size_row: &GtkBox,
+    ) -> GtkBox {
         let row = GtkBox::new(Orientation::Horizontal, 8);
         row.append(&Label::builder().label("airflow:").build());
         row.append(airflow_combo);
-        row.append(&Label::builder().label("diameter:").build());
+        row.append(&Label::builder().label("shape:").build());
+        row.append(shape_combo);
+        row.append(diameter_label);
         row.append(diameter_spin);
+        row.append(size_row);
         row.append(
             &Label::builder()
-                .label("· drag the circle on the drawing to move")
+                .label("· drag the shape on the drawing to move")
                 .build(),
         );
         row
@@ -259,15 +365,24 @@ impl FanControls {
 
     /// Syncs the widgets once the engine reports a fan's live state.
     pub fn update(&self, status: &core::FanStatus) {
-        if matches!(status.mode, core::FanMode::Fixed { .. }) {
+        if let core::FanMode::Fixed { speed } = &status.mode {
+            // Follow the requested speed, not `commanded_speed`: NVIDIA
+            // coolers only run at 30 % or above and park under 25 %, and
+            // the slider must not snap the user's setting down to 0 while
+            // they are watching it.
             self.suppress.set(true);
-            self.speed_scale.set_value(status.commanded_speed * 100.0);
+            self.speed_scale.set_value(speed.clamp(0.0, 1.0) * 100.0);
             self.suppress.set(false);
         }
         let speed = format!("{:.0}%", status.commanded_speed * 100.0);
-        let rpm = status
-            .measured_rpm
-            .map_or_else(|| "no tach".to_string(), |rpm| format!("{rpm:.0} RPM"));
+        // What the hardware reports: RPM where there is a tachometer, and the
+        // speed the header reads back where there is none (a GPU cooler's
+        // parking becomes visible this way, since it has no tach).
+        let rpm = match (status.measured_rpm, status.measured_percent) {
+            (Some(rpm), _) => format!("{rpm:.0} RPM"),
+            (None, Some(percent)) => format!("no tach, header at {:.0}%", percent * 100.0),
+            (None, None) => "no tach".to_string(),
+        };
         let (line, colour) = status.note.as_deref().map_or_else(
             || (format!("{speed} · {rpm}"), None),
             |note| {
@@ -321,17 +436,42 @@ impl FanControls {
         if let Some(factor) = engine.fan_rpm_factor(&self.fan_id) {
             self.rpm_spin.set_value(factor);
         }
+        if let Some(floor) = engine.fan_min_speed(&self.fan_id) {
+            self.floor_spin.set_value(floor * 100.0);
+        }
         if let Some(slot) = engine.fan_slot(&self.fan_id) {
             let airflow = match slot.airflow {
                 core::Airflow::Intake => "intake",
                 core::Airflow::Exhaust => "exhaust",
                 core::Airflow::Internal => "internal",
             };
-            self.airflow_combo.set_active_id(Some(airflow));
-            self.diameter_spin.set_value(slot.diameter);
+            self.placement.airflow_combo.set_active_id(Some(airflow));
+            self.placement.diameter_spin.set_value(slot.diameter);
+            if let Some((width, height)) = slot.rect {
+                self.placement
+                    .shape_combo
+                    .set_active_id(Some(SHAPE_RECTANGLE));
+                self.placement.width_spin.set_value(width);
+                self.placement.height_spin.set_value(height);
+            } else {
+                self.placement.shape_combo.set_active_id(Some(SHAPE_CIRCLE));
+                // Keep the size spins sensible if the user switches
+                // this fan to a card later.
+                self.placement.width_spin.set_value(slot.diameter);
+                self.placement.height_spin.set_value(slot.diameter);
+            }
         }
         drop(engine);
         self.refresh_visibility();
+        self.refresh_placement_visibility();
+    }
+
+    /// Shows only the size widgets the selected shape uses.
+    fn refresh_placement_visibility(&self) {
+        let rectangle = self.placement.shape_combo.active_id().as_deref() == Some(SHAPE_RECTANGLE);
+        self.diameter_label.set_visible(!rectangle);
+        self.placement.diameter_spin.set_visible(!rectangle);
+        self.size_row.set_visible(rectangle);
     }
 
     /// Shows only the controls relevant to the selected mode.
@@ -351,6 +491,7 @@ impl FanControls {
         self.wire_placement_signals(engine_rc);
         self.wire_group_signals(engine_rc);
         self.wire_rpm_signal(engine_rc);
+        self.wire_floor_signal(engine_rc);
     }
 
     /// Renaming updates the mirror (rows and case view follow the engine's
@@ -478,43 +619,52 @@ impl FanControls {
     }
 
     /// Connects the placement controls to the fan group's case-view slot.
-    /// (Dragging on the canvas moves the circle itself; see `case_view`.)
+    /// Every control pushes the whole slot, so switching shape (circle ↔
+    /// card) converts the drawing in place. (Dragging on the canvas moves
+    /// the shape itself; see `case_view`.)
     fn wire_placement_signals(&self, engine_rc: &Rc<RefCell<core::Engine>>) {
-        self.airflow_combo.connect_changed({
+        self.placement.airflow_combo.connect_changed({
             let rc = Rc::clone(engine_rc);
-            let airflow_combo = self.airflow_combo.clone();
-            let diameter_spin = self.diameter_spin.clone();
+            let placement = Rc::clone(&self.placement);
             let case_area = self.case_area.clone();
             let status_label = self.status_label.clone();
             let fan_id = self.fan_id.clone();
             move |_| {
-                push_slot(
-                    &rc,
-                    &fan_id,
-                    &airflow_combo,
-                    &diameter_spin,
-                    &case_area,
-                    &status_label,
-                );
+                push_slot(&rc, &fan_id, &placement, &case_area, &status_label);
             }
         });
-        self.diameter_spin.connect_value_changed({
+        self.placement.shape_combo.connect_changed({
             let rc = Rc::clone(engine_rc);
-            let airflow_combo = self.airflow_combo.clone();
+            let placement = Rc::clone(&self.placement);
+            let diameter_label = self.diameter_label.clone();
+            let size_row = self.size_row.clone();
             let case_area = self.case_area.clone();
             let status_label = self.status_label.clone();
             let fan_id = self.fan_id.clone();
-            move |spin| {
-                push_slot(
-                    &rc,
-                    &fan_id,
-                    &airflow_combo,
-                    spin,
-                    &case_area,
-                    &status_label,
-                );
+            move |_| {
+                let rectangle =
+                    placement.shape_combo.active_id().as_deref() == Some(SHAPE_RECTANGLE);
+                diameter_label.set_visible(!rectangle);
+                size_row.set_visible(rectangle);
+                push_slot(&rc, &fan_id, &placement, &case_area, &status_label);
             }
         });
+        for spin in [
+            &self.placement.diameter_spin,
+            &self.placement.width_spin,
+            &self.placement.height_spin,
+        ] {
+            spin.connect_value_changed({
+                let rc = Rc::clone(engine_rc);
+                let placement = Rc::clone(&self.placement);
+                let case_area = self.case_area.clone();
+                let status_label = self.status_label.clone();
+                let fan_id = self.fan_id.clone();
+                move |_spin| {
+                    push_slot(&rc, &fan_id, &placement, &case_area, &status_label);
+                }
+            });
+        }
     }
 
     /// Connects the tachometer correction spin: measured RPM gets
@@ -533,6 +683,26 @@ impl FanControls {
             client.send(dbus::FanRequest::SetRpmFactor {
                 fan: fan_id.to_string(),
                 factor,
+            });
+        });
+    }
+
+    /// Connects the speed-floor spin: the engine may never command this fan
+    /// below the floor, both here and at the service.
+    fn wire_floor_signal(&self, engine_rc: &Rc<RefCell<core::Engine>>) {
+        let rc = Rc::clone(engine_rc);
+        let fan_id = self.fan_id.clone();
+        let client = self.client.clone();
+        self.floor_spin.connect_value_changed(move |spin| {
+            let speed = spin.value() / 100.0;
+            let mut engine = rc.borrow_mut();
+            if engine.set_fan_min_speed(&fan_id, speed).is_err() {
+                return;
+            }
+            drop(engine);
+            client.send(dbus::FanRequest::SetMinSpeed {
+                fan: fan_id.to_string(),
+                speed,
             });
         });
     }
@@ -575,17 +745,22 @@ impl FanControls {
 fn push_slot(
     engine_rc: &Rc<RefCell<core::Engine>>,
     fan_id: &core::FanId,
-    airflow_combo: &ComboBoxText,
-    diameter_spin: &SpinButton,
+    placement: &PlacementWidgets,
     case_area: &DrawingArea,
     status_label: &Label,
 ) {
-    let airflow = match airflow_combo.active_id().as_deref() {
+    let airflow = match placement.airflow_combo.active_id().as_deref() {
         Some("intake") => core::Airflow::Intake,
         Some("exhaust") => core::Airflow::Exhaust,
         _ => core::Airflow::Internal,
     };
-    let diameter = diameter_spin.value().clamp(10.0, 400.0);
+    let diameter = placement.diameter_spin.value().clamp(10.0, 400.0);
+    let rect = (placement.shape_combo.active_id().as_deref() == Some(SHAPE_RECTANGLE)).then(|| {
+        (
+            placement.width_spin.value().clamp(10.0, 1200.0),
+            placement.height_spin.value().clamp(10.0, 1200.0),
+        )
+    });
     let mut engine = engine_rc.borrow_mut();
     let Some(current) = engine.fan_slot(fan_id) else {
         return;
@@ -594,6 +769,7 @@ fn push_slot(
         x: current.x,
         y: current.y,
         diameter,
+        rect,
         airflow,
     };
     if let Err(error) = engine.set_fan_slot(fan_id, slot) {
