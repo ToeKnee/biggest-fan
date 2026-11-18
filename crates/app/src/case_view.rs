@@ -326,8 +326,13 @@ fn draw_card(cr: &cairo::Context, view: &core::CaseFanView) {
     }
 }
 
-/// Writes `text` centred on (`cx`, `baseline`).
-fn draw_centered(
+/// Writes `text` centred on (`cx`, `baseline`); shared by the case view
+/// and the curve graphs.
+///
+/// # Errors
+///
+/// [`cairo::Error`] if the text extents or drawing fails.
+pub fn draw_centered(
     cr: &cairo::Context,
     cx: f64,
     baseline: f64,

@@ -284,14 +284,22 @@ joins the service on the system bus, mirrors the _service's_ config
 (which is the live one), and forwards mode, sensor and curve preset, fan
 name, tach correction, speed floor, grouping, detection, refresh-rate and
 save changes to it over D-Bus. Each fan row can rename the fan inline, pick
-mode, sensor and a preset curve (Quiet, Balanced, Performance), and set the
-"rpm reading ×" tach correction and the "never below %" speed floor under
-_extra settings_ (some tachometers report exactly double: 0.5 halves the
-reading; the floor keeps an AIO pump turning however quiet its curve is). The window opens at
+mode, sensor and a preset curve (Quiet, Balanced, Performance). Every Auto
+fan's curve is drawn as a small graph — speed against sensor temperature —
+with a dot at the speed and temperature the fan is actually at right now
+(off-curve dots show a ramp or hold band at work). Every row uses the same
+20–100 °C domain, so the curves compare straight down the list. Beside it
+every fan also charts its last 5 minutes — speed % (blue) against the
+same 0–100 scale as governing sensor °C (yellow) — so changes over time
+stay visible after the numbers have scrolled past in the status line.
+Each row
+can also set the "rpm reading ×" tach correction and the "never below %"
+speed floor under _extra settings_ (some tachometers report exactly double:
+0.5 halves the reading; the floor keeps an AIO pump turning however quiet
+its curve is). The window opens at
 1600×900 maximised; fans you have not placed yet are laid out on a grid
 inside the case drawing, and saved positions outside the case are
-clamped back in at startup. The header shows a "via the running service
-(root)" badge and the window title says where changes go. If it cannot
+clamped back in at startup. If it cannot
 join — no system bus, no service owning the bus name, or a service that
 never answers — it prints which of those it is plus the fix (`sudo
 systemctl enable --now biggest-fan.service`, or `sudo

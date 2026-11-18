@@ -12,6 +12,8 @@
 
 pub mod app;
 pub mod case_view;
+pub mod curve_graph;
 pub mod dbus;
 pub mod engine_setup;
 pub mod fan_controls;
+pub mod trend_graph;

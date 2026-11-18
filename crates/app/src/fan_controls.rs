@@ -2,7 +2,9 @@
 //! slider, sensor binding, curve preset, case-view placement, tachometer
 //! correction and fan grouping.
 
+use crate::curve_graph::CurveGraph;
 use crate::dbus;
+use crate::trend_graph::TrendGraph;
 use biggest_fan_core as core;
 use gtk4::prelude::*;
 use gtk4::{
@@ -11,6 +13,7 @@ use gtk4::{
 };
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
+use std::time::Instant;
 
 const MODE_OFF: &str = "off";
 const MODE_FIXED: &str = "fixed";
@@ -48,6 +51,15 @@ pub struct FanControls {
     sensor_combo: ComboBoxText,
     preset_combo: ComboBoxText,
     auto_row: GtkBox,
+    /// Curve graph shown under the auto controls: the fan's curve plus
+    /// its live operating point.
+    curve_graph: CurveGraph,
+    /// History graph beside the curve graph: temperature and speed over
+    /// the last few minutes.
+    trend_graph: TrendGraph,
+    /// Monotonic clock behind the trend graph's sample times (every
+    /// sample for this row shares it, so they stay ordered).
+    clock: Instant,
     /// Airflow, shape and size widgets for the case-view slot.
     placement: Rc<PlacementWidgets>,
     /// Shape-dependent visibility partners of the placement widgets.
@@ -135,6 +147,17 @@ impl FanControls {
         let temp_label = Label::builder().xalign(0.0).hexpand(true).build();
         auto_row.append(&temp_label);
 
+        // The fan's curve drawn against sensor temperature, with a dot
+        // for where the fan is now; only shown in auto mode.
+        let curve_graph = CurveGraph::new(engine_rc, id);
+
+        // The fan's recent history beside the curve: speed % and
+        // governing sensor °C over the last few minutes, every mode.
+        let trend_graph = TrendGraph::new();
+        let graphs_row = GtkBox::new(Orientation::Horizontal, 8);
+        graphs_row.append(curve_graph.widget());
+        graphs_row.append(trend_graph.widget());
+
         // Placement on the case drawing: drag the shape itself to move
         // it; airflow, shape (circle ↔ whole graphics card) and size are
         // set here.
@@ -158,6 +181,7 @@ impl FanControls {
         container.append(&header);
         container.append(&speed_scale);
         container.append(&auto_row);
+        container.append(&graphs_row);
         container.append(&placement_row);
         container.append(&status_label);
         container.append(&extra_expander);
@@ -171,6 +195,9 @@ impl FanControls {
             sensor_combo,
             preset_combo,
             auto_row,
+            curve_graph,
+            trend_graph,
+            clock: Instant::now(),
             placement: Rc::new(placement),
             diameter_label,
             size_row,
@@ -365,6 +392,8 @@ impl FanControls {
 
     /// Syncs the widgets once the engine reports a fan's live state.
     pub fn update(&self, status: &core::FanStatus) {
+        self.trend_graph
+            .record(status, self.clock.elapsed().as_secs_f64());
         if let core::FanMode::Fixed { speed } = &status.mode {
             // Follow the requested speed, not `commanded_speed`: NVIDIA
             // coolers only run at 30 % or above and park under 25 %, and
@@ -405,6 +434,8 @@ impl FanControls {
                 |temp| format!("{temp:.1} °C"),
             );
             self.temp_label.set_text(&temp);
+            self.curve_graph
+                .set_operating_point(status.governing_temp_c, status.commanded_speed);
         }
     }
 
@@ -481,6 +512,9 @@ impl FanControls {
             .set_visible(mode.as_deref() == Some(MODE_FIXED));
         self.auto_row
             .set_visible(mode.as_deref() == Some(MODE_AUTO));
+        self.curve_graph
+            .widget()
+            .set_visible(mode.as_deref() == Some(MODE_AUTO));
     }
 
     /// Connects all user controls to engine updates.
@@ -532,6 +566,7 @@ impl FanControls {
         let scale = self.speed_scale.clone();
         let sensor_combo = self.sensor_combo.clone();
         let auto_row = self.auto_row.clone();
+        let curve_area = self.curve_graph.widget().clone();
         let status_label = self.status_label.clone();
         let fan_id = self.fan_id.clone();
         let client = self.client.clone();
@@ -547,6 +582,7 @@ impl FanControls {
             push_mode(&rc, &fan_id, mode, &status_label, &client);
             scale.set_visible(mode_combo.active_id().as_deref() == Some(MODE_FIXED));
             auto_row.set_visible(mode_combo.active_id().as_deref() == Some(MODE_AUTO));
+            curve_area.set_visible(mode_combo.active_id().as_deref() == Some(MODE_AUTO));
         });
 
         // Speed slider: only meaningful (and only visible) in fixed mode.
@@ -597,6 +633,7 @@ impl FanControls {
         let status_label = self.status_label.clone();
         let fan_id = self.fan_id.clone();
         let client = self.client.clone();
+        let curve_area = self.curve_graph.widget().clone();
         self.preset_combo.connect_changed(move |combo| {
             if suppress.get() || mode_combo.active_id().as_deref() != Some(MODE_AUTO) {
                 return;
@@ -615,6 +652,9 @@ impl FanControls {
                 curve: preset.curve(),
             });
             push_mode(&rc, &fan_id, mode, &status_label, &client);
+            // The draw closure re-reads the curve from the engine, so
+            // one redraw shows the new preset at once.
+            curve_area.queue_draw();
         });
     }
 
