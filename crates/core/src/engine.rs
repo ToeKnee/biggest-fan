@@ -284,7 +284,8 @@ impl std::fmt::Debug for Engine {
 impl Engine {
     /// Wires an engine to live hardware according to `options`, validating
     /// that every configured fan header (leader and members) and auto-mode
-    /// sensor id exists.
+    /// sensor id exists. Auto fans start their ramp from the duty their
+    /// header currently holds, so taking over never dips a spinning fan.
     ///
     /// # Errors
     ///
@@ -415,10 +416,11 @@ impl Engine {
                 return Err(CoreError::UnknownSensor(sensor.to_string()));
             }
             let display_name = display_name_for(&fan_config, &headers);
+            let runtime = claimed_runtime(&fan_config, &headers);
             fans.push(FanEntry {
                 fan_config,
                 headers,
-                runtime: FanRuntime::default(),
+                runtime,
                 display_name,
                 lost_control: None,
             });
@@ -761,10 +763,11 @@ impl Engine {
             fan_config.slot = Some(fit_slot(slot, &self.config.case));
         }
         let display_name = display_name_for(&fan_config, &headers);
+        let runtime = claimed_runtime(&fan_config, &headers);
         self.fans.push(FanEntry {
             fan_config,
             headers,
-            runtime: FanRuntime::default(),
+            runtime,
             display_name,
             lost_control: None,
         });
@@ -1305,6 +1308,20 @@ fn approach(from: f64, to: f64, step: f64) -> f64 {
     }
 }
 
+/// The runtime a freshly claimed group starts with: the ramp baseline is
+/// seeded from the duty the header actually holds at takeover — what the
+/// BIOS, the card's own policy or a previous run left behind — so taking
+/// over a spinning fan eases it toward the curve instead of dropping it to
+/// the first ramp step and crawling back up. Headers whose duty cannot be
+/// read (or headers already parked at 0) start from 0.
+fn claimed_runtime(fan_config: &FanConfig, headers: &[FanDriver]) -> FanRuntime {
+    let held = headers
+        .iter()
+        .find_map(FanDriver::read_percent)
+        .unwrap_or(0.0);
+    ramp_baseline_for(&fan_config.mode, held, fan_config.min_speed.clamp(0.0, 1.0))
+}
+
 /// The ramp baseline a mode change leaves behind: _auto_ keeps the speed
 /// the engine was already commanding, so switching profile (a curve preset,
 /// a sensor re-bind, a re-saved config) eases the fan from where it is
@@ -1687,6 +1704,55 @@ mod tests {
         assert!(
             (report.fans[0].commanded_speed - 0.1).abs() < 1e-9,
             "a stopped fan ramps up from 0, one step per tick"
+        );
+    }
+
+    #[test]
+    fn taking_over_a_spinning_header_ramps_from_its_current_duty() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        fixture(dir.path());
+        // What the BIOS left in pwm1 when the engine takes over: 60 %.
+        std::fs::write(dir.path().join("hwmon1/pwm1"), "153\n").expect("bios duty");
+        let mut engine = engine_with(
+            dir.path(),
+            crate::config::model::HysteresisConfig {
+                temp_band_c: 2.0,
+                max_step_per_tick: 0.1,
+            },
+        );
+
+        // 55 °C on the fixture curve wants 0.5 — one ramp step below the
+        // duty taken over, so the fan eases straight there instead of
+        // first dropping toward 0 and crawling back up.
+        let report = engine.tick().expect("first tick after takeover");
+        assert!(
+            (report.fans[0].commanded_speed - 0.5).abs() < 1e-9,
+            "takeover continues from the 60 % the BIOS left"
+        );
+        assert_eq!(read_pwm(dir.path()), 128);
+    }
+
+    #[test]
+    fn add_fan_continues_from_the_duty_the_bios_left() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        fixture(dir.path());
+        std::fs::write(dir.path().join("hwmon1/pwm2"), "204\n").expect("pwm2");
+        std::fs::write(dir.path().join("hwmon1/fan2_input"), "800\n").expect("fan2");
+        let mut engine = engine_over(dir.path(), true, Vec::new()).expect("engine");
+
+        // The added header is auto-bound to the CPU sensor with the
+        // default curve (0.5 at 55 °C); it was spinning at 80 %, so the
+        // first tick eases one step down instead of commanding 10 %.
+        engine.add_fan(&FanId::new("nct6795-p2")).expect("add");
+        let report = engine.tick().expect("first tick");
+        let added = report
+            .fans
+            .iter()
+            .find(|fan| fan.id.as_str() == "nct6795-p2")
+            .expect("p2");
+        assert!(
+            (added.commanded_speed - 0.7).abs() < 1e-9,
+            "one step down from the 80 % taken over, not 0.1 up from a stop"
         );
     }
 
