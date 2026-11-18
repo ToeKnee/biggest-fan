@@ -39,7 +39,8 @@ pub use engine::{CaseFanView, Discovery, Engine, EngineOptions, TickReport};
 pub use engine::{default_config, discover};
 pub use error::CoreError;
 pub use fans::{
-    CurvePoint, CurvePreset, FanCurve, FanDescriptor, FanId, FanMode, FanStatus, SysfsFan,
+    CurvePoint, CurvePreset, FanCurve, FanDescriptor, FanDriver, FanId, FanMode, FanStatus,
+    NvidiaFan, SysfsFan,
 };
 pub use sensors::{
     HwmonSource, NvidiaSource, SensorCategory, SensorDescriptor, SensorId, SensorSource,

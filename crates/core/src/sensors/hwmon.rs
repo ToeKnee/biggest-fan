@@ -180,8 +180,12 @@ impl SensorSource for HwmonSource {
                 let input_path = chip.dir.join(&name);
                 // Inputs whose value cannot be read are not real sensors;
                 // skip them so dead placeholders never reach the UI.
-                if read_int(&input_path).is_err() {
-                    continue;
+                // Inputs that read exactly zero are unconnected sensors on
+                // many super-IO chips — they are just as useless, and a
+                // real in-case temperature is never exactly 0 °C.
+                match read_int(&input_path) {
+                    Ok(value) if value != 0 => {}
+                    _ => continue,
                 }
                 let label =
                     read_trimmed(&chip.dir.join(format!("temp{index}_label"))).unwrap_or_default();
@@ -273,6 +277,23 @@ mod tests {
         source.discover().expect("discovery");
         let readings = source.read_all().expect("read_all");
         assert_eq!(readings[&sid("k10temp-t1")], -5.25);
+    }
+
+    #[test]
+    fn inputs_that_only_read_zero_are_skipped() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let chip = chip_dir(root.path(), "hwmon0", "nct6795");
+        std::fs::write(chip.join("temp1_input"), "41000\n").expect("temp1");
+        // Unconnected placeholder inputs on super-IO chips read 0.
+        std::fs::write(chip.join("temp2_input"), "0\n").expect("temp2");
+        std::fs::write(chip.join("temp3_input"), "0000\n").expect("temp3");
+        // A genuine sub-zero reading must survive.
+        std::fs::write(chip.join("temp4_input"), "-1250\n").expect("temp4");
+
+        let mut source = HwmonSource::with_root(root.path());
+        let found = source.discover().expect("discovery");
+        let ids: Vec<&str> = found.iter().map(|sensor| sensor.id.as_str()).collect();
+        assert_eq!(ids, ["nct6795-t1", "nct6795-t4"]);
     }
 
     #[test]

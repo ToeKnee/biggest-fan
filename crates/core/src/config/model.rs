@@ -17,6 +17,7 @@
 //! id = "nct6795-p1"
 //! name = "Front 120mm intake"
 //! rpm_factor = 0.5                   # halve a tach that reports double
+//! min_speed = 0.4                    # never slower than this (an AIO pump)
 //! members = ["nct6795-p2", "nct6795-p3"]  # driven together as one fan
 //! mode = { type = "auto", sensor = "k10temp-t1" }
 //!
@@ -25,6 +26,9 @@
 //! y = 380.0
 //! diameter = 70.0
 //! airflow = "intake"
+//! # A whole rectangular object (e.g. a graphics card cooler) instead of
+//! # a circle:
+//! # rect = [220.0, 80.0]
 //! ```
 
 use crate::case::{CaseConfig, FanSlot};
@@ -69,6 +73,16 @@ pub struct FanConfig {
     /// touching hardware.
     #[serde(default = "default_rpm_factor")]
     pub rpm_factor: f64,
+    /// Speed floor: never command a speed below this (0.0..=1.0; the
+    /// default 0.0 means no floor). Set it for something that must always
+    /// turn — an AIO pump — so a Quiet curve or a cold sensor cannot park
+    /// it. _Off_ mode is the exception: stopping a fan by hand is a choice
+    /// the user makes, not something this floor overrides. On an NVIDIA
+    /// cooler a floor under the park point
+    /// ([`crate::fans::nvidia::SPIN_DOWN_FRACTION`]) cannot start the fans,
+    /// so it effectively parks the cooler.
+    #[serde(default)]
+    pub min_speed: f64,
     /// Extra headers driven as one with the leader; every member must be a
     /// header discovered on this machine and belongs to at most one group.
     #[serde(default)]
@@ -167,6 +181,10 @@ mod tests {
             (config.fans[0].rpm_factor - 1.0).abs() < 1e-12,
             "a config without rpm_factor keeps raw tach readings"
         );
+        assert!(
+            config.fans[0].min_speed == 0.0,
+            "a config without min_speed has no floor"
+        );
         let members: Vec<String> = config.fans[0]
             .members
             .iter()
@@ -193,6 +211,29 @@ mod tests {
     }
 
     #[test]
+    fn a_pump_floor_round_trips_and_defaults_to_no_floor() {
+        let text = r#"
+            [[fans]]
+            id = "nct6795-p4"
+            min_speed = 0.4
+            mode = { type = "auto", sensor = "nct6795-t2" }
+
+            [[fans]]
+            id = "nct6795-p5"
+            mode = { type = "off" }
+        "#;
+        let config: AppConfig = toml::from_str(text).expect("parses");
+        assert!(
+            (config.fans[0].min_speed - 0.4).abs() < 1e-12,
+            "min_speed parses"
+        );
+        assert_eq!(config.fans[1].min_speed, 0.0, "omitted means no floor");
+        let text = toml::to_string_pretty(&config).expect("serialize");
+        let back: AppConfig = toml::from_str(&text).expect("deserialize");
+        assert_eq!(config, back);
+    }
+
+    #[test]
     fn fan_groups_and_hidden_flags_round_trip() {
         let config = AppConfig {
             fans: vec![
@@ -200,6 +241,7 @@ mod tests {
                     id: FanId::new("nct6795-p1"),
                     name: Some("AIO radiator".to_string()),
                     rpm_factor: 1.0,
+                    min_speed: 0.4,
                     members: vec![FanId::new("nct6795-p2"), FanId::new("nct6795-p3")],
                     hidden: false,
                     mode: crate::fans::FanMode::Fixed { speed: 0.5 },
@@ -209,6 +251,7 @@ mod tests {
                     id: FanId::new("it87-p4"),
                     name: None,
                     rpm_factor: 0.5,
+                    min_speed: 0.0,
                     members: Vec::new(),
                     hidden: true,
                     mode: crate::fans::FanMode::Off,
@@ -237,6 +280,7 @@ mod tests {
                     id: FanId::new("it87-p2"),
                     name: None,
                     rpm_factor: 1.0,
+                    min_speed: 0.0,
                     members: Vec::new(),
                     hidden: false,
                     mode: crate::fans::FanMode::Fixed { speed: 0.35 },
@@ -246,6 +290,7 @@ mod tests {
                     id: FanId::new("nct6795-p1"),
                     name: Some("Top exhaust".to_string()),
                     rpm_factor: 1.0,
+                    min_speed: 0.0,
                     members: Vec::new(),
                     hidden: false,
                     mode: crate::fans::FanMode::Auto {
@@ -266,6 +311,7 @@ mod tests {
                         x: 150.0,
                         y: 60.0,
                         diameter: 80.0,
+                        rect: Some((240.0, 90.0)),
                         airflow: crate::case::Airflow::Exhaust,
                     }),
                 },
@@ -275,6 +321,40 @@ mod tests {
         let text = toml::to_string_pretty(&config).expect("serialize");
         let back: AppConfig = toml::from_str(&text).expect("deserialize");
         assert_eq!(config, back);
+    }
+
+    #[test]
+    fn slot_shapes_parse_in_both_forms_and_default_the_diameter() {
+        let text = r#"
+            [[fans]]
+            id = "nct6795-p1"
+            mode = { type = "off" }
+            [fans.slot]
+            x = 40.0
+            y = 380.0
+            diameter = 70.0
+            airflow = "intake"
+
+            [[fans]]
+            id = "nvidia-gpu0-cooler"
+            mode = { type = "off" }
+            [fans.slot]
+            x = 150.0
+            y = 120.0
+            rect = [220.0, 80.0]
+            airflow = "internal"
+        "#;
+        let config: AppConfig = toml::from_str(text).expect("both slot forms parse");
+        let circle = config.fans[0].slot.expect("circle slot");
+        assert_eq!(circle.diameter, 70.0);
+        assert_eq!(circle.rect, None);
+        assert!(!circle.is_rectangular());
+        let card = config.fans[1].slot.expect("rect slot");
+        assert_eq!(card.rect, Some((220.0, 80.0)));
+        // Omitted `diameter` falls back to the standard circle size.
+        assert_eq!(card.diameter, 60.0);
+        assert!(card.is_rectangular());
+        assert_eq!(card.half_extents(), (110.0, 40.0));
     }
 
     #[test]

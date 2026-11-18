@@ -146,6 +146,19 @@ impl SysfsFan {
         read_int(&self.pwm_path()).ok()
     }
 
+    /// The duty currently in `pwmN` as a fraction of this header's maximum
+    /// (0.0–1.0), `None` when the register cannot be read. A header the
+    /// motherboard controls shows the motherboard's duty, not ours.
+    #[must_use]
+    pub fn read_percent(&self) -> Option<f64> {
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "duty values are at most a few thousand"
+        )]
+        let duty = self.read_pwm()? as f64;
+        Some((duty / self.pwm_max).clamp(0.0, 1.0))
+    }
+
     /// Measured RPM from the matching tachometer, `None` when unavailable.
     #[must_use]
     pub fn read_rpm(&self) -> Option<f64> {
@@ -329,6 +342,25 @@ mod tests {
 
         fan.apply(2.0).expect("apply clamps high");
         assert_eq!(read_trimmed(&chip.join("pwm1")).as_deref(), Some("255"));
+    }
+
+    #[test]
+    fn read_percent_reports_the_duty_the_chip_holds() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let chip = fixture_chip(root.path(), "hwmon0", "it87");
+        std::fs::write(chip.join("pwm1"), "0\n").expect("pwm1");
+        std::fs::write(chip.join("pwm1_enable"), "1\n").expect("enable");
+
+        let mut fans = SysfsFan::discover_all(root.path()).expect("discovery");
+        let mut fan = fans.pop().expect("one fan");
+        assert_eq!(fan.read_percent(), Some(0.0), "a stopped duty reads zero");
+
+        fan.apply(0.5).expect("apply half");
+        let percent = fan.read_percent().expect("duty is readable");
+        assert!((percent - 0.5).abs() < 0.01, "128 of 255 reads {percent}");
+
+        fan.stop().expect("stop");
+        assert_eq!(fan.read_percent(), Some(0.0), "the zeroed duty reads back");
     }
 
     #[test]

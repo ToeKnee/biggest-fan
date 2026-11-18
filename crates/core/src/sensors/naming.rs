@@ -80,6 +80,7 @@ pub enum SensorCategory {
 ///
 /// assert_eq!(sensor_category("k10temp", "CPU temperature"), SensorCategory::Cpu);
 /// assert_eq!(sensor_category("nvidia", "GPU temperature"), SensorCategory::Gpu);
+/// assert_eq!(sensor_category("nvml", "NVIDIA GeForce RTX 4070 SUPER temperature"), SensorCategory::Gpu);
 /// assert_eq!(sensor_category("nct6795", "NCT 6795 Chassis"), SensorCategory::Case);
 /// ```
 #[must_use]
@@ -94,7 +95,9 @@ pub fn sensor_category(chip: &str, display_name: &str) -> SensorCategory {
         || combined.contains("ccd")
     {
         SensorCategory::Cpu
-    } else if chip == "nvidia" || combined.contains("gpu") {
+    } else if chip == "nvidia" || chip == "nvml" || combined.contains("gpu") {
+        // NVML-based GPU temperatures carry the chip token "NVML" and a
+        // GPU model name, so match the token explicitly.
         SensorCategory::Gpu
     } else if name.contains("case") || combined.contains("chassis") || combined.contains("amb") {
         SensorCategory::Case

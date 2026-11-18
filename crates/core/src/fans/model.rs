@@ -72,12 +72,16 @@ pub const DEFAULT_CURVE_POINTS: [CurvePoint; 4] = [
 ///
 /// Modern parts run comfortably well below their limit (Ryzen holds
 /// 95 °C, Intel mobile parts 100 °C+, `GeForce` cards boost against a power
-/// limit), so `Quiet` stays barely audible through ordinary loads and
+/// limit), so `Quiet` stops the fan altogether while the machine is idle and
 /// only ramps hard near the temperature limit.
+///
+/// A fan that must never stop — an AIO pump — keeps running whatever the
+/// preset says, by giving it a `min_speed` floor in the configuration
+/// ([`crate::config::FanConfig::min_speed`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CurvePreset {
-    /// Barely audible at normal temperatures; ramps to full only near the
-    /// temperature limit.
+    /// Stopped while the machine is idle, barely audible through ordinary
+    /// loads, and full speed only near the temperature limit.
     Quiet,
     /// The default curve: a steady climb from 35 °C to 80 °C.
     Balanced,
@@ -107,12 +111,16 @@ impl CurvePreset {
         match self {
             Self::Quiet => FanCurve::new(vec![
                 CurvePoint {
-                    temp_c: 30.0,
-                    speed: 0.15,
+                    temp_c: 25.0,
+                    speed: 0.0,
+                },
+                CurvePoint {
+                    temp_c: 40.0,
+                    speed: 0.10,
                 },
                 CurvePoint {
                     temp_c: 55.0,
-                    speed: 0.25,
+                    speed: 0.20,
                 },
                 CurvePoint {
                     temp_c: 70.0,
@@ -333,8 +341,15 @@ pub struct FanStatus {
     pub name: String,
     /// Mode the fan is being run in.
     pub mode: FanMode,
-    /// Speed fraction actually commanded this tick (0.0 to 1.0).
+    /// Speed fraction actually commanded this tick (0.0 to 1.0), as
+    /// the fan's hardware can run it: an NVIDIA cooler parks rather than
+    /// crawl, and only runs at 30 % or above.
     pub commanded_speed: f64,
+    /// Speed fraction the hardware reports for this fan's leader header:
+    /// NVML's fan percent for a GPU cooler, the `pwmN` duty for a sysfs
+    /// header. `None` when nothing can be read. This is how a parked GPU
+    /// cooler becomes visible, since it has no tachometer to report 0 rpm.
+    pub measured_percent: Option<f64>,
     /// Measured speed in RPM, when the header has a tachometer.
     pub measured_rpm: Option<f64>,
     /// Temperature of the governing sensor in Auto mode.
@@ -421,9 +436,14 @@ mod tests {
             None,
             "a hand-made curve matches no preset"
         );
-        // Quiet stays calmer than Balanced in normal load, and both go
-        // full only at the very top of the range.
+        // Quiet stops while the machine is idle, stays calmer than Balanced
+        // in normal load, and both go full only at the very top of the range.
         let (quiet, balanced) = (CurvePreset::Quiet.curve(), CurvePreset::Balanced.curve());
+        assert_eq!(
+            quiet.speed_at(25.0),
+            0.0,
+            "Quiet stops the fan while the machine is idle"
+        );
         assert!(
             quiet.speed_at(60.0) < balanced.speed_at(60.0),
             "Quiet should be gentler at ordinary temperatures"
