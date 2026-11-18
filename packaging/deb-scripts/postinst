@@ -1,0 +1,12 @@
+#!/bin/sh
+# The running daemon is the point of this package: enable and (re)start it
+# during install and upgrade so `biggest-fan gui` can reach it without any
+# manual systemctl step.
+set -e
+
+case "$1" in
+    configure)
+        systemctl enable biggest-fan.service
+        systemctl restart biggest-fan.service
+        ;;
+esac

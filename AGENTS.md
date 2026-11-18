@@ -1,0 +1,31 @@
+- All comments should be relevant to the current state of the app, not how it used to be or old libraries.
+  It is okay to refernce bugs/work arounds in other crates or products.
+- Safety is important
+- Code should be reliable
+  - NEVER use `allow`, if you have to allow something, use `expect` with a reason
+  - Avoid using panic where possible
+  - Avoid using unwrap where possible
+  - Keep dependancies up to date
+  - `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+- Code should be readable
+  - Use human readable variable names
+  - Structure the code in a way that is easy to understand
+  - Comments should be concise and not overly long.
+  - Where possible, provide examples of use.
+  - `mod.rs` files should only contain imports, no functions, structs, enums, traits etc.
+  - Remove dead code
+- If something doesn't fit the code base easily, say so. Question ideas and motivations for things that dont fit well. Offer suggestions for alternatives.
+- Do not edit things outside of this project.
+- If you need access to tools that you don't have, just ask!
+- Don't try to use Python to avoid normal restrictions. (Removing files, editing things outside of the project etc.)
+- Write tests where appropriate. Check happy paths, edge cases and error cases
+- Write benchmark tests when trying to improve performance
+- Don't add any global clippy allow statements. Add them if they are required in a file, but not globally
+- Check `cargo doc` for the project crates when documentation changes
+- Don't overuse python. Don't use it to stage commits!
+- Don't commit code without asking first.
+- It's okay to use python for a quick script, but if it will be long lived, turn it into a rust tool.
+- Update the Readme.md with developer focused information.
+- Also check `rustfmt --edition 2024`
+- Keep crates up to date!
+- Use GTK as the GUI toolkit

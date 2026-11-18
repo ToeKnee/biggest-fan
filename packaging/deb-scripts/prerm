@@ -1,0 +1,14 @@
+#!/bin/sh
+# Stop (and, on removal, disable) the daemon before the package's files go
+# away. The daemon returns the fan headers to hardware control on SIGTERM,
+# so stopping cleanly hands the fans back.
+set -e
+
+case "$1" in
+    remove|deconfigure)
+        systemctl disable --now biggest-fan.service || true
+        ;;
+    upgrade)
+        systemctl stop biggest-fan.service || true
+        ;;
+esac

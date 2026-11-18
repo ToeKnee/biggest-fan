@@ -1,0 +1,40 @@
+# Biggest Fan controller daemon, managed by systemd.
+#
+# The daemon writes to hwmon `pwm` sysfs files, which requires root — this
+# unit therefore runs the separate `biggest-fan-daemon` binary as root.
+# Installing the .deb enables and starts this service automatically
+# (postinst); by hand:
+#
+#   sudo systemctl enable --now biggest-fan.service
+#
+# If no config exists yet, the daemon writes a sensible default to
+# /etc/biggest-fan/config.toml on first start; review and tune it, then
+# `systemctl restart biggest-fan`.
+#
+# While this service runs, the daemon also owns the D-Bus name
+# net.ynottony.ten.biggestfan on the system bus, so `biggest-fan gui` can
+# control fans as a normal user (policy:
+# /etc/dbus-1/system.d/net.ynottony.ten.biggestfan.conf).
+#
+# The daemon hands the fan headers back to the motherboard's automatic
+# control when it stops; only leave it stopped when another controller
+# (BIOS/fancontrol) is meant to take over.
+
+[Unit]
+Description=Biggest Fan smart fan controller
+After=sysinit.target local-fs.target
+StartLimitBurst=5
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/biggest-fan-daemon --config /etc/biggest-fan/config.toml
+Restart=on-failure
+RestartSec=5
+
+# Modest hardening. The service needs write access to /sys/class/hwmon,
+# so ProtectSystem=strict / ReadOnlyPaths are deliberately not set here.
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

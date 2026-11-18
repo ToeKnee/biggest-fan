@@ -1,0 +1,57 @@
+[package]
+name = "biggest-fan"
+description = "A smart fan controller app with a graphical PC-case view."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "biggest-fan"
+path = "src/main.rs"
+
+# The root control loop: a separate binary so the service unit (and
+# packagers) can install and run it without the GUI in the picture.
+[[bin]]
+name = "biggest-fan-daemon"
+path = "src/daemon_main.rs"
+
+[dependencies]
+biggest-fan-core = { workspace = true }
+cairo-rs = "0.22"
+clap = { version = "4.6.8", features = ["derive"] }
+glib = "0.22.11"
+gtk4 = "0.11.5"
+signal-hook = "0.4.6"
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.145"
+zbus = { version = "6.3.0", features = ["tokio-multithread"] }
+
+# cargo-deb packaging: `cargo deb -p biggest-fan`, then
+# `sudo dpkg -i target/debian/biggest-fan_*.deb` and enable the service
+# (see README). Set the maintainer below to yourself before releasing.
+[package.metadata.deb]
+maintainer = "Anthony Batchelor <tony@ynottony.net>"
+copyright = "2026, Anthony Batchelor <tony@ynottony.net>"
+license-file = ["../../LICENSE", "0"]
+section = "utils"
+priority = "optional"
+# postinst enables+starts the daemon on install; prerm stops/disables it on
+# removal so the fans are handed back to hardware control.
+maintainer-scripts = "../../packaging/deb-scripts"
+depends = [
+  # "libgtk-4-1t64 (>= 4.14)",
+  # "libpango-1.0-0t64 (>= 1.44)",
+  # "libgdk-pixbuf-2.0-0t64 (>= 2.40)",
+  # "libcairo2 (>= 1.16)",
+  # "libglib2.0-0t64 (>= 2.64)",
+  # "libc6 (>= 2.34)",
+]
+assets = [
+  # The target/release prefix is special: cargo-deb rewrites it to the real
+  # workspace target dir (see cargo-deb docs on assets).
+  ["target/release/biggest-fan", "usr/bin/biggest-fan", "755"],
+  ["target/release/biggest-fan-daemon", "usr/bin/biggest-fan-daemon", "755"],
+  ["../../packaging/systemd/biggest-fan.service", "lib/systemd/system/biggest-fan.service", "644"],
+  ["../../packaging/dbus/net.ynottony.ten.biggestfan.conf", "etc/dbus-1/system.d/net.ynottony.ten.biggestfan.conf", "644"],
+  ["../../README.md", "usr/share/doc/biggest-fan/README.md", "644"],
+]

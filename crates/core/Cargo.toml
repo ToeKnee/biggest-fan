@@ -1,0 +1,15 @@
+[package]
+name = "biggest-fan-core"
+description = "Sensor discovery, fan control and the control loop behind Biggest Fan."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nvml-wrapper = "0.13.0"
+serde = { version = "1.0.229", features = ["derive"] }
+thiserror = "2.0.21"
+toml = "1.2.1"
+
+[dev-dependencies]
+tempfile = "3.27.0"
