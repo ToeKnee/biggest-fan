@@ -215,7 +215,8 @@ pub struct CaseFanView {
 /// Hysteresis bookkeeping for one auto fan.
 #[derive(Clone, Copy, Debug, Default)]
 struct FanRuntime {
-    /// Speed fraction commanded on the previous tick.
+    /// Speed fraction the engine last commanded (on the previous tick, or
+    /// by an immediate mode change in [`Engine::set_fan_mode`]).
     last_commanded: f64,
     /// Temperature that last *raised* the speed; the speed may not fall
     /// until the sensor drops `temp_band_c` below this.
@@ -623,6 +624,10 @@ impl Engine {
 
     /// Refreshes one fan group's mode and (unless dry-run) applies it at
     /// once. `fan_id` may be the group leader or one of its members.
+    /// Switching to _auto_ continues the speed ramp from the speed the fan
+    /// is already at instead of restarting it at 0, so changing curve
+    /// profiles (the GUI's Quiet / Balanced / Performance dropdown) never
+    /// dips the fan.
     ///
     /// # Errors
     ///
@@ -638,16 +643,17 @@ impl Engine {
             .find_group(fan_id)
             .ok_or_else(|| CoreError::UnknownFan(fan_id.to_string()))?;
         let entry = &mut self.fans[index];
-        entry.fan_config.mode = mode.clone();
-        entry.runtime = FanRuntime::default();
-        // An immediate write must already respect the speed floor: the next
-        // tick would correct it, but a pump should never see the dip.
+        // The floor is applied to both the write below and the ramp baseline,
+        // so a pump never sees a dip even for a tick.
         let floor = entry.fan_config.min_speed.clamp(0.0, 1.0);
+        entry.fan_config.mode = mode.clone();
+        entry.runtime = ramp_baseline_for(mode, entry.runtime.last_commanded, floor);
+        let commanded = entry.runtime.last_commanded;
         if self.apply_writes {
             for header in &mut entry.headers {
                 match mode {
                     FanMode::Off => header.stop()?,
-                    FanMode::Fixed { speed } => header.apply(speed.clamp(0.0, 1.0).max(floor))?,
+                    FanMode::Fixed { .. } => header.apply(commanded)?,
                     FanMode::Auto { .. } => {}
                 }
             }
@@ -959,6 +965,8 @@ impl Engine {
     /// Swaps in a whole config (the D-Bus service calls this when the GUI
     /// saves its edits): fan groups are re-claimed against the discovered
     /// headers and sensor display names refreshed, just like at startup.
+    /// Groups keep the ramp position of the group they replace, so saving
+    /// a config never dips a running fan.
     ///
     /// # Errors
     ///
@@ -977,12 +985,24 @@ impl Engine {
                 (sensor.id.clone(), name)
             })
             .collect();
-        let (fans, hidden_fans) = Self::claim_fans(
+        let previous_runtime: BTreeMap<FanId, FanRuntime> = self
+            .fans
+            .iter()
+            .map(|entry| (entry.fan_config.id.clone(), entry.runtime))
+            .collect();
+        let (mut fans, hidden_fans) = Self::claim_fans(
             &self.all_headers,
             &self.sensor_names,
             std::mem::take(&mut config.fans),
             config.case,
         )?;
+        for entry in &mut fans {
+            if let Some(previous) = previous_runtime.get(&entry.fan_config.id) {
+                let floor = entry.fan_config.min_speed.clamp(0.0, 1.0);
+                entry.runtime =
+                    ramp_baseline_for(&entry.fan_config.mode, previous.last_commanded, floor);
+            }
+        }
         self.config = config;
         self.fans = fans;
         self.hidden_fans = hidden_fans;
@@ -1280,6 +1300,25 @@ fn approach(from: f64, to: f64, step: f64) -> f64 {
     }
 }
 
+/// The ramp baseline a mode change leaves behind: _auto_ keeps the speed
+/// the engine was already commanding, so switching profile (a curve preset,
+/// a sensor re-bind, a re-saved config) eases the fan from where it is
+/// instead of dropping it and ramping back up; _off_ and _fixed_ reset the
+/// baseline to what the change itself commands — a fan deliberately stopped
+/// really does start its next ramp at 0. The old curve's hold band never
+/// carries over to a new one.
+const fn ramp_baseline_for(mode: &FanMode, previous_commanded: f64, floor: f64) -> FanRuntime {
+    let last_commanded = match mode {
+        FanMode::Auto { .. } => previous_commanded,
+        FanMode::Off => 0.0,
+        FanMode::Fixed { speed } => speed.clamp(0.0, 1.0).max(floor),
+    };
+    FanRuntime {
+        last_commanded,
+        hold_temp_c: None,
+    }
+}
+
 /// Whether this header drives an NVIDIA GPU cooler (drawn as a card).
 const fn is_gpu_cooler(header: &FanDriver) -> bool {
     matches!(header, FanDriver::Nvidia(_))
@@ -1352,7 +1391,7 @@ fn default_slot(index: usize, total: usize, case: &CaseConfig, rectangular: bool
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fans::CurvePoint;
+    use crate::fans::{CurvePoint, CurvePreset};
 
     /// Fake hwmon tree: one CPU chip and one super-IO chip with a fan.
     fn fixture(root: &Path) {
@@ -1523,6 +1562,126 @@ mod tests {
         assert_eq!(
             engine.fan_mode(&fan_id),
             Some(FanMode::Fixed { speed: 0.5 })
+        );
+    }
+
+    /// The curve the `engine_with` fixture starts with (0.2 at 40 °C,
+    /// 1.0 at 80 °C), for tests that rebuild an auto mode.
+    fn fixture_curve() -> FanCurve {
+        FanCurve::new(vec![
+            CurvePoint {
+                temp_c: 40.0,
+                speed: 0.2,
+            },
+            CurvePoint {
+                temp_c: 80.0,
+                speed: 1.0,
+            },
+        ])
+        .expect("curve")
+    }
+
+    #[test]
+    fn changing_curve_profile_ramps_from_the_current_speed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        fixture(dir.path());
+        let mut engine = engine_with(
+            dir.path(),
+            crate::config::model::HysteresisConfig {
+                temp_band_c: 2.0,
+                max_step_per_tick: 0.1,
+            },
+        );
+        let fan_id = FanId::new("nct6795-p1");
+        set_cpu_temp(dir.path(), 79_000);
+
+        // Ramp up: 0.1 then 0.2 (as in the ramp-rate test above).
+        engine.tick().expect("tick 1");
+        let report = engine.tick().expect("tick 2");
+        assert!((report.fans[0].commanded_speed - 0.2).abs() < 1e-9);
+
+        // A preset change goes through set_fan_mode with the new curve.
+        // The fan must keep climbing from 0.2, not restart its ramp at 0.
+        engine
+            .set_fan_mode(
+                &fan_id,
+                &FanMode::Auto {
+                    sensor: SensorId::new("k10temp-t1"),
+                    curve: CurvePreset::Performance.curve(),
+                },
+            )
+            .expect("switch profile");
+        let report = engine.tick().expect("tick after the switch");
+        assert!(
+            (report.fans[0].commanded_speed - 0.3).abs() < 1e-9,
+            "the ramp continues from 0.2 instead of resetting to 0"
+        );
+    }
+
+    #[test]
+    fn fixed_to_auto_continues_from_the_fixed_speed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        fixture(dir.path());
+        let mut engine = engine_with(
+            dir.path(),
+            crate::config::model::HysteresisConfig {
+                temp_band_c: 0.0,
+                max_step_per_tick: 0.1,
+            },
+        );
+        let fan_id = FanId::new("nct6795-p1");
+
+        // The slider parks the fan at 60 %; switching back to _auto_ with
+        // no tick in between must ramp from 0.6, not from 0. The curve
+        // wants 0.5 at 55 °C, so the fan eases down by one step.
+        engine
+            .set_fan_mode(&fan_id, &FanMode::Fixed { speed: 0.6 })
+            .expect("fixed");
+        engine
+            .set_fan_mode(
+                &fan_id,
+                &FanMode::Auto {
+                    sensor: SensorId::new("k10temp-t1"),
+                    curve: fixture_curve(),
+                },
+            )
+            .expect("auto");
+        let report = engine.tick().expect("first auto tick");
+        assert!(
+            (report.fans[0].commanded_speed - 0.5).abs() < 1e-9,
+            "one step down from 0.6, not a jump from 0 to 0.1"
+        );
+    }
+
+    #[test]
+    fn auto_after_off_still_ramps_up_from_zero() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        fixture(dir.path());
+        let mut engine = engine_with(
+            dir.path(),
+            crate::config::model::HysteresisConfig {
+                temp_band_c: 0.0,
+                max_step_per_tick: 0.1,
+            },
+        );
+        let fan_id = FanId::new("nct6795-p1");
+
+        // A fan the user stopped really did stop, so its next ramp must
+        // start at 0 — continuing from the pre-off speed would jump it.
+        engine.set_fan_mode(&fan_id, &FanMode::Off).expect("off");
+        engine
+            .set_fan_mode(
+                &fan_id,
+                &FanMode::Auto {
+                    sensor: SensorId::new("k10temp-t1"),
+                    curve: fixture_curve(),
+                },
+            )
+            .expect("auto");
+        let report = engine.tick().expect("first tick after off");
+        assert!(
+            (report.fans[0].commanded_speed - 0.1).abs() < 1e-9,
+            "a stopped fan ramps up from 0, one step per tick"
         );
     }
 
@@ -2180,6 +2339,33 @@ mod tests {
             Err(CoreError::UnknownFan(_))
         ));
         assert_eq!(engine.managed_fans().len(), 1);
+    }
+
+    #[test]
+    fn re_applying_the_config_keeps_the_ramp_position() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        fixture(dir.path());
+        let mut engine = engine_with(
+            dir.path(),
+            crate::config::model::HysteresisConfig {
+                temp_band_c: 2.0,
+                max_step_per_tick: 0.1,
+            },
+        );
+        set_cpu_temp(dir.path(), 79_000);
+        engine.tick().expect("tick 1");
+        let report = engine.tick().expect("tick 2");
+        assert!((report.fans[0].commanded_speed - 0.2).abs() < 1e-9);
+
+        // Saving the config round-trips it through apply_config; the fan
+        // must keep climbing from 0.2 instead of restarting its ramp at 0.
+        let saved = engine.current_config();
+        engine.apply_config(saved).expect("re-apply");
+        let report = engine.tick().expect("tick after the save");
+        assert!(
+            (report.fans[0].commanded_speed - 0.3).abs() < 1e-9,
+            "saving must not reset the ramp"
+        );
     }
 
     #[test]

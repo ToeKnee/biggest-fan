@@ -128,6 +128,12 @@ and speeds ramp by at most `max_step_per_tick` per tick (failsafes bypass
 this). If an auto fan's sensor stops reporting, the fan goes to
 `fail_safe_speed`.
 
+Changing a fan's profile — swapping the curve preset, re-binding the sensor,
+or coming back to _auto_ from a fixed speed — continues the ramp from the
+speed the fan is already at instead of restarting it at 0. Only _off_ resets
+the baseline: a fan you deliberately stopped really does start its next ramp
+there.
+
 A fan's `min_speed` floor outranks all of that: in fixed or auto mode the
 engine can never take it lower, and it jumps straight to the floor instead of
 ramping up through speeds it is not allowed to run at. Only _off_ stops a
