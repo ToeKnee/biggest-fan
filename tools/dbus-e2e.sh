@@ -54,7 +54,7 @@ export DBUS_SYSTEM_BUS_ADDRESS
 echo "private bus at: $DBUS_SYSTEM_BUS_ADDRESS"
 
 # --- scenario 1: daemon answers method calls on the bus -------------------
-"$DAEMON" --config "$SMOKE/e2e-daemon-config.toml" --dry-run --no-nvidia \
+"$DAEMON" --config "$SMOKE/e2e-daemon-config.toml" --dry-run \
     >"$SMOKE/e2e-daemon.log" 2>&1 &
 DAEMON_PID=$!
 i=0
@@ -101,7 +101,7 @@ fi
 # machine-independent path is the engine's rejection — proof the method is on
 # the bus rather than a D-Bus "unknown method" error.
 if timeout 5 busctl --no-pager call "$BUS_NAME" "$OBJ_PATH" "$IFACE" SetFanMinSpeed \
-        s d "biggest-fan-e2e-does-not-exist-p1" 0.4 | grep -q 'ok[^,]*false'; then
+        sd "biggest-fan-e2e-does-not-exist-p1" 0.4 | grep -q 'ok[^,]*false'; then
     pass "SetFanMinSpeed answers an envelope for a fan the machine does not have"
 else
     fail "SetFanMinSpeed did not answer an envelope"
@@ -132,7 +132,7 @@ if [ -n "${WAYLAND_DISPLAY:-}${DISPLAY:-}" ]; then
     fi
 
     # --- scenario 3: GUI joins the running service and stays alive -------
-    "$DAEMON" --config "$SMOKE/e2e-daemon-config.toml" --dry-run --no-nvidia \
+    "$DAEMON" --config "$SMOKE/e2e-daemon-config.toml" --dry-run \
         >"$SMOKE/e2e-daemon2.log" 2>&1 &
     DAEMON_PID=$!
     sleep 2
@@ -171,7 +171,7 @@ fi
 
 # --- scenario 4: daemon degrades gracefully when the bus is broken --------
 DBUS_SYSTEM_BUS_ADDRESS=unix:path=/nonexistent-bus-socket \
-    timeout 4 "$DAEMON" --config "$SMOKE/e2e-daemon-config.toml" --dry-run --no-nvidia \
+    timeout 4 "$DAEMON" --config "$SMOKE/e2e-daemon-config.toml" --dry-run \
     >"$SMOKE/e2e-daemon-nobus.log" 2>&1 &
 NOBUS_PID=$!
 sleep 3

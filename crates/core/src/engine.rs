@@ -26,13 +26,16 @@ pub struct Discovery {
 /// Discovers sensors and fan headers.
 ///
 /// `hwmon_root` is normally `/sys/class/hwmon`; tests may point it at a
-/// fixture tree. `use_nvidia` controls whether NVML is attempted (a missing
-/// NVIDIA driver is not an error).
+/// fixture tree. `use_nvidia` controls whether NVML is attempted — the
+/// binaries always attempt it and need no NVIDIA-related configuration:
+/// a machine without NVIDIA management just discovers no NVIDIA
+/// sensors or coolers. Tests pass `false` to stay off the GPU entirely.
 ///
 /// # Errors
 ///
-/// [`CoreError::Io`] when the hwmon root is unreadable, or NVML errors
-/// beyond "driver not present".
+/// [`CoreError::Io`] when the hwmon root is unreadable, or [`CoreError::Nvidia`]
+/// when NVML starts but cannot enumerate devices (a broken driver state,
+/// reported rather than quietly hiding an NVIDIA GPU).
 pub fn discover(hwmon_root: &Path, use_nvidia: bool) -> Result<Discovery, CoreError> {
     let mut hwmon = HwmonSource::with_root(hwmon_root);
     let mut discovery = Discovery {
@@ -169,7 +172,9 @@ fn governing_sensor_for(sensors: &[SensorDescriptor], fan: &FanDescriptor) -> Op
 pub struct EngineOptions {
     /// hwmon class directory (tests point this at a fixture).
     pub hwmon_root: PathBuf,
-    /// Attempt to read NVIDIA GPUs through NVML.
+    /// Attempt to read NVIDIA GPUs through NVML. The binaries always keep
+    /// this `true` (no NVIDIA management just discovers nothing NVIDIA);
+    /// `false` is for tests and fixtures that must not touch NVML.
     pub use_nvidia: bool,
     /// When false the loop computes speeds but never touches fan headers
     /// (`--dry-run` and tests).

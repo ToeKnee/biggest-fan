@@ -39,10 +39,6 @@ struct Cli {
     #[arg(long, global = true)]
     dry_run: bool,
 
-    /// Skip NVIDIA GPU reading through NVML
-    #[arg(long, global = true)]
-    no_nvidia: bool,
-
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -71,7 +67,9 @@ fn main() -> ExitCode {
         .unwrap_or_else(core::config::default_config_path);
     let options = core::EngineOptions {
         hwmon_root: PathBuf::from("/sys/class/hwmon"),
-        use_nvidia: !cli.no_nvidia,
+        // NVIDIA management is always attempted: a machine without an
+        // NVIDIA GPU simply ends up with no NVIDIA sensors or coolers.
+        use_nvidia: true,
         apply_writes: !cli.dry_run,
     };
 
@@ -185,4 +183,17 @@ fn detect_fans(mut engine: core::Engine) -> Result<(), core::CoreError> {
     }
     engine.save_config()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nvidia_handling_needs_no_option() {
+        // `--no-nvidia` is gone: machines without an NVIDIA GPU need no
+        // explicit configuration, and the flag is rejected outright.
+        assert!(Cli::try_parse_from(["biggest-fan", "--no-nvidia", "scan"]).is_err());
+        assert!(Cli::try_parse_from(["biggest-fan", "--dry-run", "scan"]).is_ok());
+    }
 }

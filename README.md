@@ -20,8 +20,9 @@ Has adjustable update time (default to 1 second refresh)
 - GTK 4 development packages, e.g. on Debian/Ubuntu:
   `sudo apt install libgtk-4-dev pkg-config`
 - For NVIDIA GPU temperatures: the system NVIDIA driver provides
-  `libnvidia-ml.so` (loaded at runtime via NVML). Pass `--no-nvidia` on
-  machines without an NVIDIA GPU.
+  `libnvidia-ml.so` (loaded at runtime via NVML). Both binaries always
+  attempt NVML: without NVIDIA management no NVIDIA sensors or coolers
+  simply show up, so no configuration is needed on non-NVIDIA machines.
 
 ### Workspace layout
 
@@ -51,8 +52,9 @@ a display), and that the daemon keeps running when the bus is broken.
 ## Usage
 
 Global flags (both binaries): `--config PATH` (default
-`~/.config/biggest-fan/config.toml`), `--dry-run` (compute speeds but never
-write to the fan headers), `--no-nvidia`.
+`~/.config/biggest-fan/config.toml`) and `--dry-run` (compute speeds but
+never write to the fan headers). NVIDIA handling needs no flag: a machine
+without an NVIDIA GPU just discovers no NVIDIA sensors or coolers.
 
 ```sh
 biggest-fan scan          # list discovered sensors and fan headers
