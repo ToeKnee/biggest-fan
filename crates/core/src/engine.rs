@@ -1346,25 +1346,37 @@ const fn is_gpu_cooler(header: &FanDriver) -> bool {
     matches!(header, FanDriver::Nvidia(_))
 }
 
-/// Clamps a slot inside the case canvas: neither a circle's diameter
-/// nor a rectangle's sides can exceed the canvas, and the centre stays
-/// far enough from the edges that the whole shape is on the page — a fan
-/// drawn off-canvas can never be grabbed to move it back.
+/// How far a slot's shape must stay from the case walls: a fan drawn
+/// flush with the outline (or its rpm/⚠ label across it) reads as
+/// touching the edge. Shapes are also sized so they still fit inside
+/// the padded walls.
+const SLOT_EDGE_PAD: f64 = 16.0;
+
+/// The largest a shape's side along one canvas dimension may get: the
+/// padded interior, floored at the 10-unit minimum shape size.
+const fn max_shape_size(dimension: f64) -> f64 {
+    (-2.0_f64).mul_add(SLOT_EDGE_PAD, dimension).max(10.0)
+}
+
+/// Clamps a slot inside the case canvas: the shape fits, and its centre
+/// stays [`SLOT_EDGE_PAD`] away from the walls so nothing touches the
+/// outline — a fan drawn off-canvas can never be grabbed to move it
+/// back. (On a canvas too small for the shape plus padding, the shape
+/// just centres itself.)
 fn fit_slot(mut slot: FanSlot, case: &CaseConfig) -> FanSlot {
-    match slot.rect {
-        Some((width, height)) => {
-            slot.rect = Some((
-                width.clamp(10.0, case.width),
-                height.clamp(10.0, case.height),
-            ));
-        }
-        None => {
-            slot.diameter = slot.diameter.clamp(10.0, case.width.min(case.height));
-        }
+    if let Some((width, height)) = slot.rect {
+        slot.rect = Some((
+            width.clamp(10.0, max_shape_size(case.width)),
+            height.clamp(10.0, max_shape_size(case.height)),
+        ));
+    } else {
+        let max_diameter = max_shape_size(case.width.min(case.height));
+        slot.diameter = slot.diameter.clamp(10.0, max_diameter);
     }
     let (half_width, half_height) = slot.half_extents();
-    slot.x = slot.x.clamp(half_width, case.width - half_width);
-    slot.y = slot.y.clamp(half_height, case.height - half_height);
+    let (x_floor, y_floor) = (half_width + SLOT_EDGE_PAD, half_height + SLOT_EDGE_PAD);
+    slot.x = slot.x.clamp(x_floor, (case.width - x_floor).max(x_floor));
+    slot.y = slot.y.clamp(y_floor, (case.height - y_floor).max(y_floor));
     slot
 }
 
@@ -1389,19 +1401,29 @@ fn default_slot(index: usize, total: usize, case: &CaseConfig, rectangular: bool
         );
     }
     let diameter = 60.0;
-    let pitch = diameter + 14.0;
+    // The grid spans the padded interior: inset is the smallest distance
+    // a centre may sit from a wall, and the pitch shrinks (never below
+    // what keeps circles apart) if the preferred spacing would overflow.
+    let inset = diameter / 2.0 + SLOT_EDGE_PAD;
+    let usable_width = (-2.0_f64).mul_add(inset, case.width).max(0.0);
+    let usable_height = (-2.0_f64).mul_add(inset, case.height).max(0.0);
     // Smallest column count whose grid fits every fan (integer square
     // root of `total`, never below 1).
     let mut columns = 1usize;
     while columns * columns < total {
         columns += 1;
     }
+    let rows = total.div_ceil(columns);
+    #[expect(clippy::cast_precision_loss, reason = "grid counts are tiny")]
+    let pitch = (diameter + 14.0)
+        .min(usable_width / ((columns - 1).max(1)) as f64)
+        .min(usable_height / ((rows - 1).max(1)) as f64);
     #[expect(clippy::cast_precision_loss, reason = "grid indices are tiny")]
     let (column, row) = ((index % columns) as f64, (index / columns) as f64);
     fit_slot(
         FanSlot {
-            x: column.mul_add(pitch, 18.0 + diameter / 2.0),
-            y: row.mul_add(pitch, 18.0 + diameter / 2.0),
+            x: column.mul_add(pitch, inset),
+            y: row.mul_add(pitch, inset),
             diameter,
             rect: None,
             airflow: Airflow::Exhaust,
@@ -2489,8 +2511,8 @@ mod tests {
         let auto = engine.fan_slot(&FanId::new("nct6795-p1")).expect("slot");
         assert!((auto.diameter - 60.0).abs() < 1e-9);
         let slot = FanSlot {
-            x: 60.0,
-            y: 60.0,
+            x: 90.0,
+            y: 90.0,
             diameter: 120.0,
             rect: None,
             airflow: Airflow::Intake,
@@ -2517,8 +2539,14 @@ mod tests {
         for index in 0..total {
             let slot = default_slot(index, total, &case, false);
             let radius = slot.diameter / 2.0;
-            assert!(slot.x >= radius && slot.x <= case.width - radius);
-            assert!(slot.y >= radius && slot.y <= case.height - radius);
+            assert!(
+                slot.x >= radius + SLOT_EDGE_PAD && slot.x <= case.width - radius - SLOT_EDGE_PAD,
+                "slot {index} must sit clear of the side walls"
+            );
+            assert!(
+                slot.y >= radius + SLOT_EDGE_PAD && slot.y <= case.height - radius - SLOT_EDGE_PAD,
+                "slot {index} must sit clear of the top and bottom walls"
+            );
             assert!(
                 !seen.contains(&(slot.x, slot.y)),
                 "slot {index} lands where another already sits"
@@ -2546,9 +2574,16 @@ mod tests {
         let fitted = engine.fan_slot(&FanId::new("nct6795-p1")).expect("slot");
         let case = engine.case_config();
         let radius = fitted.diameter / 2.0;
-        assert!(fitted.diameter <= case.width.min(case.height));
-        assert!(fitted.x >= radius && fitted.x <= case.width - radius);
-        assert!(fitted.y >= radius && fitted.y <= case.height - radius);
+        assert!(
+            2.0_f64.mul_add(SLOT_EDGE_PAD, fitted.diameter) <= case.width.min(case.height),
+            "even a huge fan is sized to fit inside the padded walls"
+        );
+        assert!(
+            fitted.x >= radius + SLOT_EDGE_PAD && fitted.x <= case.width - radius - SLOT_EDGE_PAD
+        );
+        assert!(
+            fitted.y >= radius + SLOT_EDGE_PAD && fitted.y <= case.height - radius - SLOT_EDGE_PAD
+        );
     }
 
     #[test]
@@ -2569,7 +2604,7 @@ mod tests {
         let engine = engine_over(dir.path(), false, vec![fan]).expect("engine");
         let slot = engine.fan_slot(&FanId::new("nct6795-p1")).expect("slot");
         let case = engine.case_config();
-        assert!(slot.y + 30.0 <= case.height);
+        assert!(slot.y + 30.0 <= case.height - SLOT_EDGE_PAD);
     }
 
     #[test]
@@ -2578,7 +2613,8 @@ mod tests {
         fixture(dir.path());
         let mut engine = engine_over(dir.path(), false, vec![fixed_fan("nct6795-p1", &[], false)])
             .expect("engine");
-        // A card wider than the 300-wide canvas is trimmed to fit.
+        // A card wider than the 300-wide canvas is trimmed to fit inside
+        // the padded walls.
         engine
             .set_fan_slot(
                 &FanId::new("nct6795-p1"),
@@ -2592,17 +2628,23 @@ mod tests {
             )
             .expect("set");
         let slot = engine.fan_slot(&FanId::new("nct6795-p1")).expect("slot");
-        assert_eq!(slot.rect, Some((300.0, 100.0)));
+        assert_eq!(slot.rect, Some((268.0, 100.0)));
         assert!(slot.is_rectangular());
         let case = engine.case_config();
         let (half_width, half_height) = slot.half_extents();
-        assert!(slot.x >= half_width && slot.x <= case.width - half_width);
-        assert!(slot.y >= half_height && slot.y <= case.height - half_height);
+        assert!(
+            slot.x >= half_width + SLOT_EDGE_PAD
+                && slot.x <= case.width - half_width - SLOT_EDGE_PAD
+        );
+        assert!(
+            slot.y >= half_height + SLOT_EDGE_PAD
+                && slot.y <= case.height - half_height - SLOT_EDGE_PAD
+        );
         engine.save_config().expect("save");
         let reloaded = crate::config::load(&dir.path().join("config.toml")).expect("reload");
         assert_eq!(
             reloaded.fans[0].slot.and_then(|slot| slot.rect),
-            Some((300.0, 100.0))
+            Some((268.0, 100.0))
         );
     }
 

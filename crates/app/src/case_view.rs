@@ -85,10 +85,11 @@ pub fn install(engine_rc: Rc<RefCell<core::Engine>>) -> DrawingArea {
             f64::from(update_area.height()),
             case,
         );
-        let (half_width, half_height) = start.half_extents();
+        // The engine's `set_fan_slot` clamps the slot back inside the
+        // padded case walls, so the drag just chases the pointer.
         let slot = core::FanSlot {
-            x: (start.x + offset_x / scale).clamp(half_width, case.width - half_width),
-            y: (start.y + offset_y / scale).clamp(half_height, case.height - half_height),
+            x: start.x + offset_x / scale,
+            y: start.y + offset_y / scale,
             diameter: start.diameter,
             rect: start.rect,
             airflow: start.airflow,
