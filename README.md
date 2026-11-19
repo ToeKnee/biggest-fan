@@ -299,7 +299,10 @@ speed floor under _extra settings_ (some tachometers report exactly double:
 its curve is). The window opens at
 1600×900 maximised; fans you have not placed yet are laid out on a grid
 inside the case drawing, and saved positions outside the case are
-clamped back in at startup. If it cannot
+clamped back in at startup — always keeping a small margin from the case
+walls, so no fan shape or its label touches the outline. Each fan row
+sits in its own subtle tile; the tiles flow one per line normally, or two
+side by side when the panel is wide enough (a 4K screen). If it cannot
 join — no system bus, no service owning the bus name, or a service that
 never answers — it prints which of those it is plus the fix (`sudo
 systemctl enable --now biggest-fan.service`, or `sudo

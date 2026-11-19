@@ -30,6 +30,31 @@ const CURVE_CUSTOM: &str = "custom";
 const SHAPE_CIRCLE: &str = "circle";
 const SHAPE_RECTANGLE: &str = "rectangle";
 
+/// Style class that turns each fan row into a subtle tile. The colours
+/// are translucent tints of the theme's own foreground, so the tile
+/// reads softly on both light and dark themes.
+pub const FAN_TILE_CLASS: &str = "fan-tile";
+
+/// Style class for the panel container that lays the fan tiles out as
+/// a flow: one tile per line on a 1080p-sized panel, two side by side
+/// once it is wide enough (the two graphs per tile set the break).
+pub const FAN_FLOW_CLASS: &str = "fan-flow";
+
+/// The stylesheet [`FAN_TILE_CLASS`] and [`FAN_FLOW_CLASS`] expect,
+/// installed on the GUI's display when a window is built.
+pub const FAN_TILE_CSS: &str = "
+.fan-tile {
+    background-color: alpha(@theme_fg_color, 0.05);
+    border: 1px solid alpha(@theme_fg_color, 0.16);
+    border-radius: 10px;
+    padding: 10px 12px;
+}
+
+.fan-flow > flowboxchild {
+    padding: 6px;
+}
+";
+
 /// Placement widgets bundled so any one change can push the whole slot.
 struct PlacementWidgets {
     airflow_combo: ComboBoxText,
@@ -95,6 +120,7 @@ impl FanControls {
         client: &dbus::Client,
     ) -> Self {
         let container = GtkBox::new(Orientation::Vertical, 4);
+        container.add_css_class(FAN_TILE_CLASS);
 
         let header = GtkBox::new(Orientation::Horizontal, 8);
         // The fan's name is editable straight where it is shown; an empty
@@ -219,6 +245,19 @@ impl FanControls {
     #[must_use]
     pub const fn fan_id(&self) -> &core::FanId {
         &self.fan_id
+    }
+
+    /// Takes this fan's row out of the panel: inside the flow the cell
+    /// wrapper is what occupies a layout slot, so hide that too.
+    pub fn hide_row(&self) {
+        self.container.set_visible(false);
+        if let Some(cell) = self
+            .container
+            .parent()
+            .filter(|parent| parent.downcast_ref::<gtk4::FlowBoxChild>().is_some())
+        {
+            cell.set_visible(false);
+        }
     }
 
     /// Builds one checkbox per fan header for driving headers together as

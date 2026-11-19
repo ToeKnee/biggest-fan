@@ -3,13 +3,13 @@
 
 use crate::case_view;
 use crate::dbus;
-use crate::fan_controls::FanControls;
+use crate::fan_controls::{FAN_FLOW_CLASS, FAN_TILE_CSS, FanControls};
 use biggest_fan_core as core;
 use glib::{ControlFlow, SourceId};
 use gtk4::prelude::*;
 use gtk4::{
-    Application, ApplicationWindow, Box as GtkBox, Button, ComboBoxText, HeaderBar, Label, ListBox,
-    ListBoxRow, Orientation, PolicyType, ScrolledWindow, SpinButton, gio,
+    Application, ApplicationWindow, Box as GtkBox, Button, ComboBoxText, FlowBox, HeaderBar, Label,
+    ListBox, ListBoxRow, Orientation, PolicyType, ScrolledWindow, SpinButton, gio,
 };
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -22,8 +22,8 @@ struct GuiState {
     engine: Rc<RefCell<core::Engine>>,
     /// Fan rows, in panel order; "Add fan" appends more at runtime.
     fan_controls: RefCell<Vec<FanControls>>,
-    /// The box fan rows live in (new rows are appended to it).
-    fans_box: GtkBox,
+    /// The flow of fan row tiles (new rows are inserted into it).
+    fans_flow: FlowBox,
     /// Unmanaged headers offered by "Add fan", and its button.
     unclaimed_combo: ComboBoxText,
     add_button: Button,
@@ -77,6 +77,24 @@ pub fn run(
     code
 }
 
+/// Installs the app's stylesheet (the fan-row tiles from
+/// `fan_controls::FAN_TILE_CSS`) on the display this window lives on.
+fn install_stylesheet() {
+    let provider = gtk4::CssProvider::new();
+    // A broken selector would be reported by GTK itself; the rows stay
+    // usable plain either way. (`load_from_data`; `load_from_string`
+    // would need the gtk `v4_12` feature.)
+    provider.load_from_data(FAN_TILE_CSS);
+    // The window exists before this runs, so a display always does.
+    if let Some(display) = gtk4::gdk::Display::default() {
+        gtk4::style_context_add_provider_for_display(
+            &display,
+            &provider,
+            gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
+        );
+    }
+}
+
 fn build_window(
     application: &Application,
     engine_rc: &Rc<RefCell<core::Engine>>,
@@ -93,6 +111,7 @@ fn build_window(
         .default_height(900)
         .build();
     window.set_maximized(true);
+    install_stylesheet();
 
     let header = HeaderBar::new();
     let save_button = Button::builder().label("Save config").build();
@@ -173,7 +192,7 @@ fn build_window(
     let state = Rc::new(GuiState {
         engine: Rc::clone(engine_rc),
         fan_controls: RefCell::new(fan_panel.controls),
-        fans_box: fan_panel.fans_box,
+        fans_flow: fan_panel.fans_flow,
         unclaimed_combo: fan_panel.unclaimed_combo,
         add_button: fan_panel.add_button,
         sensor_rows,
@@ -228,7 +247,7 @@ fn on_detect_clicked(state: &GuiState) {
 fn hide_control_rows(state: &GuiState, ids: &[core::FanId]) {
     for controls in state.fan_controls.borrow().iter() {
         if ids.contains(controls.fan_id()) {
-            controls.container.set_visible(false);
+            controls.hide_row();
         }
     }
     state.case_area.queue_draw();
@@ -271,7 +290,7 @@ fn on_add_fan_clicked(state: &GuiState) {
         &state.case_area,
         &state.client,
     );
-    state.fans_box.append(&controls.container);
+    state.fans_flow.insert(&controls.container, -1);
     state.fan_controls.borrow_mut().push(controls);
     populate_addable_headers(
         &state.unclaimed_combo,
@@ -355,11 +374,12 @@ fn wire_interval_spin(
     });
 }
 
-/// The "Fans" panel: one control row per managed fan group (in a box new
-/// rows can be appended to) with an "add a fan header" row underneath.
+/// The "Fans" panel: one control row per managed fan group (in a flow
+/// new rows can be inserted into) with an "add a fan header" row
+/// underneath.
 struct FanPanel {
     controls: Vec<FanControls>,
-    fans_box: GtkBox,
+    fans_flow: FlowBox,
     unclaimed_combo: ComboBoxText,
     add_button: Button,
 }
@@ -379,13 +399,21 @@ fn append_fans_panel(
             .xalign(0.0)
             .build(),
     );
-    let fans_box = GtkBox::new(Orientation::Vertical, 12);
-    panel.append(&fans_box);
+    // The fan rows are flow tiles: one per line on a 1080p-sized panel,
+    // two side by side once the panel is wide enough for a 4K screen.
+    // Each tile's minimum content width (the two graphs side by side)
+    // is what decides where the flow breaks.
+    let fans_flow = FlowBox::new();
+    fans_flow.add_css_class(FAN_FLOW_CLASS);
+    fans_flow.set_min_children_per_line(1);
+    fans_flow.set_max_children_per_line(2);
+    fans_flow.set_selection_mode(gtk4::SelectionMode::None);
+    panel.append(&fans_flow);
     let fan_ids_and_names = engine_rc.borrow().managed_fans();
     let mut fan_controls = Vec::new();
     for (fan_id, name) in fan_ids_and_names {
         let controls = FanControls::new(engine_rc, &fan_id, &name, case_area, client);
-        fans_box.append(&controls.container);
+        fans_flow.insert(&controls.container, -1);
         fan_controls.push(controls);
     }
     // The add row sits below the existing fans: new rows join the list
@@ -402,7 +430,7 @@ fn append_fans_panel(
     panel.append(&add_row);
     let panel = FanPanel {
         controls: fan_controls,
-        fans_box,
+        fans_flow,
         unclaimed_combo,
         add_button,
     };
@@ -498,7 +526,7 @@ fn tick_once(state: &GuiState) {
             None => {
                 // The control loop parked this fan (for example its driver
                 // refused writes), so its row leaves the panel too.
-                controls.container.set_visible(false);
+                controls.hide_row();
             }
         }
     }
