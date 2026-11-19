@@ -575,6 +575,18 @@ impl Engine {
             // _Off_ is exempt — stopping a fan by hand is the user's choice.
             commanded = commanded.max(floor);
         }
+        // What the hardware will actually run, asked *before* the writes:
+        // the NVIDIA mapping depends on who holds the fans beforehand and
+        // what the card reads, which is exactly what `apply` will use. An
+        // NVIDIA cooler parks below 25 %, holds 30 % inside the band, and
+        // takes a cooler the card has spun above its floor at the floor
+        // itself (see `fans/nvidia.rs`). _Off_ never takes over: it parks
+        // through `stop`, so the report must not claim otherwise.
+        let effective = if matches!(mode, FanMode::Off) {
+            0.0
+        } else {
+            entry.headers[0].effective_speed(commanded)
+        };
         if self.apply_writes {
             write_headers(
                 &mut entry.headers,
@@ -584,11 +596,10 @@ impl Engine {
             )?;
         }
         entry.runtime.last_commanded = commanded;
-        // What the hardware actually runs, and a note when it contradicts the
-        // speed just written: a GPU cooler whose stop the driver refused, or
-        // one that never started turning. A lost header outranks that note —
-        // it is about to be parked anyway.
-        let effective = entry.headers[0].effective_speed(commanded);
+        // A note when the read-back contradicts the speed just written: a
+        // GPU cooler whose stop the driver refused, or one that never
+        // started turning. A lost header outranks that note — it is about
+        // to be parked anyway.
         if let Some(readback) = entry.headers[0].speed_note(effective) {
             note.get_or_insert(readback);
         }
@@ -602,9 +613,10 @@ impl Engine {
             mode,
             // Report the speed the leader header can actually run, not
             // just what the curve asked for (an NVIDIA cooler parks below
-            // 25 % and holds 30 % inside the band up to its spin floor); the
-            // ramp and hold band still use the requested value, so groups
-            // that mix driver kinds are approximated.
+            // 25 %, holds 30 % inside the band, and takes a card-driven
+            // cooler above its floor at the floor); the ramp and hold band
+            // still use the requested value, so groups that mix driver
+            // kinds are approximated.
             commanded_speed: effective,
             measured_percent: entry.headers.iter().find_map(FanDriver::read_percent),
             measured_rpm: entry

@@ -245,7 +245,17 @@ Differences from sysfs headers:
   `fans/nvidia.rs`), where a modern card parks them at 0 rpm; a request of
   30 % or more takes them back under our control. A request in the 25–30 %
   band keeps whatever the cooler was last doing, so a curve or a ramp that
-  crosses the band never stops and restarts the fans. Handing the policy
+  crosses the band never stops and restarts the fans. On top of that sits a
+  take-over rule: while the card itself has the fans reading above 30 %
+  (its automatic policy warmed up) and our request asks under the floor, we
+  take the cooler at 30 % instead of parking — a Quiet profile (which only
+  reaches 30 % at 65 °C) can keep a hot card down at the floor rather than
+  leaving it to the card's louder policy. A parked card reads 0 %, so a
+  fan-off-when-cool profile still switches the fans fully off, and a cooler
+  the card has parked is never disturbed. In the zone where the card's own
+  policy wants more than 30 % but a curve asks under 25 %, the cooler hands
+  back and is taken again every other tick: the fans stay around the floor
+  but the effective percent shown alternates 0 %/30 %. Handing the policy
   back parks the fans a couple of seconds later — the card, not us, decides
   the moment (confirmed on a 4070 SUPER). Writing 0 percent is
   deliberately not the park path — the driver clamps it to its minimum (30 %

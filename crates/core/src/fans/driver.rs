@@ -51,10 +51,13 @@ impl FanDriver {
     /// NVIDIA coolers spin only at 30 % or above and park below 25 %, so a
     /// request inside that band keeps the cooler doing what it already was
     /// ([`crate::fans::nvidia::MIN_SPIN_FRACTION`] and
-    /// [`crate::fans::nvidia::SPIN_DOWN_FRACTION`]); sysfs headers take any
+    /// [`crate::fans::nvidia::SPIN_DOWN_FRACTION`]); a request under the
+    /// floor hands the fans back to the card — unless the card itself reads
+    /// them above the floor, which takes control at the floor
+    /// ([`crate::fans::nvidia::effective_speed`]). Sysfs headers take any
     /// fraction. [`NvidiaFan::apply`] realises the same mapping on the wire,
-    /// so asking for this after a write is stable; asking without a write
-    /// (a dry run) reports what a write would do from the current state.
+    /// so asking before a write predicts it; asking after one reports what
+    /// the write settled on.
     #[must_use]
     pub fn effective_speed(&self, requested: f64) -> f64 {
         match self {

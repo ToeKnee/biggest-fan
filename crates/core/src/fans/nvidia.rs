@@ -77,29 +77,51 @@ const SPEED_GRANULARITY: f64 = 0.005;
 ///  request >= 30 %   >= 30 %               >= 30 %
 /// ```
 ///
+/// `card_above_floor` is true when the card reads its fans above the floor
+/// ([`NvidiaFan::read_percent`] > [`MIN_SPIN_FRACTION`]). It adds one
+/// take-over on top of the table: a request under 30 % while the card
+/// itself has the fans above 30 % commands the floor instead of parking.
+/// A Quiet profile, which only crosses the floor at 65 °C, can then quiet
+/// a card-driven 40 % down to 30 % rather than leaving the cooler to the
+/// card. Under `Manual` the reading is this process's own last command,
+/// which is why the rule is gated on the owner; `Unknown` is handed to the
+/// card first (its low request parks it) and the rule picks the cooler back
+/// up on the next tick. A parked card reads 0 %, so the rule stays off and
+/// a fan-off-when-cool profile still switches the fans fully off.
+///
 /// Examples:
 ///
 /// ```
 /// use biggest_fan_core::fans::nvidia::{FanOwnership, effective_speed};
 ///
-/// // Off always parks the cooler, even while it is spinning.
-/// assert_eq!(effective_speed(0.0, FanOwnership::Manual), 0.0);
+/// // Off always parks a cooler the card is not running above the floor.
+/// assert_eq!(effective_speed(0.0, FanOwnership::Manual, false), 0.0);
 /// // Mid-band requests keep the cooler doing what it already was.
-/// assert_eq!(effective_speed(0.27, FanOwnership::Manual), 0.30);
-/// assert_eq!(effective_speed(0.27, FanOwnership::Driver), 0.0);
+/// assert_eq!(effective_speed(0.27, FanOwnership::Manual, false), 0.30);
+/// assert_eq!(effective_speed(0.27, FanOwnership::Driver, false), 0.0);
 /// // A stopped cooler only restarts at the floor it can hold.
-/// assert_eq!(effective_speed(0.30, FanOwnership::Driver), 0.30);
+/// assert_eq!(effective_speed(0.30, FanOwnership::Driver, false), 0.30);
+/// // The card has its fans at 40 %; a Quiet-style 20 % request takes them
+/// // at the floor rather than handing control back.
+/// assert_eq!(effective_speed(0.20, FanOwnership::Driver, true), 0.30);
 /// ```
 #[must_use]
-pub fn effective_speed(requested: f64, ownership: FanOwnership) -> f64 {
+pub fn effective_speed(requested: f64, ownership: FanOwnership, card_above_floor: bool) -> f64 {
     // A request that is not a number must never park a cooler: run it full,
     // the same fail-safe direction as `FanCurve::speed_at`.
     if !requested.is_finite() {
         return 1.0;
     }
     if requested >= MIN_SPIN_FRACTION {
-        requested
-    } else if requested < SPIN_DOWN_FRACTION {
+        return requested;
+    }
+    // The take-over rule: the card has the fans above the floor while our
+    // request cannot reach that speed, so command the floor rather than
+    // leave the cooler (or park it) under a hotter automatic policy.
+    if card_above_floor && matches!(ownership, FanOwnership::Driver | FanOwnership::ForcedStop) {
+        return MIN_SPIN_FRACTION;
+    }
+    if requested < SPIN_DOWN_FRACTION {
         0.0
     } else if ownership == FanOwnership::Manual {
         MIN_SPIN_FRACTION
@@ -284,7 +306,8 @@ impl NvidiaFan {
     ///
     /// Requests that resolve to a stop (see [`effective_speed`]) park the
     /// cooler through [`NvidiaFan::stop`] rather than writing a percent the
-    /// card cannot hold.
+    /// card cannot hold. The take-over rule can turn a low request into a
+    /// 30 % command when the card itself has the fans above the floor.
     ///
     /// # Errors
     ///
@@ -292,7 +315,7 @@ impl NvidiaFan {
     /// process lacks the privileges (fan writes need root), other errors
     /// mean the card disallows software fan control.
     pub fn apply(&mut self, speed_fraction: f64) -> Result<(), CoreError> {
-        let speed = effective_speed(speed_fraction, self.ownership);
+        let speed = effective_speed(speed_fraction, self.ownership, self.card_above_floor());
         if speed <= 0.0 {
             return self.stop();
         }
@@ -397,12 +420,23 @@ impl NvidiaFan {
     }
 
     /// The speed fraction this cooler can actually run for `requested`,
-    /// given who holds the fans now. The same mapping [`NvidiaFan::apply`]
-    /// writes, without touching the hardware — the engine reports it so the
-    /// UI never claims a cooler is crawling at 20 %.
+    /// given who holds the fans now and what the card reads. The same
+    /// mapping [`NvidiaFan::apply`] writes, without changing anything —
+    /// the engine reports it so the UI never claims a cooler is crawling
+    /// at 20 % or parked while the take-over rule has it at the floor.
     #[must_use]
     pub fn effective_speed(&self, requested: f64) -> f64 {
-        effective_speed(requested, self.ownership)
+        effective_speed(requested, self.ownership, self.card_above_floor())
+    }
+
+    /// True when the card reads its fans above the spin floor, the hardware
+    /// fact the take-over rule in [`effective_speed`] acts on. Under
+    /// `Manual` that reading is this process's own last command, which is
+    /// why the mapping gates the rule on the owner as well.
+    #[must_use]
+    fn card_above_floor(&self) -> bool {
+        self.read_percent()
+            .is_some_and(|percent| percent > MIN_SPIN_FRACTION)
     }
 
     /// Remembers the speed and owner, restarting the read-back grace window
@@ -508,28 +542,36 @@ mod tests {
     #[test]
     fn mid_band_requests_hold_whatever_the_cooler_was_doing() {
         // Spinning at the floor: a request inside the band keeps it there.
-        assert_eq!(effective_speed(0.25, FanOwnership::Manual), 0.30);
-        assert_eq!(effective_speed(0.29, FanOwnership::Manual), 0.30);
+        assert_eq!(effective_speed(0.25, FanOwnership::Manual, false), 0.30);
+        assert_eq!(effective_speed(0.29, FanOwnership::Manual, false), 0.30);
         // Parked: the same request is not worth starting the fans for.
-        assert_eq!(effective_speed(0.27, FanOwnership::Driver), 0.0);
+        assert_eq!(effective_speed(0.27, FanOwnership::Driver, false), 0.0);
         // A cooler whose state is unknown is treated as parked.
-        assert_eq!(effective_speed(0.27, FanOwnership::Unknown), 0.0);
+        assert_eq!(effective_speed(0.27, FanOwnership::Unknown, false), 0.0);
     }
 
     #[test]
     fn parking_needs_a_clear_request_below_the_spin_down_point() {
         for state in EVERY_STATE {
-            assert_eq!(effective_speed(0.0, state), 0.0, "off mode parks");
-            assert_eq!(effective_speed(0.24, state), 0.0, "below the band parks");
-            assert_eq!(effective_speed(-0.5, state), 0.0, "clamped by the engine");
+            assert_eq!(effective_speed(0.0, state, false), 0.0, "off mode parks");
+            assert_eq!(
+                effective_speed(0.24, state, false),
+                0.0,
+                "below the band parks"
+            );
+            assert_eq!(
+                effective_speed(-0.5, state, false),
+                0.0,
+                "clamped by the engine"
+            );
         }
     }
 
     #[test]
     fn spinning_up_starts_at_the_reliable_floor() {
-        assert_eq!(effective_speed(0.30, FanOwnership::Driver), 0.30);
-        assert_eq!(effective_speed(0.50, FanOwnership::Unknown), 0.50);
-        assert_eq!(effective_speed(1.0, FanOwnership::Driver), 1.0);
+        assert_eq!(effective_speed(0.30, FanOwnership::Driver, false), 0.30);
+        assert_eq!(effective_speed(0.50, FanOwnership::Unknown, false), 0.50);
+        assert_eq!(effective_speed(1.0, FanOwnership::Driver, false), 1.0);
     }
 
     #[test]
@@ -538,10 +580,10 @@ mod tests {
         // mapping above has no band to hold and the fans flap on a ramp.
         let middle = f64::midpoint(SPIN_DOWN_FRACTION, MIN_SPIN_FRACTION);
         assert_eq!(
-            effective_speed(middle, FanOwnership::Manual),
+            effective_speed(middle, FanOwnership::Manual, false),
             MIN_SPIN_FRACTION
         );
-        assert_eq!(effective_speed(middle, FanOwnership::Driver), 0.0);
+        assert_eq!(effective_speed(middle, FanOwnership::Driver, false), 0.0);
     }
 
     #[test]
@@ -550,14 +592,14 @@ mod tests {
         // what `apply` just wrote, so that has to be a fixed point.
         for state in EVERY_STATE {
             for requested in [0.0, 0.1, 0.25, 0.27, 0.29, 0.3, 0.42, 1.0] {
-                let effective = effective_speed(requested, state);
+                let effective = effective_speed(requested, state, false);
                 let state_after = if effective > 0.0 {
                     FanOwnership::Manual
                 } else {
                     FanOwnership::Driver
                 };
                 assert_eq!(
-                    effective_speed(effective, state_after),
+                    effective_speed(effective, state_after, false),
                     effective,
                     "requested {requested} from {state:?}"
                 );
@@ -568,11 +610,13 @@ mod tests {
     #[test]
     fn a_broken_speed_request_runs_the_fan_full() {
         for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
-            assert_eq!(
-                effective_speed(value, FanOwnership::Driver),
-                1.0,
-                "{value} must never park a cooler"
-            );
+            for above_floor in [false, true] {
+                assert_eq!(
+                    effective_speed(value, FanOwnership::Driver, above_floor),
+                    1.0,
+                    "{value} must never park a cooler"
+                );
+            }
         }
     }
 
@@ -587,9 +631,39 @@ mod tests {
     #[test]
     fn a_forced_stop_counts_as_parked_for_the_next_request() {
         // A driver with no automatic policy still gets the band rules: the
-        // cooler stays parked until a request clears the spin floor.
-        assert_eq!(effective_speed(0.27, FanOwnership::ForcedStop), 0.0);
-        assert_eq!(effective_speed(0.30, FanOwnership::ForcedStop), 0.30);
+        // cooler stays parked until a request clears the spin floor. A 0 %
+        // write the driver clamped to exactly its floor reads back at 30 %,
+        // which is not *above* the floor, so no take-over either.
+        assert_eq!(effective_speed(0.27, FanOwnership::ForcedStop, false), 0.0);
+        assert_eq!(effective_speed(0.30, FanOwnership::ForcedStop, false), 0.30);
+    }
+
+    #[test]
+    fn a_cooler_the_card_holds_above_the_floor_is_taken_at_the_floor() {
+        // The take-over rule: a Quiet-style request the card cannot match.
+        // Taking control at the floor is quieter than leaving the fans to
+        // the card's louder policy and safer than parking them under a hot
+        // card.
+        for state in [FanOwnership::Driver, FanOwnership::ForcedStop] {
+            for requested in [0.0, 0.1, 0.24, 0.27, 0.29] {
+                assert_eq!(
+                    effective_speed(requested, state, true),
+                    MIN_SPIN_FRACTION,
+                    "{requested} from {state:?}"
+                );
+            }
+        }
+        // A request that already clears the floor is untouched by the rule.
+        assert_eq!(effective_speed(0.35, FanOwnership::Driver, true), 0.35);
+        // A cooler nobody has taken control of yet defers to the card: its
+        // first low request parks it (into `Driver`), then the rule picks
+        // it back up on the next tick.
+        assert_eq!(effective_speed(0.20, FanOwnership::Unknown, true), 0.0);
+        // Under `Manual` the reading is this process's own last command,
+        // so a drop below the spin-down point still parks the cooler.
+        assert_eq!(effective_speed(0.20, FanOwnership::Manual, true), 0.0);
+        // The band case is unchanged: it was already holding 30 %.
+        assert_eq!(effective_speed(0.27, FanOwnership::Manual, true), 0.30);
     }
 
     #[test]
@@ -651,19 +725,24 @@ mod tests {
         // Mapping plus percent conversion: 27 % of a spinning cooler stays
         // at 30 %, 24 % becomes a park (no percent written at all).
         assert_eq!(
-            speed_percent(effective_speed(0.27, FanOwnership::Manual)),
+            speed_percent(effective_speed(0.27, FanOwnership::Manual, false)),
             30
         );
         assert_eq!(
-            speed_percent(effective_speed(0.24, FanOwnership::Manual)),
+            speed_percent(effective_speed(0.24, FanOwnership::Manual, false)),
             0
         );
         assert_eq!(
-            speed_percent(effective_speed(0.27, FanOwnership::Driver)),
+            speed_percent(effective_speed(0.27, FanOwnership::Driver, false)),
             0
         );
         assert_eq!(
-            speed_percent(effective_speed(0.3, FanOwnership::Driver)),
+            speed_percent(effective_speed(0.3, FanOwnership::Driver, false)),
+            30
+        );
+        // The take-over rule writes the floor, never the crawl it replaced.
+        assert_eq!(
+            speed_percent(effective_speed(0.2, FanOwnership::Driver, true)),
             30
         );
     }
