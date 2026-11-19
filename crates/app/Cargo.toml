@@ -54,4 +54,18 @@ assets = [
   ["../../packaging/systemd/biggest-fan.service", "lib/systemd/system/biggest-fan.service", "644"],
   ["../../packaging/dbus/net.ynottony.ten.biggestfan.conf", "etc/dbus-1/system.d/net.ynottony.ten.biggestfan.conf", "644"],
   ["../../README.md", "usr/share/doc/biggest-fan/README.md", "644"],
+  # Launcher (.desktop name must match the GTK app id) and the app icon:
+  # scalable SVG plus fixed sizes for themes that ignore scalable icons.
+  # Re-render the PNGs with `sh tools/render-icons.sh` after SVG edits.
+  ["../../packaging/desktop/net.ynottony.ten.BiggestFan.desktop", "usr/share/applications/net.ynottony.ten.BiggestFan.desktop", "644"],
+  ["../../packaging/icons/hicolor/scalable/apps/net.ynottony.ten.BiggestFan.svg", "usr/share/icons/hicolor/scalable/apps/net.ynottony.ten.BiggestFan.svg", "644"],
+  ["../../packaging/icons/hicolor/16x16/apps/net.ynottony.ten.BiggestFan.png", "usr/share/icons/hicolor/16x16/apps/net.ynottony.ten.BiggestFan.png", "644"],
+  ["../../packaging/icons/hicolor/24x24/apps/net.ynottony.ten.BiggestFan.png", "usr/share/icons/hicolor/24x24/apps/net.ynottony.ten.BiggestFan.png", "644"],
+  ["../../packaging/icons/hicolor/32x32/apps/net.ynottony.ten.BiggestFan.png", "usr/share/icons/hicolor/32x32/apps/net.ynottony.ten.BiggestFan.png", "644"],
+  ["../../packaging/icons/hicolor/48x48/apps/net.ynottony.ten.BiggestFan.png", "usr/share/icons/hicolor/48x48/apps/net.ynottony.ten.BiggestFan.png", "644"],
+  ["../../packaging/icons/hicolor/64x64/apps/net.ynottony.ten.BiggestFan.png", "usr/share/icons/hicolor/64x64/apps/net.ynottony.ten.BiggestFan.png", "644"],
+  ["../../packaging/icons/hicolor/96x96/apps/net.ynottony.ten.BiggestFan.png", "usr/share/icons/hicolor/96x96/apps/net.ynottony.ten.BiggestFan.png", "644"],
+  ["../../packaging/icons/hicolor/128x128/apps/net.ynottony.ten.BiggestFan.png", "usr/share/icons/hicolor/128x128/apps/net.ynottony.ten.BiggestFan.png", "644"],
+  ["../../packaging/icons/hicolor/256x256/apps/net.ynottony.ten.BiggestFan.png", "usr/share/icons/hicolor/256x256/apps/net.ynottony.ten.BiggestFan.png", "644"],
+  ["../../packaging/icons/hicolor/512x512/apps/net.ynottony.ten.BiggestFan.png", "usr/share/icons/hicolor/512x512/apps/net.ynottony.ten.BiggestFan.png", "644"],
 ]

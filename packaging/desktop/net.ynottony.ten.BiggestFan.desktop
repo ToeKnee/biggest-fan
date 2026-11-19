@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Biggest Fan
+GenericName=Fan controller
+Comment=Watch temperatures and control case fans
+Exec=biggest-fan gui
+Icon=net.ynottony.ten.BiggestFan
+Terminal=false
+Categories=System;GTK;
+Keywords=fan;cooling;temperature;thermal;hardware;
+# GTK4 sets the X11 WM_CLASS from the application id, which is this file's
+# name; the match keeps a running window tied to this launcher.
+StartupWMClass=net.ynottony.ten.BiggestFan

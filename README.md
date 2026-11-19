@@ -30,6 +30,8 @@ Has adjustable update time (default to 1 second refresh)
 | ------------------- | ------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `crates/core`       | `biggest-fan-core` | Library: sensor discovery (hwmon + NVML), human naming, fan/PWM control, config (TOML), case layout, and the control-loop `Engine` with hysteresis.                                                             |
 | `crates/app`        | `biggest-fan`      | Library plus two binaries: `biggest-fan` (GTK 4 GUI — case view + fan controls — and the `scan`, `init-config`, `detect-fans` one-shot commands) and `biggest-fan-daemon` (headless control loop, for systemd). |
+| `packaging/desktop` | —                  | The `net.ynottony.ten.BiggestFan.desktop` launcher installed by the .deb.                                                                                                                                       |
+| `packaging/icons`   | —                  | The app icon (scalable SVG source + generated PNG sizes) installed into the hicolor theme by the .deb.                                                                                                          |
 | `packaging/systemd` | —                  | The `biggest-fan.service` unit installed by the .deb.                                                                                                                                                           |
 
 ### Common commands
@@ -41,6 +43,7 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo fmt --all                        # rustfmt, edition 2024
 cargo doc -p biggest-fan-core --no-deps
 sh tools/dbus-e2e.sh                   # live D-Bus smoke check: private bus, --dry-run
+sh tools/render-icons.sh               # regenerate PNG icon sizes from the SVG (needs inkscape)
 ```
 
 `tools/dbus-e2e.sh` proves the daemon↔GUI plumbing end to end: it starts a
@@ -334,11 +337,16 @@ cargo deb -p biggest-fan            # release build, output in target/debian/
 sudo dpkg -i target/debian/biggest-fan_*_amd64.deb
 ```
 
-The .deb ships both binaries, the systemd unit, the D-Bus policy file and
-this README, with the GPL text in its copyright file. Its maintainer
-scripts (`maintainer-scripts` in `[package.metadata.deb]`, files under
-`packaging/deb-scripts/`) enable and start the service on install and
-stop and disable it on removal. Packaging metadata lives in
+The .deb ships both binaries, the systemd unit, the D-Bus policy file,
+the GUI launcher (`packaging/desktop/`) and app icons
+(`packaging/icons/`: SVG + PNG sizes 16–512, regenerated from the SVG
+with `sh tools/render-icons.sh`), and this README, with the GPL text in
+its copyright file. Its maintainer scripts (`maintainer-scripts` in
+`[package.metadata.deb]`, files under `packaging/deb-scripts/`) enable
+and start the service and refresh the hicolor icon cache on install, and
+stop/disable the service and refresh the cache again on removal. The
+.desktop is named after the GTK app id so the desktop environment matches
+it to the running window. Packaging metadata lives in
 `[package.metadata.deb]` in `crates/app/Cargo.toml`.
 
 ## License
