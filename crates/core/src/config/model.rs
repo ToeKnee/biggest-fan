@@ -6,6 +6,7 @@
 //! poll_interval_ms = 1000
 //! fail_safe_speed = 1.0
 //! hidden_sensors = ["nct6795-t2"]  # hide useless temps from the GUI list
+//! quiet = false                    # daemon: fan table at startup + warnings only
 //!
 //! [hysteresis]
 //! temp_band_c = 2.0
@@ -110,6 +111,11 @@ pub struct AppConfig {
     pub poll_interval_ms: u64,
     /// Speed fraction used for auto fans whose sensor stops responding.
     pub fail_safe_speed: f64,
+    /// Daemon log chatter: when true, the fan speed table prints once at
+    /// startup and after that only fans carrying a warning, keeping the
+    /// systemd journal quiet. The daemon's `--quiet` flag forces this on
+    /// too; either one is enough. Takes effect when the daemon starts.
+    pub quiet: bool,
     /// Anti-pumping settings for auto fans.
     pub hysteresis: HysteresisConfig,
     /// Human readable display names keyed by sensor id.
@@ -135,6 +141,7 @@ impl Default for AppConfig {
         Self {
             poll_interval_ms: 1000,
             fail_safe_speed: 1.0,
+            quiet: false,
             hysteresis: HysteresisConfig::default(),
             sensor_names: BTreeMap::new(),
             hidden_sensors: Vec::new(),
@@ -182,6 +189,7 @@ mod tests {
         assert_eq!(config.poll_interval_ms, 500);
         assert!((config.fail_safe_speed - 0.8).abs() < 1e-12);
         assert!((config.hysteresis.temp_band_c - 3.0).abs() < 1e-12);
+        assert!(!config.quiet, "the example logs every tick");
         assert_eq!(config.sensor_names["k10temp-t3"], "CPU CCD 1 temperature");
         assert!(
             config.hidden_sensors.is_empty(),
@@ -243,6 +251,24 @@ mod tests {
         let text = toml::to_string_pretty(&config).expect("serialize");
         let back: AppConfig = toml::from_str(&text).expect("deserialize");
         assert_eq!(config, back);
+    }
+
+    #[test]
+    fn quiet_logging_parses_defaults_off_and_round_trips() {
+        let text = r#"
+            quiet = true
+
+            [[fans]]
+            id = "nct6795-p1"
+            mode = { type = "off" }
+        "#;
+        let config: AppConfig = toml::from_str(text).expect("parses");
+        assert!(config.quiet, "quiet = true parses");
+        let text = toml::to_string_pretty(&config).expect("serialize");
+        let back: AppConfig = toml::from_str(&text).expect("deserialize");
+        assert_eq!(config, back);
+        let bare: AppConfig = toml::from_str("").expect("parses");
+        assert!(!bare.quiet, "a config without quiet logs every tick");
     }
 
     #[test]
@@ -308,6 +334,7 @@ mod tests {
         let config = AppConfig {
             poll_interval_ms: 750,
             fail_safe_speed: 1.0,
+            quiet: false,
             hysteresis: HysteresisConfig::default(),
             sensor_names: BTreeMap::from([(
                 "k10temp-t1".to_string(),

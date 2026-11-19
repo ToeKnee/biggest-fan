@@ -57,14 +57,18 @@ a display), and that the daemon keeps running when the bus is broken.
 Global flags (both binaries): `--config PATH` (default
 `~/.config/biggest-fan/config.toml`) and `--dry-run` (compute speeds but
 never write to the fan headers). NVIDIA handling needs no flag: a machine
-without an NVIDIA GPU just discovers no NVIDIA sensors or coolers.
+without an NVIDIA GPU just discovers no NVIDIA sensors or coolers. The
+daemon's fan speed table can also quiet down the journal: `quiet = true`
+in the config, or its `--quiet` flag (either one) — the table then prints
+once at startup, proof the loop is running, and after that only for fans
+carrying a warning.
 
 ```sh
 biggest-fan scan          # list discovered sensors and fan headers
 biggest-fan init-config   # write a starter config from live hardware (--force to replace)
 biggest-fan detect-fans   # spin headers up briefly, disable ones with nothing connected
 biggest-fan gui           # case view + fan controls (also the default)
-biggest-fan-daemon        # headless control loop, for systemd
+biggest-fan-daemon        # headless control loop, for systemd (quiet log: --quiet or config quiet = true)
 ```
 
 Writing to `pwm` sysfs files requires root, so the daemon must run as
@@ -91,6 +95,8 @@ back to the defaults:
 poll_interval_ms = 1000   # control-loop refresh period (floors at 100 ms)
 fail_safe_speed = 1.0     # speed for auto fans whose sensor disappears
 hidden_sensors = ["nvme-2-t1"]  # temperatures to hide from the GUI list
+quiet = false             # daemon: print the fan table at startup + for
+                          # warnings only (--quiet does the same thing)
 
 [hysteresis]
 temp_band_c = 2.0         # how far a sensor may fall before speed drops

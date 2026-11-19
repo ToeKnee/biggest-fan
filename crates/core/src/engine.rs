@@ -1028,6 +1028,15 @@ impl Engine {
         self.config.poll_interval_ms = interval_ms.max(100);
     }
 
+    /// Whether the daemon should keep its fan table to the startup tick
+    /// plus warnings (config `quiet = true`; the daemon's `--quiet` flag
+    /// forces this on as well). The engine itself is indifferent — it is
+    /// the daemon's logging that consults this.
+    #[must_use]
+    pub const fn quiet(&self) -> bool {
+        self.config.quiet
+    }
+
     /// Case canvas size for the GUI.
     #[must_use]
     pub const fn case_config(&self) -> CaseConfig {
@@ -2783,6 +2792,34 @@ mod tests {
             .set_fan_name(&FanId::new("nope-p9"), "x")
             .expect_err("unknown fan");
         assert!(matches!(error, CoreError::UnknownFan(_)));
+    }
+
+    #[test]
+    fn engine_reports_logging_quiet_from_its_config() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        fixture(dir.path());
+        let options = EngineOptions {
+            hwmon_root: dir.path().to_path_buf(),
+            use_nvidia: false,
+            apply_writes: true,
+        };
+        let chatty = Engine::startup(
+            AppConfig::default(),
+            dir.path().join("config.toml"),
+            &options,
+        )
+        .expect("default engine");
+        assert!(!chatty.quiet(), "no config means every tick logs");
+        let quiet_engine = Engine::startup(
+            AppConfig {
+                quiet: true,
+                ..AppConfig::default()
+            },
+            dir.path().join("config.toml"),
+            &options,
+        )
+        .expect("quiet engine");
+        assert!(quiet_engine.quiet());
     }
 
     #[test]
