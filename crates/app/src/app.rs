@@ -11,6 +11,7 @@ use gtk4::{
     Application, ApplicationWindow, Box as GtkBox, Button, ComboBoxText, FlowBox, HeaderBar, Label,
     ListBox, ListBoxRow, Orientation, PolicyType, ScrolledWindow, SpinButton, gio,
 };
+use std::cell::Cell;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::rc::Rc;
@@ -27,14 +28,96 @@ struct GuiState {
     /// Unmanaged headers offered by "Add fan", and its button.
     unclaimed_combo: ComboBoxText,
     add_button: Button,
-    /// Display name and value label for each sensor row.
-    sensor_rows: BTreeMap<core::SensorId, (String, Label)>,
+    /// The sensor readout list with its hide/show plumbing.
+    sensor_panel: Rc<SensorPanel>,
     case_area: gtk4::DrawingArea,
     status_label: Label,
     /// Handle on the running root daemon; every change goes through it.
     client: dbus::Client,
     /// Answers from that daemon, drained on every tick.
     service_events: Rc<RefCell<mpsc::Receiver<dbus::Event>>>,
+}
+
+/// One row of the "Sensors" readout list.
+struct SensorRow {
+    /// Resolved display name, rebuilt into the row text every tick.
+    name: String,
+    /// Live "name  42.5 °C" label.
+    value: Label,
+    /// The row itself — hidden sensors leave the list until shown again.
+    row: ListBoxRow,
+    /// This sensor's hide/show button.
+    toggle: Button,
+}
+
+/// The "Sensors" readout list and its hide/show plumbing. Hiding a
+/// sensor is a display-only config flag ([`core::Engine::set_sensor_hidden`]):
+/// the engine keeps reading hidden sensors, so fans bound to them keep
+/// working, and the flag only reaches the service on the next Save
+/// config — same as hiding a detected fan.
+struct SensorPanel {
+    engine: Rc<RefCell<core::Engine>>,
+    status: Label,
+    rows: BTreeMap<core::SensorId, SensorRow>,
+    /// "N hidden — show" button; reveals the hidden rows so a mistake
+    /// can be undone.
+    reveal: Button,
+    showing_hidden: Cell<bool>,
+}
+
+impl SensorPanel {
+    /// Hides or shows one sensor: the flag goes to the mirror engine (and
+    /// from there into the config on the next save), the row follows.
+    fn set_hidden(&self, id: &core::SensorId, hide: bool) {
+        if let Err(error) = self.engine.borrow_mut().set_sensor_hidden(id, hide) {
+            self.status
+                .set_text(&format!("could not change {id}: {error}"));
+            return;
+        }
+        let Some(row) = self.rows.get(id) else {
+            return;
+        };
+        row.toggle.set_label(if hide { "show" } else { "hide" });
+        row.row.set_visible(!hide || self.showing_hidden.get());
+        self.refresh_reveal();
+        self.status.set_text(&if hide {
+            format!("{} hidden — press Save config to keep it hidden", row.name)
+        } else {
+            format!(
+                "{} shown again — press Save config to keep it visible",
+                row.name
+            )
+        });
+    }
+
+    /// Flips the hidden rows' visibility as a group (the row-by-row
+    /// buttons still un-hide individual sensors while they are shown).
+    fn flip_reveal(&self) {
+        let show = !self.showing_hidden.get();
+        self.showing_hidden.set(show);
+        for (id, row) in &self.rows {
+            if self.engine.borrow().sensor_hidden(id) {
+                row.row.set_visible(show);
+            }
+        }
+        self.refresh_reveal();
+    }
+
+    /// Keeps the reveal button's label and sensitivity in step with the
+    /// hidden count.
+    fn refresh_reveal(&self) {
+        let hidden = self
+            .rows
+            .keys()
+            .filter(|id| self.engine.borrow().sensor_hidden(id))
+            .count();
+        self.reveal.set_sensitive(hidden > 0);
+        self.reveal.set_label(&match hidden {
+            0 => "no hidden sensors".to_string(),
+            n if self.showing_hidden.get() => format!("hide the {n} shown sensors"),
+            n => format!("{n} hidden — show"),
+        });
+    }
 }
 
 /// Starts the GTK app; `engine` mirrors the service's config and hardware
@@ -138,10 +221,21 @@ fn build_window(
         .child(&left)
         .build();
 
+    // Bottom bar: refresh-rate control and the live status line. The
+    // status line caps its requested width and ellipsizes long messages
+    // so notes never stretch the window. Built before the sensor panel:
+    // the panel reports hide/show results through it.
+    let status_label = Label::builder()
+        .xalign(0.0)
+        .hexpand(true)
+        .ellipsize(gtk4::pango::EllipsizeMode::End)
+        .max_width_chars(48)
+        .build();
+
     // Right: fan control rows and the sensor list.
     let right = GtkBox::new(Orientation::Vertical, 12);
     let fan_panel = append_fans_panel(&right, engine_rc, &case_area, client);
-    let sensor_rows = append_sensors_panel(&right, engine_rc);
+    let sensor_panel = append_sensors_panel(&right, engine_rc, &status_label);
     let right_scroll = ScrolledWindow::builder()
         .vexpand(true)
         .hscrollbar_policy(PolicyType::Never)
@@ -155,15 +249,7 @@ fn build_window(
     paned.set_start_child(Some(&left_scroll));
     paned.set_end_child(Some(&right_scroll));
 
-    // Bottom bar: refresh-rate control and the live status line. The
-    // status line caps its requested width and ellipsizes long messages
-    // so notes never stretch the window.
-    let status_label = Label::builder()
-        .xalign(0.0)
-        .hexpand(true)
-        .ellipsize(gtk4::pango::EllipsizeMode::End)
-        .max_width_chars(48)
-        .build();
+    // Bottom bar: the refresh-rate spin next to the status line built above.
     let interval_spin = SpinButton::builder()
         .digits(1)
         .adjustment(&gtk4::Adjustment::new(1.0, 0.1, 30.0, 0.1, 1.0, 0.0))
@@ -195,7 +281,7 @@ fn build_window(
         fans_flow: fan_panel.fans_flow,
         unclaimed_combo: fan_panel.unclaimed_combo,
         add_button: fan_panel.add_button,
-        sensor_rows,
+        sensor_panel,
         case_area,
         status_label,
         client: client.clone(),
@@ -456,12 +542,13 @@ fn populate_addable_headers(combo: &ComboBoxText, button: &Button, engine: &core
     button.set_sensitive(!headers.is_empty());
 }
 
-/// Appends the sensor section (header + readout per discovered sensor)
-/// to `panel`, returning display name and value label per sensor id.
+/// Appends the sensor section (header, a readout and a hide button per
+/// discovered sensor, then the hidden-count line) to `panel`.
 fn append_sensors_panel(
     panel: &GtkBox,
     engine_rc: &Rc<RefCell<core::Engine>>,
-) -> BTreeMap<core::SensorId, (String, Label)> {
+    status: &Label,
+) -> Rc<SensorPanel> {
     panel.append(
         &Label::builder()
             .label("<b>Sensors</b>")
@@ -471,19 +558,64 @@ fn append_sensors_panel(
     );
     let sensor_list = ListBox::new();
     sensor_list.set_selection_mode(gtk4::SelectionMode::None);
-    let mut sensor_rows = BTreeMap::new();
+    let mut rows = BTreeMap::new();
     let sensors = engine_rc.borrow().sensors().to_vec();
     for sensor in sensors {
         let name = engine_rc.borrow().sensor_name(&sensor.id);
+        let value = Label::builder().xalign(0.0).hexpand(true).build();
+        value.set_text(&format!("{name}  —"));
+        let toggle = Button::builder()
+            .label("hide")
+            .tooltip_text(
+                "hide this temperature from the list — it still drives any fan bound to it",
+            )
+            .build();
+        let row_box = GtkBox::new(Orientation::Horizontal, 8);
+        row_box.append(&value);
+        row_box.append(&toggle);
         let row = ListBoxRow::new();
-        let label = Label::builder().xalign(0.0).build();
-        label.set_text(&format!("{name}  —"));
-        row.set_child(Some(&label));
+        row.set_child(Some(&row_box));
+        // A sensor hidden by the config starts out of the list.
+        let hidden = engine_rc.borrow().sensor_hidden(&sensor.id);
+        row.set_visible(!hidden);
+        toggle.set_label(if hidden { "show" } else { "hide" });
         sensor_list.append(&row);
-        sensor_rows.insert(sensor.id, (name, label));
+        rows.insert(
+            sensor.id,
+            SensorRow {
+                name,
+                value,
+                row,
+                toggle,
+            },
+        );
     }
     panel.append(&sensor_list);
-    sensor_rows
+    let reveal = Button::builder()
+        .tooltip_text("show the hidden sensors again, so they can be kept visible")
+        .build();
+    panel.append(&reveal);
+    let sensor_panel = Rc::new(SensorPanel {
+        engine: Rc::clone(engine_rc),
+        status: status.clone(),
+        rows,
+        reveal: reveal.clone(),
+        showing_hidden: Cell::new(false),
+    });
+    sensor_panel.refresh_reveal();
+    let reveal_panel = Rc::clone(&sensor_panel);
+    reveal.connect_clicked(move |_| reveal_panel.flip_reveal());
+    for (id, row) in &sensor_panel.rows {
+        let toggle_panel = Rc::clone(&sensor_panel);
+        let toggle_id = id.clone();
+        row.toggle.connect_clicked(move |_| {
+            // The button label shows the action, so hide iff it says
+            // "hide" — i.e. the sensor is currently visible.
+            let hide = !toggle_panel.engine.borrow().sensor_hidden(&toggle_id);
+            toggle_panel.set_hidden(&toggle_id, hide);
+        });
+    }
+    sensor_panel
 }
 
 /// (Re)arms the periodic control-loop tick at the engine's current poll
@@ -530,12 +662,12 @@ fn tick_once(state: &GuiState) {
             }
         }
     }
-    for status in &report.sensors {
-        if let Some((name, label)) = state.sensor_rows.get(&status.id) {
-            let temp = status
+    for sensor in &report.sensors {
+        if let Some(row) = state.sensor_panel.rows.get(&sensor.id) {
+            let temp = sensor
                 .temp_c
                 .map_or_else(|| "no reading".to_string(), |temp| format!("{temp:.1} °C"));
-            label.set_text(&format!("{name}  {temp}"));
+            row.value.set_text(&format!("{}  {temp}", row.name));
         }
     }
     state.case_area.queue_draw();

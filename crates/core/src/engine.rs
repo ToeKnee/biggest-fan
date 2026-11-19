@@ -1083,6 +1083,42 @@ impl Engine {
             .collect()
     }
 
+    /// Whether a sensor is hidden from the GUI's temperature list.
+    /// Hiding is display-only: the sensor is still read every tick and
+    /// can still drive the fans bound to it.
+    #[must_use]
+    pub fn sensor_hidden(&self, sensor_id: &SensorId) -> bool {
+        self.config
+            .hidden_sensors
+            .iter()
+            .any(|hidden| hidden == sensor_id)
+    }
+
+    /// Hide or show a sensor in the GUI's temperature list. Any sensor
+    /// this machine has can be hidden, even one a fan follows: only the
+    /// list changes. The flag lives in the config, so `save_config` (or
+    /// the GUI's Save button) keeps it across restarts.
+    ///
+    /// # Errors
+    ///
+    /// [`CoreError::UnknownSensor`] when this machine has no such sensor.
+    pub fn set_sensor_hidden(
+        &mut self,
+        sensor_id: &SensorId,
+        hidden: bool,
+    ) -> Result<(), CoreError> {
+        if !self.sensors.iter().any(|sensor| &sensor.id == sensor_id) {
+            return Err(CoreError::UnknownSensor(sensor_id.to_string()));
+        }
+        self.config
+            .hidden_sensors
+            .retain(|hidden_id| hidden_id != sensor_id);
+        if hidden {
+            self.config.hidden_sensors.push(sensor_id.clone());
+        }
+        Ok(())
+    }
+
     /// Resolved display name for a sensor id.
     #[must_use]
     pub fn sensor_name(&self, sensor_id: &SensorId) -> String {
@@ -2747,6 +2783,108 @@ mod tests {
             .set_fan_name(&FanId::new("nope-p9"), "x")
             .expect_err("unknown fan");
         assert!(matches!(error, CoreError::UnknownFan(_)));
+    }
+
+    #[test]
+    fn hiding_a_sensor_keeps_it_reading_and_driving() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        fixture(dir.path());
+        let mut engine = engine_with(
+            dir.path(),
+            crate::config::model::HysteresisConfig {
+                temp_band_c: 2.0,
+                max_step_per_tick: 1.0,
+            },
+        );
+        let cpu = SensorId::new("k10temp-t1");
+        engine.set_sensor_hidden(&cpu, true).expect("hide");
+        assert!(engine.sensor_hidden(&cpu));
+        // The fan bound to the hidden sensor keeps following its curve:
+        // 70 °C on the fixture's 40→0.2 / 80→1.0 curve is 0.8.
+        set_cpu_temp(dir.path(), 70_000);
+        let report = engine.tick().expect("tick");
+        assert!(
+            (report.fans[0].commanded_speed - 0.8).abs() < 1e-9,
+            "a hidden sensor still drives its fan"
+        );
+        // The tick report keeps reporting the hidden sensor too — charts
+        // and fail-safes need its reading; only the GUI list consults the
+        // flag.
+        assert!(
+            report
+                .sensors
+                .iter()
+                .any(|sensor| sensor.id == cpu && sensor.temp_c.is_some())
+        );
+        // The flag lands in the config the engine would save.
+        assert_eq!(engine.current_config().hidden_sensors, vec![cpu.clone()]);
+        // ...and hiding again is a no-op, so a double hide cannot
+        // duplicate the id.
+        engine.set_sensor_hidden(&cpu, true).expect("re-hide");
+        assert_eq!(engine.current_config().hidden_sensors.len(), 1);
+        // Showing it again empties the list.
+        engine.set_sensor_hidden(&cpu, false).expect("show");
+        assert!(!engine.sensor_hidden(&cpu));
+        assert!(
+            engine.current_config().hidden_sensors.is_empty(),
+            "showing it again empties the list"
+        );
+    }
+
+    #[test]
+    fn set_sensor_hidden_rejects_a_sensor_the_machine_lacks() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        fixture(dir.path());
+        let mut engine = engine_with(
+            dir.path(),
+            crate::config::model::HysteresisConfig::default(),
+        );
+        let error = engine
+            .set_sensor_hidden(&SensorId::new("nope-t9"), true)
+            .expect_err("unknown sensor");
+        assert!(matches!(error, CoreError::UnknownSensor(_)));
+    }
+
+    #[test]
+    fn startup_accepts_a_config_that_hides_a_bound_sensor() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        fixture(dir.path());
+        let config = AppConfig {
+            fans: vec![FanConfig {
+                id: FanId::new("nct6795-p1"),
+                name: None,
+                rpm_factor: 1.0,
+                min_speed: 0.0,
+                members: Vec::new(),
+                hidden: false,
+                mode: FanMode::Auto {
+                    sensor: SensorId::new("k10temp-t1"),
+                    curve: FanCurve::default(),
+                },
+                slot: None,
+            }],
+            // A hidden sensor a fan is bound to — legal, and still used:
+            // hiding only changes what the GUI lists.
+            hidden_sensors: vec![SensorId::new("k10temp-t1")],
+            ..AppConfig::default()
+        };
+        let mut engine = Engine::startup(
+            config,
+            dir.path().join("config.toml"),
+            &EngineOptions {
+                hwmon_root: dir.path().to_path_buf(),
+                use_nvidia: false,
+                apply_writes: true,
+            },
+        )
+        .expect("a hidden binding is still a valid binding");
+        assert!(engine.sensor_hidden(&SensorId::new("k10temp-t1")));
+        let report = engine.tick().expect("tick");
+        assert_eq!(
+            report.fans[0].governing_temp_c,
+            Some(55.0),
+            "the hidden sensor still governs its fan"
+        );
     }
 
     #[test]

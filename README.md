@@ -90,6 +90,7 @@ back to the defaults:
 ```toml
 poll_interval_ms = 1000   # control-loop refresh period (floors at 100 ms)
 fail_safe_speed = 1.0     # speed for auto fans whose sensor disappears
+hidden_sensors = ["nvme-2-t1"]  # temperatures to hide from the GUI list
 
 [hysteresis]
 temp_band_c = 2.0         # how far a sensor may fall before speed drops
@@ -158,6 +159,11 @@ under the park point cannot start the fans, so it parks the cooler instead
   super-IO chips (a real in-case temperature is never exactly 0 °C).
 - Sensors are listed most useful first: CPU, then GPU, then
   motherboard/drive temperatures, then case/chassis temperatures.
+- Useless temperatures can be hidden from the GUI's sensor list (per-row
+  hide button, or `hidden_sensors` in the config). Hiding is display-only:
+  hidden sensors are still read every tick, and a fan bound to a hidden
+  temperature keeps working exactly as before — the hidden rows come back
+  under the list's "N hidden — show" line if a hide was a mistake.
 - Fan headers are listed by controller name, then header number.
 - `init-config` auto-matches each header to a likely sensor: `CPU_FAN`-
   style headers follow CPU temperatures, GPU/aux headers the graphics card
@@ -295,6 +301,10 @@ with a dot at the speed and temperature the fan is actually at right now
 every fan also charts its last 5 minutes — speed % (blue) against the
 same 0–100 scale as governing sensor °C (yellow) — so changes over time
 stay visible after the numbers have scrolled past in the status line.
+The **Sensors** readout has a hide button on every row: hidden
+temperatures leave the list behind an "N hidden — show" line (kept in
+`hidden_sensors` when the config is saved), but stay read — a fan bound
+to a hidden temperature keeps working and charts normally.
 Each row
 can also set the "rpm reading ×" tach correction and the "never below %"
 speed floor under _extra settings_ (some tachometers report exactly double:

@@ -5,6 +5,7 @@
 //! ```toml
 //! poll_interval_ms = 1000
 //! fail_safe_speed = 1.0
+//! hidden_sensors = ["nct6795-t2"]  # hide useless temps from the GUI list
 //!
 //! [hysteresis]
 //! temp_band_c = 2.0
@@ -34,6 +35,7 @@
 use crate::case::{CaseConfig, FanSlot};
 use crate::fans::FanId;
 use crate::fans::FanMode;
+use crate::sensors::SensorId;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -112,6 +114,11 @@ pub struct AppConfig {
     pub hysteresis: HysteresisConfig,
     /// Human readable display names keyed by sensor id.
     pub sensor_names: BTreeMap<String, String>,
+    /// Sensor ids hidden from the GUI's temperature list. Hiding is
+    /// display-only: the engine keeps reading them every tick, so a fan
+    /// bound to a hidden sensor keeps working (the GUI's hide buttons set
+    /// this; hidden sensors still appear in the binding dropdowns).
+    pub hidden_sensors: Vec<SensorId>,
     /// Fan headers under management.
     pub fans: Vec<FanConfig>,
     /// Case canvas size for the GUI.
@@ -130,6 +137,7 @@ impl Default for AppConfig {
             fail_safe_speed: 1.0,
             hysteresis: HysteresisConfig::default(),
             sensor_names: BTreeMap::new(),
+            hidden_sensors: Vec::new(),
             fans: Vec::new(),
             case: CaseConfig::default(),
         }
@@ -175,6 +183,10 @@ mod tests {
         assert!((config.fail_safe_speed - 0.8).abs() < 1e-12);
         assert!((config.hysteresis.temp_band_c - 3.0).abs() < 1e-12);
         assert_eq!(config.sensor_names["k10temp-t3"], "CPU CCD 1 temperature");
+        assert!(
+            config.hidden_sensors.is_empty(),
+            "the example hides no sensors"
+        );
         assert_eq!(config.fans.len(), 1);
         assert_eq!(config.fans[0].name.as_deref(), Some("Front 120mm intake"));
         assert!(
@@ -234,6 +246,32 @@ mod tests {
     }
 
     #[test]
+    fn hidden_sensors_parse_default_and_round_trip() {
+        let text = r#"
+            hidden_sensors = ["nct6795-t2", "nvme-2-t1"]
+
+            [[fans]]
+            id = "nct6795-p1"
+            mode = { type = "auto", sensor = "k10temp-t1" }
+        "#;
+        let config: AppConfig = toml::from_str(text).expect("parses");
+        let hidden: Vec<String> = config
+            .hidden_sensors
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(hidden, ["nct6795-t2", "nvme-2-t1"]);
+        let text = toml::to_string_pretty(&config).expect("serialize");
+        let back: AppConfig = toml::from_str(&text).expect("deserialize");
+        assert_eq!(config, back);
+        let bare: AppConfig = toml::from_str("").expect("parses");
+        assert!(
+            bare.hidden_sensors.is_empty(),
+            "a config without hidden_sensors hides nothing"
+        );
+    }
+
+    #[test]
     fn fan_groups_and_hidden_flags_round_trip() {
         let config = AppConfig {
             fans: vec![
@@ -275,6 +313,7 @@ mod tests {
                 "k10temp-t1".to_string(),
                 "CPU temperature".to_string(),
             )]),
+            hidden_sensors: Vec::new(),
             fans: vec![
                 FanConfig {
                     id: FanId::new("it87-p2"),
