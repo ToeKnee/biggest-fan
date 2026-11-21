@@ -53,8 +53,10 @@ impl FanDriver {
     /// ([`crate::fans::nvidia::MIN_SPIN_FRACTION`] and
     /// [`crate::fans::nvidia::SPIN_DOWN_FRACTION`]); a request under the
     /// floor hands the fans back to the card — unless the card itself reads
-    /// them above the floor, which takes control at the floor
-    /// ([`crate::fans::nvidia::effective_speed`]). Sysfs headers take any
+    /// them above the floor, which takes control at the floor and then holds
+    /// it there for a while rather than handing the fans straight back
+    /// ([`crate::fans::nvidia::effective_speed`] and
+    /// [`crate::fans::nvidia::PARK_DWELL`]). Sysfs headers take any
     /// fraction. [`NvidiaFan::apply`] realises the same mapping on the wire,
     /// so asking before a write predicts it; asking after one reports what
     /// the write settled on.

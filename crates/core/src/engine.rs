@@ -617,12 +617,13 @@ impl Engine {
             commanded = commanded.max(floor);
         }
         // What the hardware will actually run, asked *before* the writes:
-        // the NVIDIA mapping depends on who holds the fans beforehand and
-        // what the card reads, which is exactly what `apply` will use. An
-        // NVIDIA cooler parks below 25 %, holds 30 % inside the band, and
-        // takes a cooler the card has spun above its floor at the floor
-        // itself (see `fans/nvidia.rs`). _Off_ never takes over: it parks
-        // through `stop`, so the report must not claim otherwise.
+        // the NVIDIA mapping depends on who holds the fans beforehand, what
+        // the card reads and whether a take-over hold is running, which is
+        // exactly what `apply` will use. An NVIDIA cooler parks below 25 %,
+        // holds 30 % inside the band, and takes a cooler the card has spun
+        // above its floor at the floor itself, keeping that floor while the
+        // dwell lasts (see `fans/nvidia.rs`). _Off_ never takes over: it
+        // parks through `stop`, so the report must not claim otherwise.
         let effective = if matches!(mode, FanMode::Off) {
             0.0
         } else {

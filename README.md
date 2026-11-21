@@ -257,19 +257,29 @@ Differences from sysfs headers:
   take-over rule: while the card itself has the fans reading above 30 %
   (its automatic policy warmed up) and our request asks under the floor, we
   take the cooler at 30 % instead of parking — a Quiet profile (which only
-  reaches 30 % at 65 °C) can keep a hot card down at the floor rather than
+  reaching 30 % at 65 °C) can keep a hot card down at the floor rather than
   leaving it to the card's louder policy. A parked card reads 0 %, so a
   fan-off-when-cool profile still switches the fans fully off, and a cooler
-  the card has parked is never disturbed. In the zone where the card's own
-  policy wants more than 30 % but a curve asks under 25 %, the cooler hands
-  back and is taken again every other tick: the fans stay around the floor
-  but the effective percent shown alternates 0 %/30 %. Handing the policy
+  the card has parked is never disturbed. Having taken a cooler over, we _keep_
+  it at the floor: for `PARK_DWELL` (90 s) a request under the floor is
+  answered with 30 % rather than a hand-back, because the card's automatic
+  policy spends several seconds ramping its fans far above what we wanted (it
+  reached 42–48 % on a 4070 SUPER while a curve was asking for 13 %). Only a
+  take-over arms that hold: a curve dipping under the floor while the card has
+  its fans parked still parks at once, so a fan-off-when-cool profile goes
+  quiet as soon as the machine cools. When the
+  dwell runs out the park point is tried again, so a cooler that no longer
+  needs air still gets handed back to the card's 0 dB mode — once every dwell
+  instead of once every tick, which is what used to make the fan flutter and
+  the reported percent alternate 0 %/30 %. Switching a fan _Off_ skips the
+  dwell and parks immediately. Handing the policy
   back parks the fans a couple of seconds later — the card, not us, decides
   the moment (confirmed on a 4070 SUPER). Writing 0 percent is
   deliberately not the park path — the driver clamps it to its minimum (30 %
   on a 4070 SUPER), which is why setting _Off_ used to leave the fans
   spinning. The percent shown in the GUI and case view is the effective one
-  (a 20 % curve point displays as 0 % and the fans are parked), while a
+  (a 20 % curve point displays as 0 % with the fans parked, or as 30 % while a
+  take-over hold is running), while a
   fixed slider keeps showing the speed you set.
 - Fan _writes_ need root (the daemon has it; `scan`/`init-config` only
   read NVML, which works unprivileged). A refused write with the
