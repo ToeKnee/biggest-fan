@@ -12,7 +12,7 @@
 //! temperature hit the limit.
 //!
 //! "Run full test" starts the auto-tune (see [`crate::tune`]): warm-up
-//! under full stress, then each fan is tried one notch slower until a
+//! under full stress, then each fan's speed is searched downward until a
 //! temperature climbs, and the slowest curves each fan can hold are
 //! suggested (kept only if *Save config* is pressed afterwards).
 
@@ -318,7 +318,7 @@ impl TuneRow {
         let tune_button = Button::builder()
             .label("Run full test")
             .tooltip_text(
-                "warm up under full stress, then try each fan one notch slower until a \
+                "warm up under full stress, then search each fan downward until a \
                  temperature climbs, and suggest the slowest curves each fan can hold",
             )
             .build();

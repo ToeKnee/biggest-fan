@@ -385,18 +385,27 @@ that answers "how slow can each fan run and still keep up?":
    `auto` mode — fixed pumps and hand-set fans are left alone) is pinned
    to full speed while both stressors run, for the **warm-up (min)**
    soak: a few minutes is fine for air, an AIO wants ~10, a custom loop
-   ~20.
-2. Soaked, each fan is tried one notch (10 %) slower at a time; after
-   each notch the tune waits half the warm-up (never under a minute)
-   and reverts the notch if any sensor rose more than 2 °C or NVML
-   reported GPU thermal throttling.
+   ~20. The soak ends early once the readings have sat still for 20 s —
+   but never before half the requested warm-up, because water takes its
+   time.
+2. Soaked, each fan's speed is _searched_ rather than walked: probes
+   gallop down in doubling steps (90 %, 70 %, 30 %, …) and once one
+   fails the search bisects its last safe/unsafe pair until the two are
+   5 % apart. A fan that fails its very first probe is done there —
+   splitting the top 10 % would be settles spent for nothing. Each probe
+   is judged as soon as the machine has stopped moving (at least 45 s,
+   at most half the warm-up); any sensor rising more than 2 °C above the
+   last accepted state, or NVML GPU thermal throttling, reverts the
+   probe and re-anchors there before the next one.
 3. Each fan's slowest proven speed becomes a suggested curve (the
    Balanced shape scaled to that speed), applied as transient modes.
    The end report says whether the GPU ever thermally throttled — the
    curves are only trustworthy if it didn't.
 
-A tune takes hours (warm-up plus ~10 settle periods per fan), so it is
-meant to be left running — for everyday quieting without a long test, see
+A tune now costs minutes per fan (a handful of measured settles each)
+rather than the ~10 five-minute notches the first version walked — an
+8-fan machine with a 10-minute AIO soak is around an hour, not six.
+For everyday quieting without any test run, see
 [Background nudging](#background-nudging) instead. Everything it does is reversible: _Save
 config_ keeps the suggested curves; _Stop tune_, _Restore saved modes_
 or closing the window put the fans back in the modes they had before
