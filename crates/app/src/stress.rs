@@ -8,8 +8,8 @@
 //!
 //! A thermal guard (k10temp + GPU temperature) aborts the load if the
 //! machine gets hot, so experimenting can never turn into cooking: the
-//! guard trips, the thread wraps up, and the status line says which
-//! temperature hit the limit.
+//! guard trips, the thread wraps up, and the status bar at the bottom
+//! of the window says which temperature hit the limit.
 //!
 //! "Run full test" starts the auto-tune (see [`crate::tune`]): warm-up
 //! under full stress, then each fan's speed is searched downward until a
@@ -34,8 +34,8 @@ use std::time::{Duration, Instant};
 /// normally ends them long before that.
 const TUNE_STRESS_SECS: u64 = 24 * 60 * 60;
 
-/// One live stress thread: the external stop flag, and the join handle
-/// once it finishes so the result can be read back onto the status line.
+/// A live stress thread: the external stop flag, and the join handle
+/// once it finishes so the result can be read back onto the status bar.
 struct StressRun {
     stop: Arc<AtomicBool>,
     started: Instant,
@@ -61,7 +61,10 @@ pub struct StressPanel {
     tune_button: Button,
     warmup_spin: SpinButton,
     restore_button: Button,
-    status: Label,
+    /// What this panel wants on the window's status bar right now (its
+    /// own `poll` fills it in; the app's tick decides whether it gets
+    /// shown — see [`StressPanel::status_line`]).
+    status_line: RefCell<Option<String>>,
     engine: Rc<RefCell<core::Engine>>,
     client: dbus::Client,
     /// Live sensor temperatures, refreshed by the control-loop tick.
@@ -73,6 +76,14 @@ pub struct StressPanel {
 }
 
 impl StressPanel {
+    /// The line this panel would like on the window's status bar: live
+    /// stressor progress, a tune's state, or the last result — `None`
+    /// while the lab has nothing to say, leaving the bar to the control
+    /// loop and the service.
+    #[must_use]
+    pub fn status_line(&self) -> Option<String> {
+        self.status_line.borrow().clone()
+    }
     /// Ends any live tune and stressors (called when the window closes).
     pub fn stop_all(&self) {
         self.stop_tune();
@@ -232,7 +243,7 @@ impl StressPanel {
     }
 
     /// Half-second refresh: collect finished runs into notes, keep live
-    /// runs' elapsed time on the label, and step a live tune.
+    /// runs' elapsed time in the status line, and step a live tune.
     fn poll(&self) {
         let mut parts: Vec<String> = Vec::new();
         // Clearing a toggle re-enters the widget handlers, which borrow
@@ -264,12 +275,13 @@ impl StressPanel {
         if let Some(note) = self.tune_note.borrow().as_ref() {
             parts.push(note.clone());
         }
-        if parts.is_empty() {
-            self.status
-                .set_text("Heat up the machine and watch the fans respond; a thermal guard stops the load if things get too hot.");
+        // The bar is shared: with nothing to report the lab stays quiet
+        // rather than hiding a fan note or a service answer.
+        *self.status_line.borrow_mut() = if parts.is_empty() {
+            None
         } else {
-            self.status.set_text(&parts.join("  ·  "));
-        }
+            Some(parts.join("  ·  "))
+        };
     }
 
     /// Advances a live tune; aborts it if its stressors died on their own
@@ -414,9 +426,12 @@ fn collect(
     true
 }
 
-/// Appends the "Stress lab" section (header, note, controls, full-test
-/// row and status line) to `panel`, wiring the toggles, the tune button
-/// and the half-second status tick.
+/// Appends the "Stress lab" section (header, note, controls and
+/// full-test row) to `panel`, wiring the toggles, the tune button and
+/// the half-second status tick.
+///
+/// The lab has no status label of its own: its progress and results go
+/// to the window's status bar through [`StressPanel::status_line`].
 #[must_use]
 pub fn append_stress_panel(
     panel: &GtkBox,
@@ -431,11 +446,17 @@ pub fn append_stress_panel(
             .xalign(0.0)
             .build(),
     );
-    let status = Label::builder()
-        .label("Heat up the machine and watch the fans respond; a thermal guard stops the load if things get too hot.")
-        .wrap(true)
-        .xalign(0.0)
-        .build();
+    panel.append(
+        &Label::builder()
+            .label(
+                "Heat up the machine and watch the fans respond; a thermal guard stops the \
+                 load if things get too hot. Progress and results appear in the status bar \
+                 at the bottom of the window.",
+            )
+            .wrap(true)
+            .xalign(0.0)
+            .build(),
+    );
 
     let row = GtkBox::new(Orientation::Horizontal, 8);
     let cpu_button = ToggleButton::builder()
@@ -475,7 +496,7 @@ pub fn append_stress_panel(
         tune_button: tune_row.tune_button.clone(),
         warmup_spin: tune_row.warmup_spin.clone(),
         restore_button: tune_row.restore_button.clone(),
-        status: status.clone(),
+        status_line: RefCell::new(None),
         engine: Rc::clone(engine_rc),
         client: client.clone(),
         temps,
@@ -518,7 +539,6 @@ pub fn append_stress_panel(
         .connect_clicked(move |_| restore_panel.restore_saved());
 
     panel.append(&row);
-    panel.append(&status);
 
     // Half-second status tick: elapsed time while running, results once
     // a thread has wrapped up, and the live tune's state machine. Like

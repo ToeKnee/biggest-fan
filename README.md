@@ -372,7 +372,9 @@ The GUI carries a **Stress lab** panel at the bottom of the right column:
 _toggle_ **CPU load** / **GPU load** to run the stressors as in-process
 threads (they share the library with the CLI below), pick how many
 seconds to run and the guard temperature, and watch the case view react.
-Finished runs report their throughput on the panel's status line, the
+Finished runs report their throughput in the status bar at the bottom of
+the window (the same one the fan notes use; a fan's own note outranks
+the lab's progress), the
 guard aborts the load if k10temp or the GPU gets too hot, and closing
 the window always stops the load. Run the GUI itself in release mode
 (`cargo run --release -p biggest-fan`) — a debug build runs the
@@ -409,7 +411,8 @@ For everyday quieting without any test run, see
 [Background nudging](#background-nudging) instead. Everything it does is reversible: _Save
 config_ keeps the suggested curves; _Stop tune_, _Restore saved modes_
 or closing the window put the fans back in the modes they had before
-the tune (the guard trips do the same). The status line shows progress
+the tune (the guard trips do the same). The status bar at the bottom of
+the window shows progress
 ("warming up, 4 min left", "fan 3 of 8 — Front intake at 60 %") and the
 full report afterwards.
 

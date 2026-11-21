@@ -40,6 +40,9 @@ struct GuiState {
     /// Latest live temperature per sensor, refreshed every tick; the
     /// Stress lab's auto-tune watches these.
     last_temps: Rc<RefCell<BTreeMap<core::SensorId, f64>>>,
+    /// The Stress lab section, whose progress and results share this
+    /// status bar with the control loop (see `tick_once`).
+    stress: Rc<stress::StressPanel>,
     /// Tick counter behind the periodic service-config poll (the nudger's
     /// learned trims only reach this mirror through the service's config).
     config_poll: Cell<u32>,
@@ -191,6 +194,18 @@ fn install_stylesheet() {
     }
 }
 
+/// Builds the window's header bar: Detect sits left of Save, both at the
+/// right-hand end.
+fn build_header_bar() -> (HeaderBar, Button, Button) {
+    let header = HeaderBar::new();
+    let save_button = Button::builder().label("Save config").build();
+    let detect_button = Button::builder().label("Detect fans").build();
+    // `pack_end` stacks right-to-left, so this puts Detect left of Save.
+    header.pack_end(&save_button);
+    header.pack_end(&detect_button);
+    (header, save_button, detect_button)
+}
+
 fn build_window(
     application: &Application,
     engine_rc: &Rc<RefCell<core::Engine>>,
@@ -209,12 +224,7 @@ fn build_window(
     window.set_maximized(true);
     install_stylesheet();
 
-    let header = HeaderBar::new();
-    let save_button = Button::builder().label("Save config").build();
-    let detect_button = Button::builder().label("Detect fans").build();
-    // `pack_end` stacks right-to-left, so this puts Detect left of Save.
-    header.pack_end(&save_button);
-    header.pack_end(&detect_button);
+    let (header, save_button, detect_button) = build_header_bar();
     window.set_titlebar(Some(&header));
 
     // Left: the case drawing plus a short legend.
@@ -250,7 +260,7 @@ fn build_window(
     let fan_panel = append_fans_panel(&right, engine_rc, &case_area, client);
     let sensor_panel = append_sensors_panel(&right, engine_rc, &status_label);
     let last_temps = Rc::new(RefCell::new(BTreeMap::new()));
-    wire_stress_panel(&window, &right, engine_rc, client, Rc::clone(&last_temps));
+    let stress = wire_stress_panel(&window, &right, engine_rc, client, Rc::clone(&last_temps));
     let right_scroll = ScrolledWindow::builder()
         .vexpand(true)
         .hscrollbar_policy(PolicyType::Never)
@@ -302,6 +312,7 @@ fn build_window(
         client: client.clone(),
         service_events,
         last_temps,
+        stress,
         config_poll: Cell::new(0),
         service_config: RefCell::new(String::new()),
     });
@@ -516,12 +527,14 @@ fn wire_stress_panel(
     engine_rc: &Rc<RefCell<core::Engine>>,
     client: &dbus::Client,
     last_temps: Rc<RefCell<BTreeMap<core::SensorId, f64>>>,
-) {
+) -> Rc<stress::StressPanel> {
     let stress_panel = stress::append_stress_panel(right, engine_rc, client, last_temps);
+    let close_panel = Rc::clone(&stress_panel);
     window.connect_close_request(move |_window| {
-        stress_panel.stop_all();
+        close_panel.stop_all();
         Propagation::Proceed
     });
+    stress_panel
 }
 
 /// Appends the fan section (header, one control row per managed fan
@@ -747,7 +760,12 @@ fn tick_once(state: &GuiState) {
     }
     state.case_area.queue_draw();
 
+    // One writer decides what the status bar says: a fan's note (a
+    // fail-safe, a refused write) outranks the Stress lab's progress,
+    // and the lab only keeps the bar while it has something to report.
     if !notes.is_empty() {
         state.status_label.set_text(&notes.join(" · "));
+    } else if let Some(line) = state.stress.status_line() {
+        state.status_label.set_text(&line);
     }
 }
