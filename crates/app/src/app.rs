@@ -4,8 +4,9 @@
 use crate::case_view;
 use crate::dbus;
 use crate::fan_controls::{FAN_FLOW_CLASS, FAN_TILE_CSS, FanControls};
+use crate::stress;
 use biggest_fan_core as core;
-use glib::{ControlFlow, SourceId};
+use glib::{ControlFlow, Propagation, SourceId};
 use gtk4::prelude::*;
 use gtk4::{
     Application, ApplicationWindow, Box as GtkBox, Button, ComboBoxText, FlowBox, HeaderBar, Label,
@@ -77,7 +78,7 @@ impl SensorPanel {
         let Some(row) = self.rows.get(id) else {
             return;
         };
-        row.toggle.set_label(if hide { "show" } else { "hide" });
+        row.toggle.set_label(if hide { "Show" } else { "Hide" });
         row.row.set_visible(!hide || self.showing_hidden.get());
         self.refresh_reveal();
         self.status.set_text(&if hide {
@@ -113,9 +114,9 @@ impl SensorPanel {
             .count();
         self.reveal.set_sensitive(hidden > 0);
         self.reveal.set_label(&match hidden {
-            0 => "no hidden sensors".to_string(),
-            n if self.showing_hidden.get() => format!("hide the {n} shown sensors"),
-            n => format!("{n} hidden — show"),
+            0 => "No hidden sensors".to_string(),
+            n if self.showing_hidden.get() => format!("Hide the {n} shown sensors"),
+            n => format!("{n} hidden — Show"),
         });
     }
 }
@@ -236,6 +237,7 @@ fn build_window(
     let right = GtkBox::new(Orientation::Vertical, 12);
     let fan_panel = append_fans_panel(&right, engine_rc, &case_area, client);
     let sensor_panel = append_sensors_panel(&right, engine_rc, &status_label);
+    wire_stress_panel(&window, &right);
     let right_scroll = ScrolledWindow::builder()
         .vexpand(true)
         .hscrollbar_policy(PolicyType::Never)
@@ -261,7 +263,7 @@ fn build_window(
     )]
     interval_spin.set_value(poll_ms as f64 / 1000.0);
     let bottom = GtkBox::new(Orientation::Horizontal, 8);
-    bottom.append(&Label::builder().label("update every (s):").build());
+    bottom.append(&Label::builder().label("Update every (s):").build());
     bottom.append(&interval_spin);
     bottom.append(&status_label);
 
@@ -470,6 +472,17 @@ struct FanPanel {
     add_button: Button,
 }
 
+/// Appends the Stress lab panel to `right` and ties its stress threads
+/// to the window: closing the window raises their stop flags, so no
+/// load outlives the window that started it.
+fn wire_stress_panel(window: &ApplicationWindow, right: &GtkBox) {
+    let stress_panel = stress::append_stress_panel(right);
+    window.connect_close_request(move |_window| {
+        stress_panel.stop_all();
+        Propagation::Proceed
+    });
+}
+
 /// Appends the fan section (header, one control row per managed fan
 /// group, then the add row under them all) to `panel`.
 fn append_fans_panel(
@@ -510,7 +523,7 @@ fn append_fans_panel(
         .label("Add fan")
         .tooltip_text("take over a fan header nothing drives yet (also revives parked ones)")
         .build();
-    add_row.append(&Label::builder().label("add:").build());
+    add_row.append(&Label::builder().label("Add:").build());
     add_row.append(&unclaimed_combo);
     add_row.append(&add_button);
     panel.append(&add_row);
@@ -565,7 +578,7 @@ fn append_sensors_panel(
         let value = Label::builder().xalign(0.0).hexpand(true).build();
         value.set_text(&format!("{name}  —"));
         let toggle = Button::builder()
-            .label("hide")
+            .label("Hide")
             .tooltip_text(
                 "hide this temperature from the list — it still drives any fan bound to it",
             )
@@ -578,7 +591,7 @@ fn append_sensors_panel(
         // A sensor hidden by the config starts out of the list.
         let hidden = engine_rc.borrow().sensor_hidden(&sensor.id);
         row.set_visible(!hidden);
-        toggle.set_label(if hidden { "show" } else { "hide" });
+        toggle.set_label(if hidden { "Show" } else { "Hide" });
         sensor_list.append(&row);
         rows.insert(
             sensor.id,
@@ -610,7 +623,7 @@ fn append_sensors_panel(
         let toggle_id = id.clone();
         row.toggle.connect_clicked(move |_| {
             // The button label shows the action, so hide iff it says
-            // "hide" — i.e. the sensor is currently visible.
+            // "Hide" — i.e. the sensor is currently visible.
             let hide = !toggle_panel.engine.borrow().sensor_hidden(&toggle_id);
             toggle_panel.set_hidden(&toggle_id, hide);
         });

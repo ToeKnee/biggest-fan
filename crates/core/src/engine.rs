@@ -558,8 +558,17 @@ impl Engine {
                                 target = base;
                             }
                         }
-                        // Rate-limit auto changes so fans ramp instead of pumping.
-                        if hysteresis.max_step_per_tick > 0.0 {
+                        // Rate-limit auto changes: up like a rocket, down
+                        // like a feather. Raising speed is the safe
+                        // direction, so it runs at the roomy rocket step;
+                        // the way back down is the feather step, so a fan
+                        // that no longer needs to shout goes quiet slowly
+                        // instead of pumping up and down.
+                        if target > base {
+                            if hysteresis.max_step_up_per_tick > 0.0 {
+                                target = approach(base, target, hysteresis.max_step_up_per_tick);
+                            }
+                        } else if hysteresis.max_step_per_tick > 0.0 {
                             target = approach(base, target, hysteresis.max_step_per_tick);
                         }
                     }
@@ -1569,6 +1578,7 @@ mod tests {
             crate::config::model::HysteresisConfig {
                 temp_band_c: 2.0,
                 max_step_per_tick: 1.0, // no rate limiting in this test
+                max_step_up_per_tick: 1.0,
             },
         );
 
@@ -1601,6 +1611,7 @@ mod tests {
             crate::config::model::HysteresisConfig {
                 temp_band_c: 2.0,
                 max_step_per_tick: 0.1,
+                max_step_up_per_tick: 0.1,
             },
         );
         set_cpu_temp(dir.path(), 79_000);
@@ -1613,6 +1624,37 @@ mod tests {
     }
 
     #[test]
+    fn speed_goes_up_like_a_rocket_and_down_like_a_feather() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        fixture(dir.path());
+        let mut engine = engine_with(
+            dir.path(),
+            crate::config::model::HysteresisConfig {
+                temp_band_c: 0.0,
+                max_step_per_tick: 0.1,    // feather: the way down
+                max_step_up_per_tick: 0.5, // rocket: the way up (the default)
+            },
+        );
+
+        // The fixture header starts parked (pwm1 = 0); 55 °C on the
+        // fixture curve wants 0.5. One rocket step covers the whole
+        // climb — protection lands fast instead of creeping up at the
+        // feather step, which would have needed five ticks here.
+        let report = engine.tick().expect("tick 1");
+        assert!((report.fans[0].commanded_speed - 0.5).abs() < 1e-9);
+
+        // Cooling to 40 °C only wants 0.2, but the way back down crawls
+        // at the feather step: 0.4, then 0.3, then 0.2.
+        set_cpu_temp(dir.path(), 40_000);
+        let report = engine.tick().expect("tick 2");
+        assert!((report.fans[0].commanded_speed - 0.4).abs() < 1e-9);
+        let report = engine.tick().expect("tick 3");
+        assert!((report.fans[0].commanded_speed - 0.3).abs() < 1e-9);
+        let report = engine.tick().expect("tick 4");
+        assert!((report.fans[0].commanded_speed - 0.2).abs() < 1e-9);
+    }
+
+    #[test]
     fn dead_sensor_triggers_the_fail_safe() {
         let dir = tempfile::tempdir().expect("tempdir");
         fixture(dir.path());
@@ -1621,6 +1663,7 @@ mod tests {
             crate::config::model::HysteresisConfig {
                 temp_band_c: 0.0,
                 max_step_per_tick: 1.0,
+                max_step_up_per_tick: 1.0,
             },
         );
         engine.tick().expect("first tick");
@@ -1691,6 +1734,7 @@ mod tests {
             crate::config::model::HysteresisConfig {
                 temp_band_c: 2.0,
                 max_step_per_tick: 0.1,
+                max_step_up_per_tick: 0.1,
             },
         );
         let fan_id = FanId::new("nct6795-p1");
@@ -1728,6 +1772,7 @@ mod tests {
             crate::config::model::HysteresisConfig {
                 temp_band_c: 0.0,
                 max_step_per_tick: 0.1,
+                max_step_up_per_tick: 0.1,
             },
         );
         let fan_id = FanId::new("nct6795-p1");
@@ -1763,6 +1808,7 @@ mod tests {
             crate::config::model::HysteresisConfig {
                 temp_band_c: 0.0,
                 max_step_per_tick: 0.1,
+                max_step_up_per_tick: 0.1,
             },
         );
         let fan_id = FanId::new("nct6795-p1");
@@ -1790,13 +1836,13 @@ mod tests {
     fn taking_over_a_spinning_header_ramps_from_its_current_duty() {
         let dir = tempfile::tempdir().expect("tempdir");
         fixture(dir.path());
-        // What the BIOS left in pwm1 when the engine takes over: 60 %.
-        std::fs::write(dir.path().join("hwmon1/pwm1"), "153\n").expect("bios duty");
+        std::fs::write(dir.path().join("hwmon1/pwm1"), "153\n").expect("seed duty");
         let mut engine = engine_with(
             dir.path(),
             crate::config::model::HysteresisConfig {
                 temp_band_c: 2.0,
                 max_step_per_tick: 0.1,
+                max_step_up_per_tick: 0.1,
             },
         );
 
@@ -2500,6 +2546,7 @@ mod tests {
             crate::config::model::HysteresisConfig {
                 temp_band_c: 2.0,
                 max_step_per_tick: 0.1,
+                max_step_up_per_tick: 0.1,
             },
         );
         set_cpu_temp(dir.path(), 79_000);
@@ -2843,6 +2890,7 @@ mod tests {
             crate::config::model::HysteresisConfig {
                 temp_band_c: 2.0,
                 max_step_per_tick: 1.0,
+                max_step_up_per_tick: 1.0,
             },
         );
         let cpu = SensorId::new("k10temp-t1");

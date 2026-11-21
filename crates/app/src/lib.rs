@@ -16,4 +16,5 @@ pub mod curve_graph;
 pub mod dbus;
 pub mod engine_setup;
 pub mod fan_controls;
+pub mod stress;
 pub mod trend_graph;

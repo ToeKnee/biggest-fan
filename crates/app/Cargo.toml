@@ -17,6 +17,9 @@ path = "src/daemon_main.rs"
 
 [dependencies]
 biggest-fan-core = { workspace = true }
+# The Stress lab panel runs the lab's stressors in-process (library side
+# of the `stress-lab` crate; the CLI binary stays developer-only).
+biggest-fan-stress-lab = { workspace = true }
 cairo-rs = "0.22"
 clap = { version = "4.6.8", features = ["derive"] }
 glib = "0.22.11"

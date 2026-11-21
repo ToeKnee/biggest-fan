@@ -147,13 +147,7 @@ impl FanControls {
             .build();
         speed_scale.set_range(0.0, 100.0);
 
-        let sensor_combo = ComboBoxText::new();
-        {
-            let engine = engine_rc.borrow();
-            for sensor in engine.sensors() {
-                sensor_combo.append(Some(sensor.id.as_str()), &engine.sensor_name(&sensor.id));
-            }
-        }
+        let sensor_combo = sensor_dropdown(&engine_rc.borrow(), id);
         // Curve presets: one dropdown pick instead of hand-writing points.
         // "Custom" is display-only — a hand-made curve shows up here until
         // a preset replaces it.
@@ -165,10 +159,15 @@ impl FanControls {
             core::CurvePreset::Performance.label(),
         );
         preset_combo.append(Some(CURVE_CUSTOM), "Custom");
+        // Show what switching an off/fixed fan to Automatic will actually
+        // apply: the first sensor in the (ranked) list and the default
+        // curve. `init_from_engine` overwrites both for auto fans.
+        sensor_combo.set_active(Some(0));
+        preset_combo.set_active_id(Some(CURVE_BALANCED));
         let auto_row = GtkBox::new(Orientation::Horizontal, 8);
-        auto_row.append(&Label::builder().label("sensor:").build());
+        auto_row.append(&Label::builder().label("Sensor:").build());
         auto_row.append(&sensor_combo);
-        auto_row.append(&Label::builder().label("curve:").build());
+        auto_row.append(&Label::builder().label("Curve:").build());
         auto_row.append(&preset_combo);
         let temp_label = Label::builder().xalign(0.0).hexpand(true).build();
         auto_row.append(&temp_label);
@@ -302,7 +301,7 @@ impl FanControls {
         shape_combo.set_tooltip_text(Some(
             "a rectangle draws a whole object (graphics card cooler) sized by width and height",
         ));
-        let diameter_label = Label::builder().label("diameter:").build();
+        let diameter_label = Label::builder().label("Diameter:").build();
         let diameter_spin = SpinButton::builder()
             .digits(0)
             .adjustment(&gtk4::Adjustment::new(120.0, 30.0, 300.0, 5.0, 10.0, 0.0))
@@ -310,9 +309,9 @@ impl FanControls {
         let width_spin = Self::size_spin("card width on the drawing");
         let height_spin = Self::size_spin("card height on the drawing");
         let size_row = GtkBox::new(Orientation::Horizontal, 4);
-        size_row.append(&Label::builder().label("card w:").build());
+        size_row.append(&Label::builder().label("Card w:").build());
         size_row.append(&width_spin);
-        size_row.append(&Label::builder().label("h:").build());
+        size_row.append(&Label::builder().label("H:").build());
         size_row.append(&height_spin);
         (
             PlacementWidgets {
@@ -379,11 +378,11 @@ impl FanControls {
         member_checks: &[(core::FanId, CheckButton)],
     ) -> Expander {
         let rpm_row = GtkBox::new(Orientation::Horizontal, 8);
-        rpm_row.append(&Label::builder().label("rpm reading ×").build());
+        rpm_row.append(&Label::builder().label("RPM reading ×").build());
         rpm_row.append(rpm_spin);
 
         let floor_row = GtkBox::new(Orientation::Horizontal, 8);
-        floor_row.append(&Label::builder().label("never below %").build());
+        floor_row.append(&Label::builder().label("Never below %").build());
         floor_row.append(floor_spin);
 
         let extra_box = GtkBox::new(Orientation::Vertical, 2);
@@ -391,14 +390,14 @@ impl FanControls {
         extra_box.append(&rpm_row);
         extra_box.append(
             &Label::builder()
-                .label("drive extra headers as one fan")
+                .label("Drive extra headers as one fan")
                 .xalign(0.0)
                 .build(),
         );
         for (_, check) in member_checks {
             extra_box.append(check);
         }
-        let expander = Expander::builder().label("extra settings").build();
+        let expander = Expander::builder().label("Extra settings").build();
         expander.set_child(Some(&extra_box));
         expander
     }
@@ -414,9 +413,9 @@ impl FanControls {
         size_row: &GtkBox,
     ) -> GtkBox {
         let row = GtkBox::new(Orientation::Horizontal, 8);
-        row.append(&Label::builder().label("airflow:").build());
+        row.append(&Label::builder().label("Airflow:").build());
         row.append(airflow_combo);
-        row.append(&Label::builder().label("shape:").build());
+        row.append(&Label::builder().label("Shape:").build());
         row.append(shape_combo);
         row.append(diameter_label);
         row.append(diameter_spin);
@@ -493,14 +492,11 @@ impl FanControls {
             }
             core::FanMode::Auto { sensor, curve } => {
                 self.mode_combo.set_active_id(Some(MODE_AUTO));
+                // A hidden sensor this fan is bound to still gets a row
+                // (see `sensor_dropdown`), so this always lands.
                 self.sensor_combo.set_active_id(Some(sensor.as_str()));
-                let preset_id = match core::CurvePreset::matching(curve) {
-                    Some(core::CurvePreset::Quiet) => CURVE_QUIET,
-                    Some(core::CurvePreset::Balanced) => CURVE_BALANCED,
-                    Some(core::CurvePreset::Performance) => CURVE_PERFORMANCE,
-                    None => CURVE_CUSTOM,
-                };
-                self.preset_combo.set_active_id(Some(preset_id));
+                self.preset_combo
+                    .set_active_id(Some(preset_combo_id(curve)));
             }
         }
         if let Some(factor) = engine.fan_rpm_factor(&self.fan_id) {
@@ -604,6 +600,7 @@ impl FanControls {
         let mode_combo = self.mode_combo.clone();
         let scale = self.speed_scale.clone();
         let sensor_combo = self.sensor_combo.clone();
+        let preset_combo = self.preset_combo.clone();
         let auto_row = self.auto_row.clone();
         let curve_area = self.curve_graph.widget().clone();
         let status_label = self.status_label.clone();
@@ -622,6 +619,19 @@ impl FanControls {
             scale.set_visible(mode_combo.active_id().as_deref() == Some(MODE_FIXED));
             auto_row.set_visible(mode_combo.active_id().as_deref() == Some(MODE_AUTO));
             curve_area.set_visible(mode_combo.active_id().as_deref() == Some(MODE_AUTO));
+            // An auto fan may have been given the default curve just now
+            // (off → auto) or lost a hand-made one (off → auto after an
+            // earlier custom curve); show the preset that is really in
+            // force so the dropdown never lies about the profile.
+            let applied = match rc.borrow().fan_mode(&fan_id) {
+                Some(core::FanMode::Auto { curve, .. }) => Some(preset_combo_id(&curve)),
+                _ => None,
+            };
+            if let Some(preset_id) = applied {
+                suppress.set(true);
+                preset_combo.set_active_id(Some(preset_id));
+                suppress.set(false);
+            }
         });
 
         // Speed slider: only meaningful (and only visible) in fixed mode.
@@ -910,6 +920,36 @@ fn push_mode(
     }
 }
 
+/// Sensor binding dropdown: every temperature, minus the hidden ones
+/// ([`core::Engine::sensor_hidden`]) except the sensor this fan is
+/// already bound to — dropping that row would silently change a live
+/// binding.
+fn sensor_dropdown(engine: &core::Engine, fan_id: &core::FanId) -> ComboBoxText {
+    let combo = ComboBoxText::new();
+    let bound = engine.fan_mode(fan_id).and_then(|mode| match mode {
+        core::FanMode::Auto { sensor, .. } => Some(sensor),
+        _ => None,
+    });
+    for sensor in engine.sensors() {
+        if engine.sensor_hidden(&sensor.id) && bound.as_ref() != Some(&sensor.id) {
+            continue;
+        }
+        combo.append(Some(sensor.id.as_str()), &engine.sensor_name(&sensor.id));
+    }
+    combo
+}
+
+/// The preset dropdown row that describes `curve` ("custom" for a
+/// hand-made one).
+fn preset_combo_id(curve: &core::FanCurve) -> &'static str {
+    match core::CurvePreset::matching(curve) {
+        Some(core::CurvePreset::Quiet) => CURVE_QUIET,
+        Some(core::CurvePreset::Balanced) => CURVE_BALANCED,
+        Some(core::CurvePreset::Performance) => CURVE_PERFORMANCE,
+        None => CURVE_CUSTOM,
+    }
+}
+
 fn existing_curve(engine: &core::Engine, fan_id: &core::FanId) -> core::FanCurve {
     engine
         .fan_mode(fan_id)
@@ -936,5 +976,25 @@ mod tests {
             escape_markup("Corsair <H100i> & RGB"),
             "Corsair &lt;H100i&gt; &amp; RGB"
         );
+    }
+
+    #[test]
+    fn preset_combo_id_names_the_real_curve() {
+        for (preset, id) in [
+            (core::CurvePreset::Quiet, CURVE_QUIET),
+            (core::CurvePreset::Balanced, CURVE_BALANCED),
+            (core::CurvePreset::Performance, CURVE_PERFORMANCE),
+        ] {
+            assert_eq!(preset_combo_id(&preset.curve()), id);
+        }
+        // The curve an off fan gets when switched to Automatic is the
+        // default one, so the dropdown must show Balanced, not Quiet.
+        assert_eq!(preset_combo_id(&core::FanCurve::default()), CURVE_BALANCED);
+        let hand_made = core::FanCurve::new(vec![core::CurvePoint {
+            temp_c: 40.0,
+            speed: 0.5,
+        }])
+        .expect("valid");
+        assert_eq!(preset_combo_id(&hand_made), CURVE_CUSTOM);
     }
 }

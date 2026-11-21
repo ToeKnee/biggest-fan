@@ -1,0 +1,22 @@
+[package]
+name = "biggest-fan-stress-lab"
+description = "Developer lab: AVX-512 CPU and Vulkan GPU stressors plus a hardware CSV logger, for tuning fan settings against real workloads."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "stress-lab"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4.6.8", features = ["derive"] }
+# Same NVML wrapper the core crate uses, for GPU-side telemetry while
+# stressing (temperature, fan %, utilisation, power, throttle flags).
+nvml-wrapper = "0.13.0"
+# Minimal executor for wgpu's async setup calls.
+pollster = "0.4"
+# GPU stressor on purpose: Vulkan compute with a WGSL hot loop. All
+# backends compile (wgpu 24 made them runtime choices); the code pins
+# `Backends::VULKAN` so `stress-lab gpu` runs on the real card.
+wgpu = "24.0"

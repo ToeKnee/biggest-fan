@@ -10,7 +10,8 @@
 //!
 //! [hysteresis]
 //! temp_band_c = 2.0
-//! max_step_per_tick = 0.1
+//! max_step_per_tick = 0.1        # feather: how slowly speed may fall
+//! max_step_up_per_tick = 0.5     # rocket: how quickly speed may rise
 //!
 //! [sensor_names]
 //! "k10temp-t3" = "CPU CCD 1 temperature"
@@ -41,15 +42,26 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 /// Tuning values that keep auto fans from pumping up and down.
+///
+/// The ramp is deliberately asymmetric — up like a rocket, down like a
+/// feather: raising speed is the safe direction, so it runs at the roomy
+/// `max_step_up_per_tick`; dropping back is the quiet direction, so it
+/// crawls at `max_step_per_tick`.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct HysteresisConfig {
     /// How far below the temperature that last raised the speed the sensor
     /// must fall before the speed is allowed to drop.
     pub temp_band_c: f64,
-    /// Largest speed-fraction change per update tick (1.0 disables
-    /// rate-limiting).
+    /// Feather: largest speed-fraction *drop* per update tick. 0.0 or 1.0
+    /// removes the feather, letting speed fall to the curve at once.
+    /// Speed *rises* are limited by [`Self::max_step_up_per_tick`].
     pub max_step_per_tick: f64,
+    /// Rocket: largest speed-fraction *rise* per update tick. Defaults
+    /// high (0.5), so protection against a heat spike lands within a tick
+    /// or two while the fan still does not slam from idle to full in one
+    /// step. 0.0 or 1.0 lets speed rise at once.
+    pub max_step_up_per_tick: f64,
 }
 
 impl Default for HysteresisConfig {
@@ -57,6 +69,7 @@ impl Default for HysteresisConfig {
         Self {
             temp_band_c: 2.0,
             max_step_per_tick: 0.1,
+            max_step_up_per_tick: 0.5,
         }
     }
 }
@@ -166,6 +179,7 @@ mod tests {
             [hysteresis]
             temp_band_c = 3.0
             max_step_per_tick = 0.05
+            max_step_up_per_tick = 0.4
 
             [sensor_names]
             "k10temp-t3" = "CPU CCD 1 temperature"
@@ -189,6 +203,10 @@ mod tests {
         assert_eq!(config.poll_interval_ms, 500);
         assert!((config.fail_safe_speed - 0.8).abs() < 1e-12);
         assert!((config.hysteresis.temp_band_c - 3.0).abs() < 1e-12);
+        assert!(
+            (config.hysteresis.max_step_up_per_tick - 0.4).abs() < 1e-12,
+            "the rocket step is configurable too"
+        );
         assert!(!config.quiet, "the example logs every tick");
         assert_eq!(config.sensor_names["k10temp-t3"], "CPU CCD 1 temperature");
         assert!(
@@ -227,6 +245,10 @@ mod tests {
         assert_eq!(config.poll_interval_ms, 1000);
         assert!((config.fail_safe_speed - 1.0).abs() < 1e-12);
         assert!((config.hysteresis.temp_band_c - 2.0).abs() < 1e-12);
+        assert!(
+            config.hysteresis.max_step_up_per_tick > config.hysteresis.max_step_per_tick,
+            "a default config ramps up like a rocket and down like a feather"
+        );
         assert_eq!(config.fans, Vec::new());
     }
 

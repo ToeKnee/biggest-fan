@@ -8,7 +8,7 @@ Map sensors names to human readable names ("CPU temperature" instead of "k10temp
 Map fans to a graphical representation of a modern PC case.
 Different fans should be able to be controlled be different sensors.
 Fans can be to be turned off, run at a constant speed or automatically respond to sensors.
-Handles hysteresis to as not to ramp up and down the fans too quickly.
+Handles hysteresis so fans do not pump up and down: speed goes up like a rocket and down like a feather.
 Has adjustable update time (default to 1 second refresh)
 
 ## Development
@@ -26,13 +26,14 @@ Has adjustable update time (default to 1 second refresh)
 
 ### Workspace layout
 
-| Path                | Crate              | What it is                                                                                                                                                                                                      |
-| ------------------- | ------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `crates/core`       | `biggest-fan-core` | Library: sensor discovery (hwmon + NVML), human naming, fan/PWM control, config (TOML), case layout, and the control-loop `Engine` with hysteresis.                                                             |
-| `crates/app`        | `biggest-fan`      | Library plus two binaries: `biggest-fan` (GTK 4 GUI — case view + fan controls — and the `scan`, `init-config`, `detect-fans` one-shot commands) and `biggest-fan-daemon` (headless control loop, for systemd). |
-| `packaging/desktop` | —                  | The `net.ynottony.ten.BiggestFan.desktop` launcher installed by the .deb.                                                                                                                                       |
-| `packaging/icons`   | —                  | The app icon (scalable SVG source + generated PNG sizes) installed into the hicolor theme by the .deb.                                                                                                          |
-| `packaging/systemd` | —                  | The `biggest-fan.service` unit installed by the .deb.                                                                                                                                                           |
+| Path                | Crate                    | What it is                                                                                                                                                                                                                      |
+| ------------------- | ------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `crates/core`       | `biggest-fan-core`       | Library: sensor discovery (hwmon + NVML), human naming, fan/PWM control, config (TOML), case layout, and the control-loop `Engine` with hysteresis.                                                                             |
+| `crates/app`        | `biggest-fan`            | Library plus two binaries: `biggest-fan` (GTK 4 GUI — case view + fan controls — and the `scan`, `init-config`, `detect-fans` one-shot commands) and `biggest-fan-daemon` (headless control loop, for systemd).                 |
+| `crates/stress-lab` | `biggest-fan-stress-lab` | Library plus developer CLI `stress-lab`: hand-written CPU (AVX-512) and GPU (Vulkan compute) stressors and a CSV temp/fan/PWM monitor. The library also drives the GUI's Stress lab panel; the CLI binary stays developer-only. |
+| `packaging/desktop` | —                        | The `net.ynottony.ten.BiggestFan.desktop` launcher installed by the .deb.                                                                                                                                                       |
+| `packaging/icons`   | —                        | The app icon (scalable SVG source + generated PNG sizes) installed into the hicolor theme by the .deb.                                                                                                                          |
+| `packaging/systemd` | —                        | The `biggest-fan.service` unit installed by the .deb.                                                                                                                                                                           |
 
 ### Common commands
 
@@ -42,6 +43,8 @@ cargo test --workspace
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo fmt --all                        # rustfmt, edition 2024
 cargo doc -p biggest-fan-core --no-deps
+cargo build -p biggest-fan-stress-lab --release  # stressors: always release — debug is ~100x slower
+./target/release/stress-lab --help
 sh tools/dbus-e2e.sh                   # live D-Bus smoke check: private bus, --dry-run
 sh tools/render-icons.sh               # regenerate PNG icon sizes from the SVG (needs inkscape)
 ```
@@ -99,8 +102,9 @@ quiet = false             # daemon: print the fan table at startup + for
                           # warnings only (--quiet does the same thing)
 
 [hysteresis]
-temp_band_c = 2.0         # how far a sensor may fall before speed drops
-max_step_per_tick = 0.1   # max speed change per tick (1.0 disables)
+temp_band_c = 2.0           # how far a sensor may fall before speed drops
+max_step_per_tick = 0.1     # feather: max speed drop per tick (0 or 1.0 = none)
+max_step_up_per_tick = 0.5  # rocket: max speed rise per tick (0 or 1.0 = at once)
 
 [sensor_names]            # human readable overrides, keyed by sensor id
 "k10temp-t3" = "CPU CCD 1 temperature"
@@ -136,9 +140,13 @@ airflow = "intake"        # "intake", "exhaust" or "internal"
 
 Hysteresis works two ways: a sensor must fall `temp_band_c` below the
 temperature that last raised an auto fan's speed before that fan slows down,
-and speeds ramp by at most `max_step_per_tick` per tick (failsafes bypass
-this). If an auto fan's sensor stops reporting, the fan goes to
-`fail_safe_speed`.
+and the ramp is asymmetric — up like a rocket, down like a feather. Raising
+speed is the safe direction, so it runs at `max_step_up_per_tick` (0.5 gets
+to full speed within two ticks of a heat spike, without slamming from idle
+in one step); the way back down crawls at `max_step_per_tick`, so fans go
+quiet slowly instead of pumping up and down. Setting either to 0 or 1.0
+removes that limit (failsafes bypass both). If an auto fan's sensor stops
+reporting, the fan goes to `fail_safe_speed`.
 
 Changing a fan's profile — swapping the curve preset, re-binding the sensor,
 or coming back to _auto_ from a fixed speed — continues the ramp from the
@@ -354,6 +362,64 @@ The bridge:
   with untrusted local users, tighten that file (the comments explain
   how) — it is the only thing letting ordinary users change fan
   behaviour.
+
+## Stress lab
+
+`crates/stress-lab` exists to answer "which fan actually cools what?" with
+real heat instead of guesses — deliberately without stress-ng or CUDA.
+
+The GUI carries a **Stress lab** panel at the bottom of the right column:
+_toggle_ **CPU load** / **GPU load** to run the stressors as in-process
+threads (they share the library with the CLI below), pick how many
+seconds to run and the guard temperature, and watch the case view react.
+Finished runs report their throughput on the panel's status line, the
+guard aborts the load if k10temp or the GPU gets too hot, and closing
+the window always stops the load. Run the GUI itself in release mode
+(`cargo run --release -p biggest-fan`) — a debug build runs the
+stressors ~100x too slowly to heat anything.
+
+For scripted experiments the CLI does the same things:
+
+```sh
+cargo build -p biggest-fan-stress-lab --release   # release: debug stressors are ~100x too slow to heat anything
+./target/release/stress-lab cpu --secs 30            # AVX-512 FMA + integer churn across all cores
+./target/release/stress-lab gpu --secs 30            # Vulkan compute on the real GPU (refuses llvmpipe)
+./target/release/stress-lab monitor log.csv --secs 300 --every-secs 2 --phase-file /tmp/phase
+```
+
+The GPU stressor defaults to ~2M shader threads: on an RTX 4070 SUPER
+that pins the card near its 220 W power limit (~13 TFLOP/s f32). Much
+smaller thread counts still _show_ 100 % utilisation in `nvidia-smi`
+while the card sits under 100 W, so watch watts, not utilisation, when
+retuning `--threads`.
+
+Each stressor runs a thermal guard (k10temp `Tctl` + NVML GPU temp) and
+bails out with exit 3 if `--max-temp-c` is crossed, so experiments cannot
+cook the machine. `monitor` appends one CSV row per tick for every hwmon
+temp/fan/PWM plus NVML's GPU columns; `--phase-file` lets an outside
+script stamp the current experiment phase into each row.
+
+Fan phases are switched live through the daemon's D-Bus API (transient
+modes only — the saved config is untouched):
+
+```sh
+busctl --system call net.ynottony.ten.biggestfan /net/ynottony/ten/biggestfan \
+  net.ynottony.ten.biggestfan.Control1 SetFanMode ss "arctic_fan-p1" '{"type":"fixed","speed":1.0}'
+```
+
+Send each fan's original mode back afterwards (the saved config answers
+"what were the originals?": `GetConfig` returns the config TOML). Full
+one-off harnesses live in `target/lab/` (kept out of git, since cargo may
+clear `target/` at any time): `experiment.sh` runs the CPU+GPU fan-phase matrix,
+`experiment-gpu.sh` the GPU-only one, and `analyze.py` prints the
+per-phase min/median/max table. They snapshot every visible fan's mode
+first and restore it on exit, even on Ctrl+C.
+
+First findings (CPU+GPU rig, run 1): with an AIO, k10temp Tctl plateaus
+near 80 °C under AVX-512 load no matter what the case fans do — front
+intakes off, exhaust off or everything at full speed all land within a
+degree or two — so the cooler, not the airflow, is the CPU limit and the
+default curve already matches reality up there.
 
 ## Packaging (deb)
 

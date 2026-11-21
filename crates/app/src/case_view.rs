@@ -262,7 +262,6 @@ fn draw_card(cr: &cairo::Context, view: &core::CaseFanView) {
     )]
     let cooler_fans = fan_count as usize;
     let fan_radius = (height / 2.0 - 10.0).max(4.0);
-    cr.set_source_rgba(red, green, blue, 0.5_f64.mul_add(view.speed, 0.2));
     for index in 0..cooler_fans {
         #[expect(
             clippy::cast_precision_loss,
@@ -270,6 +269,10 @@ fn draw_card(cr: &cairo::Context, view: &core::CaseFanView) {
         )]
         let fraction = (index as f64 + 0.5) / fan_count;
         let centre_x = fraction.mul_add(width, left);
+        // Re-arm the fill every circle: the wedge and stroke below leave
+        // their own source behind, which would otherwise freeze the
+        // later circles at the wedge colour instead of tracking speed.
+        cr.set_source_rgba(red, green, blue, 0.5_f64.mul_add(view.speed, 0.2));
         circle(cr, centre_x, view.slot.y, fan_radius.min(width / 2.0 - 4.0));
         let _ = cr.fill_preserve();
         cr.set_source_rgb(red, green, blue);
