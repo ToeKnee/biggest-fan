@@ -48,6 +48,13 @@ impl NvidiaSource {
     pub fn is_gpu_throttled(&self, gpu_index: u32) -> bool {
         self.throttled.get(&gpu_index).copied().unwrap_or(false)
     }
+
+    /// Whether any GPU's last throttle report indicated a temperature
+    /// above that card's thermal limit.
+    #[must_use]
+    pub fn any_throttled(&self) -> bool {
+        self.throttled.values().copied().any(|throttled| throttled)
+    }
 }
 
 impl std::fmt::Debug for NvidiaSource {

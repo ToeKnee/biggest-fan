@@ -59,7 +59,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 /// 16 flops per iteration per thread: 8 cross-coupled FMAs × 2 flops.
 const FLOPS_PER_ITER: f64 = 16.0;
 
-#[derive(Args, Debug)]
+#[derive(Args, Clone, Debug)]
 pub struct GpuArgs {
     /// Seconds of stress to run.
     #[arg(long, default_value_t = 60)]

@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 /// or deadline lands within a millisecond.
 const CHUNK: u32 = 2048;
 
-#[derive(Args, Debug)]
+#[derive(Args, Clone, Debug)]
 pub struct CpuArgs {
     /// Seconds of stress to run.
     #[arg(long, default_value_t = 60)]

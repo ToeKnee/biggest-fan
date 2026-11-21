@@ -8,6 +8,12 @@
 //! hidden_sensors = ["nct6795-t2"]  # hide useless temps from the GUI list
 //! quiet = false                    # daemon: fan table at startup + warnings only
 //!
+//! [nudge]
+//! enabled = true    # learn quieter fan speeds in the background (off by default)
+//! step = 0.05       # give up 5% of a fan's curve speed per successful trial
+//! hold_secs = 240   # how long the slower speed must hold before it is kept
+//! learned = { "nct6795-p1" = 0.10 }  # what the nudger has learned so far
+//!
 //! [hysteresis]
 //! temp_band_c = 2.0
 //! max_step_per_tick = 0.1        # feather: how slowly speed may fall
@@ -74,6 +80,68 @@ impl Default for HysteresisConfig {
     }
 }
 
+/// The background nudger: it quietly learns how much slower each automatic
+/// fan can run, using the machine's own real-world load instead of a test
+/// run.
+///
+/// When a fan's sensor is warm and steady, one fan is trimmed a little
+/// below its curve and held there; if nothing gets hotter the trim is kept
+/// in [`NudgeConfig::learned`] and the config is saved, so a machine drifts
+/// towards quieter fans over days of normal use.
+///
+/// Trims multiply the speed the curve asks for (`speed * (1.0 - trim)`),
+/// so a hot day still pushes the fan up the curve — nudging only ever
+/// moves a fan *relative* to what its curve wants, and a fan's own
+/// `min_speed` floor is never crossed.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NudgeConfig {
+    /// Nudging changes fan speeds during normal use, so it starts off.
+    pub enabled: bool,
+    /// Extra speed to give up per successful trial, as a fraction of the
+    /// curve's speed (0.05 = the fan runs 5% slower than its curve asks).
+    pub step: f64,
+    /// Largest total trim one fan may learn: 0.5 means a fan is never run
+    /// below half the speed its curve asks for.
+    pub max_trim: f64,
+    /// How long a trimmed speed must hold before it is kept.
+    pub hold_secs: u64,
+    /// A trial fails when the fan's sensor climbs this many degrees above
+    /// the plateau it was sitting on before the trim.
+    pub rise_limit_c: f64,
+    /// A trial also fails if the sensor falls more than this below the
+    /// plateau: the load dropped, so the trial proved nothing.
+    pub drop_limit_c: f64,
+    /// Only trim a fan whose sensor is at least this warm — there is
+    /// nothing to learn about airflow while the machine is cool.
+    pub min_temp_c: f64,
+    /// How much the sensor may have drifted over the samples before a
+    /// trial starts. Steady conditions make the verdict trustworthy.
+    pub steady_band_c: f64,
+    /// Pause after every trial (kept or reverted) before the next one.
+    pub cooldown_secs: u64,
+    /// What the nudger has learned so far: fan id -> trim, saved with the
+    /// config. Delete an entry (or set it to 0.0) to unlearn a fan.
+    pub learned: BTreeMap<String, f64>,
+}
+
+impl Default for NudgeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            step: 0.05,
+            max_trim: 0.5,
+            hold_secs: 240,
+            rise_limit_c: 1.5,
+            drop_limit_c: 2.0,
+            min_temp_c: 55.0,
+            steady_band_c: 1.0,
+            cooldown_secs: 300,
+            learned: BTreeMap::new(),
+        }
+    }
+}
+
 /// One logical fan's configuration: a leader header plus any extra headers
 /// driven together with it (an AIO radiator's three fans, for example).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -131,6 +199,8 @@ pub struct AppConfig {
     pub quiet: bool,
     /// Anti-pumping settings for auto fans.
     pub hysteresis: HysteresisConfig,
+    /// Background learning of slower fan speeds.
+    pub nudge: NudgeConfig,
     /// Human readable display names keyed by sensor id.
     pub sensor_names: BTreeMap<String, String>,
     /// Sensor ids hidden from the GUI's temperature list. Hiding is
@@ -156,6 +226,7 @@ impl Default for AppConfig {
             fail_safe_speed: 1.0,
             quiet: false,
             hysteresis: HysteresisConfig::default(),
+            nudge: NudgeConfig::default(),
             sensor_names: BTreeMap::new(),
             hidden_sensors: Vec::new(),
             fans: Vec::new(),
@@ -175,6 +246,11 @@ mod tests {
         let text = r#"
             poll_interval_ms = 500
             fail_safe_speed = 0.8
+
+            [nudge]
+            enabled = true
+            step = 0.1
+            learned = { "nct6795-p1" = 0.2 }
 
             [hysteresis]
             temp_band_c = 3.0
@@ -208,6 +284,16 @@ mod tests {
             "the rocket step is configurable too"
         );
         assert!(!config.quiet, "the example logs every tick");
+        assert!(config.nudge.enabled, "the example turns nudging on");
+        assert!(
+            (config.nudge.step - 0.1).abs() < 1e-12,
+            "the nudge step is configurable"
+        );
+        assert_eq!(
+            config.nudge.learned.get("nct6795-p1").copied(),
+            Some(0.2),
+            "learned trims are part of the config"
+        );
         assert_eq!(config.sensor_names["k10temp-t3"], "CPU CCD 1 temperature");
         assert!(
             config.hidden_sensors.is_empty(),
@@ -358,6 +444,11 @@ mod tests {
             fail_safe_speed: 1.0,
             quiet: false,
             hysteresis: HysteresisConfig::default(),
+            nudge: NudgeConfig {
+                enabled: true,
+                learned: BTreeMap::from([("it87-p2".to_string(), 0.15)]),
+                ..NudgeConfig::default()
+            },
             sensor_names: BTreeMap::from([(
                 "k10temp-t1".to_string(),
                 "CPU temperature".to_string(),

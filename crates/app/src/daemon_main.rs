@@ -95,6 +95,12 @@ fn run(mut engine: core::Engine, quiet: bool) -> Result<(), core::CoreError> {
                     println!("{line}");
                 }
                 first_tick = false;
+                // What the background nudger decided, when it decided
+                // something: kept or reverted trims are rare and worth a
+                // line in the journal.
+                for note in engine.drain_nudge_notes() {
+                    println!("nudge: {note}");
+                }
                 std::io::stdout().flush().ok();
             }
             Err(error) => {
