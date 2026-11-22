@@ -302,6 +302,18 @@ Differences from sysfs headers:
   note — the check is the same clocks-event-reasons bitmask `nvidia-smi`
   prints. AMD CPUs have no equivalent hwmon signal (their throttle status
   lives in MSRs), so no CPU throttle note exists.
+- The GPU's _own cooler_ does more than note it. A Quiet curve runs
+  Balanced and a Balanced curve runs Performance while the card throttles
+  — runtime relief: the graph draws it over the saved one in orange with
+  a "Keep this curve" button, and it clears when the card stops
+  throttling. Any other curve (custom, or Performance) is nudged instead:
+  the two curve points around the temperature the fan is running at go up
+  +5 % (a warmer point that would be left quieter than its neighbour is
+  pulled up too, colder points are never touched), saved into the config
+  at once, and while the card keeps throttling, at most one further nudge
+  every 20 seconds — a real wait to see whether the last step was enough
+  — until the curve cannot rise at that temperature any more. Other fans
+  tracking the GPU keep following their own curves untouched.
 
 ## systemd service
 
@@ -345,7 +357,11 @@ degrees and whole percents and can never cross its neighbours),
 delete one (two points is the floor — pick a preset for a simpler curve).
 A drag is only committed to the fan and the service when you let go, so a
 half-dragged curve never drives anything; the dropdown then reads
-"Custom", and picking a preset replaces what you drew. Beside it
+"Custom", and picking a preset replaces what you drew. While runtime GPU
+throttle relief lifts a preset cooler above its saved curve, the graph
+draws the lifted curve over the saved one in orange and offers a "Keep
+this curve" button to make it the fan's real curve (saved-curve nudges
+need no offer — they arrive as the fan's curve). Beside it
 every fan also charts its last 5 minutes — speed % (blue) against the
 same 0–100 scale as governing sensor °C (yellow) — so changes over time
 stay visible after the numbers have scrolled past in the status line.

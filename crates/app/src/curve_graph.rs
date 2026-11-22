@@ -18,13 +18,17 @@
 //!
 //! All fans share the same temperature domain, so their curves can be
 //! compared straight down the list.
+//!
+//! While GPU throttle relief lifts a cooler above its saved curve, the
+//! curve actually running is drawn over the saved one in hot orange, and
+//! a "Keep this curve" button offers to make it permanent.
 
 use crate::case_view::draw_centered;
 use crate::dbus;
 use crate::fan_controls::{escape_markup, push_mode};
 use biggest_fan_core as core;
 use gtk4::prelude::*;
-use gtk4::{DrawingArea, Label};
+use gtk4::{Box as GtkBox, Button, DrawingArea, Label, Orientation};
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
@@ -221,19 +225,32 @@ fn remove_point(points: &mut Vec<core::CurvePoint>, plot: Plot, x: f64, y: f64) 
     true
 }
 
-/// Draws the graph: frame, grid, the curve with a filled area under it,
-/// the curve's points as handles (the one the pointer is over or holding
-/// stands out, with its values beside it), and the live operating point
-/// as a dashed temperature line plus a dot.
-fn draw(
-    cr: &cairo::Context,
-    width: f64,
-    height: f64,
-    curve: Option<&core::FanCurve>,
-    handles: Option<&[core::CurvePoint]>,
+/// What one frame shows: the fan's curve (its auto curve, or the draft
+/// under the pointer), the handles to paint, the hovered/held handle,
+/// the live operating point, and the throttle-relief curve running
+/// above the saved one (if any).
+struct Frame<'a> {
+    curve: Option<&'a core::FanCurve>,
+    handles: Option<&'a [core::CurvePoint]>,
     focus: Option<usize>,
     operating: Option<OperatingPoint>,
-) {
+    relief: Option<&'a core::FanCurve>,
+}
+
+/// Draws the graph: frame, grid, the curve with a filled area under it,
+/// the curve's points as handles (the one the pointer is over or holding
+/// stands out, with its values beside it), the live operating point as a
+/// dashed temperature line plus a dot, and — while GPU throttle relief
+/// runs the fan above its curve — the curve actually running, over the
+/// saved one in hot orange.
+fn draw(cr: &cairo::Context, width: f64, height: f64, frame: &Frame<'_>) {
+    let Frame {
+        curve,
+        handles,
+        focus,
+        operating,
+        relief,
+    } = *frame;
     cr.set_source_rgb(0.13, 0.13, 0.15);
     let _ = cr.paint();
 
@@ -297,6 +314,10 @@ fn draw(
         let _ = cr.fill();
     }
 
+    // The throttle-relief curve the fan is really running, over the
+    // saved one in hot orange (the live marker lands on this line).
+    draw_relief(cr, plot, relief);
+
     // The curve's own points: hover one to read it, drag it to reshape
     // the curve. The focused handle gets a halo and a readout of what it
     // asks for — its temperature and the speed there.
@@ -334,6 +355,24 @@ fn draw(
         cr.set_source_rgb(0.95, 0.75, 0.20);
         cr.arc(x, y_for(plot, commanded), 3.0, 0.0, std::f64::consts::TAU);
         let _ = cr.fill();
+    }
+}
+
+/// The curve GPU throttle relief is actually running, stroked in hot
+/// orange over the fan's saved curve.
+fn draw_relief(cr: &cairo::Context, plot: Plot, relief: Option<&core::FanCurve>) {
+    let Some(relief) = relief else {
+        return;
+    };
+    let points = curve_points(relief, plot);
+    if let Some(&(first_x, first_y)) = points.first() {
+        cr.move_to(first_x, first_y);
+        for &(x, y) in points.iter().skip(1) {
+            cr.line_to(x, y);
+        }
+        cr.set_source_rgb(0.95, 0.50, 0.25);
+        cr.set_line_width(2.0);
+        let _ = cr.stroke();
     }
 }
 
@@ -421,9 +460,17 @@ fn commit_points(
 /// `queue_draw` to appear.
 ///
 /// An edit works the same way: it writes a draft here, and commits the
-/// fan's mode only when the gesture ends.
+/// fan's mode only when the gesture ends. While GPU throttle relief
+/// lifts a cooler above its saved curve, the boosted curve is drawn
+/// over the saved one and the "Keep this curve" row offers to make it
+/// permanent.
 pub struct CurveGraph {
     area: DrawingArea,
+    /// The graph with the (normally hidden) keep offer under it.
+    container: GtkBox,
+    save_row: GtkBox,
+    engine: Rc<RefCell<core::Engine>>,
+    fan_id: core::FanId,
     operating: Rc<RefCell<Option<OperatingPoint>>>,
 }
 
@@ -451,6 +498,37 @@ impl CurveGraph {
         let grabbed: Rc<Cell<Option<usize>>> = Rc::new(Cell::new(None));
         // Which handle the pointer is resting on (no drag involved).
         let hovered: Rc<Cell<Option<usize>>> = Rc::new(Cell::new(None));
+        // The keep offer shown while throttle relief lifts this fan's
+        // curve; `set_operating_point` (every tick) shows or hides it.
+        let save_row = GtkBox::new(Orientation::Horizontal, 6);
+        let save_button = Button::builder()
+            .label("Keep this curve")
+            .tooltip_text(
+                "make the curve the fan is actually running its saved curve; \
+                 relief keeps lifting from there while the card throttles, \
+                 and \"Save config\" writes it to disk",
+            )
+            .build();
+        {
+            let rc = Rc::clone(engine_rc);
+            let fan_id = fan_id.clone();
+            let status_label = status_label.clone();
+            let client = client.clone();
+            save_button.connect_clicked(move |_| {
+                save_relief_curve(&rc, &fan_id, &status_label, &client);
+            });
+        }
+        save_row.append(
+            &Label::builder()
+                .label("GPU relief is running this curve")
+                .build(),
+        );
+        save_row.append(&save_button);
+        save_row.set_visible(false);
+        let container = GtkBox::new(Orientation::Vertical, 2);
+        container.append(&area);
+        container.append(&save_row);
+        container.set_hexpand(true);
 
         let draw_engine = Rc::clone(engine_rc);
         let draw_fan_id = fan_id.clone();
@@ -462,15 +540,25 @@ impl CurveGraph {
             // Take a copy of what is needed and release the engine
             // before drawing (same care as the case canvas).
             let draft = draw_draft.borrow().clone();
-            let (curve, handles) = draw_engine.try_borrow().map_or((None, None), |engine| {
-                match engine.fan_mode(&draw_fan_id) {
-                    Some(core::FanMode::Auto { curve, .. }) => {
-                        let handles = draft.clone().unwrap_or_else(|| curve.points().to_vec());
-                        (Some(curve), Some(handles))
-                    }
-                    _ => (None, None),
-                }
-            });
+            let (curve, handles, relief) =
+                draw_engine
+                    .try_borrow()
+                    .map_or((None, None, None), |engine| {
+                        match engine.fan_mode(&draw_fan_id) {
+                            Some(core::FanMode::Auto { curve, .. }) => {
+                                let handles =
+                                    draft.clone().unwrap_or_else(|| curve.points().to_vec());
+                                // No overlay while a draft is being dragged:
+                                // the draft is the curve under the pointer.
+                                let relief = draft
+                                    .is_none()
+                                    .then(|| engine.relieved_fan_curve(&draw_fan_id))
+                                    .flatten();
+                                (Some(curve), Some(handles), relief)
+                            }
+                            _ => (None, None, None),
+                        }
+                    });
             // A drag draws its draft instead of the fan's real curve.
             let drafted = draft
                 .as_ref()
@@ -479,11 +567,14 @@ impl CurveGraph {
                 cr,
                 f64::from(width),
                 f64::from(height),
-                drafted.as_ref().or(curve.as_ref()),
-                handles.as_deref(),
-                // A held handle outranks a hovered one.
-                draw_grabbed.get().or_else(|| draw_hovered.get()),
-                *draw_operating.borrow(),
+                &Frame {
+                    curve: drafted.as_ref().or(curve.as_ref()),
+                    handles: handles.as_deref(),
+                    // A held handle outranks a hovered one.
+                    focus: draw_grabbed.get().or_else(|| draw_hovered.get()),
+                    operating: *draw_operating.borrow(),
+                    relief: relief.as_ref(),
+                },
             );
         });
 
@@ -499,22 +590,67 @@ impl CurveGraph {
         wire_point_edits(&area, engine_rc, fan_id, client, status_label);
         wire_hover(&area, engine_rc, fan_id, &draft, &hovered);
 
-        Self { area, operating }
+        Self {
+            area,
+            container,
+            save_row,
+            engine: Rc::clone(engine_rc),
+            fan_id: fan_id.clone(),
+            operating,
+        }
     }
 
     /// The widget to add to the fan row.
     #[must_use]
-    pub const fn widget(&self) -> &DrawingArea {
-        &self.area
+    pub const fn widget(&self) -> &GtkBox {
+        &self.container
     }
 
     /// Moves the live marker to the fan's current governing temperature
-    /// (if the sensor reads at all) and commanded speed, and schedules a
-    /// redraw.
+    /// (if the sensor reads at all) and commanded speed, shows or hides
+    /// the "Keep this curve" offer to match the engine's live throttle
+    /// relief, and schedules a redraw.
     pub fn set_operating_point(&self, temp_c: Option<f64>, commanded_speed: f64) {
         *self.operating.borrow_mut() = temp_c.map(|temp| (temp, commanded_speed));
+        let relieved = self
+            .engine
+            .try_borrow()
+            .is_ok_and(|engine| engine.relieved_fan_curve(&self.fan_id).is_some());
+        self.save_row.set_visible(relieved);
         self.area.queue_draw();
     }
+}
+
+/// Keeps a throttle-lifted curve as the fan's own: the curve the fan is
+/// actually running (relief included) replaces its configured curve,
+/// through the same path as a drag commit so the service and the case
+/// view follow. Relief continues from the new baseline while the card
+/// still throttles; writing the curve to disk stays the "Save config"
+/// button's job.
+fn save_relief_curve(
+    engine_rc: &Rc<RefCell<core::Engine>>,
+    fan_id: &core::FanId,
+    status_label: &Label,
+    client: &dbus::Client,
+) {
+    let engine = engine_rc.borrow();
+    let Some(core::FanMode::Auto { sensor, .. }) = engine.fan_mode(fan_id) else {
+        return;
+    };
+    let Some(relief) = engine.relieved_fan_curve(fan_id) else {
+        return;
+    };
+    drop(engine);
+    push_mode(
+        engine_rc,
+        fan_id,
+        Some(core::FanMode::Auto {
+            sensor,
+            curve: relief,
+        }),
+        status_label,
+        client,
+    );
 }
 
 /// Wires the drag-a-handle gesture onto the graph. The press grabs the
@@ -1072,10 +1208,13 @@ mod tests {
                 &cr,
                 f64::from(width),
                 f64::from(height),
-                Some(&curve),
-                Some(curve.points()),
-                focus,
-                None,
+                &Frame {
+                    curve: Some(&curve),
+                    handles: Some(curve.points()),
+                    focus,
+                    operating: None,
+                    relief: None,
+                },
             );
         }
         let stride = usize::try_from(surface.stride()).expect("a positive stride");
@@ -1110,5 +1249,52 @@ mod tests {
         // The readout box is wider than this plot, so it centres rather
         // than clamps (clamping the wrong way round would panic).
         assert!(bright_pixels(40, 30, Some(1)) > 0);
+    }
+
+    /// Counts the hot-orange pixels only the throttle-relief overlay
+    /// paints (premultiplied BGRA: high red, low blue — the blue curve,
+    /// white text and handles all have a high blue channel).
+    fn overlay_pixels(width: i32, height: i32, relief: Option<&core::FanCurve>) -> usize {
+        let surface =
+            cairo::ImageSurface::create(cairo::Format::ARgb32, width, height).expect("surface");
+        {
+            let cr = cairo::Context::new(&surface).expect("cairo context");
+            let curve = ramp_curve();
+            draw(
+                &cr,
+                f64::from(width),
+                f64::from(height),
+                &Frame {
+                    curve: Some(&curve),
+                    handles: Some(curve.points()),
+                    focus: None,
+                    operating: None,
+                    relief,
+                },
+            );
+        }
+        let stride = usize::try_from(surface.stride()).expect("a positive stride");
+        let mut orange = 0_usize;
+        surface
+            .with_data(|data| {
+                orange = data
+                    .chunks(stride.max(1))
+                    .flat_map(|row| row.as_chunks::<4>().0)
+                    .filter(|pixel| pixel[0] < 110 && pixel[1] < 200 && pixel[2] > 150)
+                    .count();
+            })
+            .expect("a freshly drawn image surface still has its pixels");
+        orange
+    }
+
+    #[test]
+    fn the_relief_overlay_paints_over_the_curve() {
+        assert_eq!(
+            overlay_pixels(260, 90, None),
+            0,
+            "no overlay without throttle relief"
+        );
+        let lifted = overlay_pixels(260, 90, Some(&core::CurvePreset::Performance.curve()));
+        assert!(lifted > 100, "the lifted-curve overlay did not draw");
     }
 }

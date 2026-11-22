@@ -5,7 +5,7 @@ use crate::case::{Airflow, CaseConfig, FanSlot};
 use crate::config::model::{AppConfig, FanConfig, HysteresisConfig};
 use crate::error::CoreError;
 use crate::fans::driver::FanDriver;
-use crate::fans::model::{FanCurve, FanDescriptor, FanId, FanMode, FanStatus};
+use crate::fans::model::{CurvePreset, FanCurve, FanDescriptor, FanId, FanMode, FanStatus};
 use crate::fans::nvidia::NvidiaFan;
 use crate::fans::sysfs::SysfsFan;
 use crate::sensors::model::{SensorDescriptor, SensorId, SensorSource, SensorStatus};
@@ -231,6 +231,30 @@ pub struct CaseFanView {
     pub note: Option<String>,
 }
 
+/// Extra cooling applied to a GPU cooler while its own card is thermal
+/// throttling, tracked in [`FanRuntime`]. Preset fans run the preset one
+/// space up while the card throttles (the GUI draws that lifted curve and
+/// offers to keep it); curves a preset bump cannot raise get their saved
+/// curve nudged instead — see [`THROTTLE_CURVE_RAISE`].
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+enum ThrottleRelief {
+    /// No relief: the fan runs exactly its configured curve.
+    #[default]
+    Off,
+    /// The configured preset curve is replaced by the preset one space
+    /// up (quiet → balanced, balanced → performance).
+    RaisedPreset(CurvePreset),
+}
+
+/// How far one saved-curve nudge lifts the points around the current
+/// temperature, and how long a fan then cools on the nudged curve before
+/// the next nudge if the card is still throttling. The cooldown is the
+/// point: one visible step, then a real wait to see whether the
+/// throttling stopped. Nudging stops by itself once the points around
+/// the current temperature are at full speed.
+const THROTTLE_CURVE_RAISE: f64 = 0.05;
+const RELIEF_ADJUST_COOLDOWN_SECS: u64 = 20;
+
 /// Hysteresis bookkeeping for one auto fan.
 #[derive(Clone, Copy, Debug, Default)]
 struct FanRuntime {
@@ -240,6 +264,12 @@ struct FanRuntime {
     /// Temperature that last *raised* the speed; the speed may not fall
     /// until the sensor drops `temp_band_c` below this.
     hold_temp_c: Option<f64>,
+    /// Extra cooling while this fan's GPU card thermal throttles
+    /// (GPU coolers only — see [`ThrottleRelief`]).
+    throttle_relief: ThrottleRelief,
+    /// Ticks until this fan may nudge its saved curve again for throttle
+    /// relief (0 = it may nudge this tick).
+    relief_cooldown: u32,
 }
 
 #[derive(Debug)]
@@ -272,6 +302,10 @@ pub struct Engine {
     all_headers: Vec<FanDriver>,
     /// Configs of headers found disconnected; skipped until re-enabled.
     hidden_fans: Vec<FanConfig>,
+    /// Set when the control loop changed the config itself (a throttle-
+    /// relief curve nudge); the next tick writes the file, for the
+    /// process that owns the headers.
+    config_dirty: bool,
     last_report: TickReport,
 }
 
@@ -289,6 +323,7 @@ impl std::fmt::Debug for Engine {
             .field("fans", &self.fans)
             .field("all_headers", &self.all_headers)
             .field("hidden_fans", &self.hidden_fans)
+            .field("config_dirty", &self.config_dirty)
             .field("last_report", &self.last_report)
             .finish()
     }
@@ -365,6 +400,7 @@ impl Engine {
             fans,
             all_headers,
             hidden_fans,
+            config_dirty: false,
             last_report: TickReport::default(),
         })
     }
@@ -481,6 +517,15 @@ impl Engine {
             self.hidden_fans.push(entry.fan_config);
         }
 
+        // A throttle nudge rewrote a fan's saved curve mid-tick: persist
+        // it. Only the process that owns the header writes owns the
+        // config file — a GUI mirror keeps the change in memory, which
+        // is enough for its graphs to show the lifted curve.
+        if self.config_dirty {
+            self.save_config()?;
+            self.config_dirty = false;
+        }
+
         let report = TickReport { sensors, fans };
         self.last_report = report.clone();
         Ok(report)
@@ -498,6 +543,8 @@ impl Engine {
         // NVML throttle state must be read before `entry`'s mutable
         // borrow of the fans list below is taken.
         let throttle_note = self.gpu_throttle_note(&mode);
+        let gpu_throttled = self.gpu_cooler_throttled(index, &mode);
+        let relief_cooldown_ticks = relief_cooldown_ticks(self.poll_interval_ms());
         let entry = &mut self.fans[index];
         let mut note = throttle_note;
         let mut governing_temp_c = None;
@@ -529,7 +576,24 @@ impl Engine {
                     }
                     Some(temp_c) => {
                         governing_temp_c = Some(temp_c);
-                        let desired = curve.speed_at(temp_c);
+                        // A GPU cooler whose own card is thermal
+                        // throttling cools harder than its curve asks
+                        // (see `apply_throttle_relief`); case fans
+                        // tracking the GPU keep following their curve
+                        // untouched. The fail-safe branch above skips
+                        // relief: protection speed outranks it.
+                        let nudged = apply_throttle_relief(
+                            entry,
+                            &mut note,
+                            &mode,
+                            gpu_throttled,
+                            temp_c,
+                            relief_cooldown_ticks,
+                        );
+                        if nudged && self.apply_writes {
+                            self.config_dirty = true;
+                        }
+                        let desired = relief_speed(curve, temp_c, entry.runtime.throttle_relief);
                         if desired > base {
                             target = desired;
                             entry.runtime.hold_temp_c = Some(temp_c);
@@ -634,6 +698,21 @@ impl Engine {
         })
     }
 
+    /// Whether this fan drives the cooler of an NVIDIA card that is
+    /// currently thermal throttling: an auto fan on an NVIDIA header whose
+    /// own card (the ordinal in its header id) reports a thermal slowdown.
+    /// Only such a fan gets [`ThrottleRelief`].
+    fn gpu_cooler_throttled(&self, index: usize, mode: &FanMode) -> bool {
+        if !matches!(mode, FanMode::Auto { .. }) || !is_gpu_cooler(&self.fans[index].header) {
+            return false;
+        }
+        gpu_index_in_sensor_id(self.fans[index].header.id().as_str()).is_some_and(|gpu_index| {
+            self.nvidia
+                .as_ref()
+                .is_some_and(|nvidia| nvidia.is_gpu_throttled(gpu_index))
+        })
+    }
+
     /// Refreshes one fan's mode and (unless dry-run) applies it at once.
     /// Switching to _auto_ continues the speed ramp from the speed the fan
     /// is already at instead of restarting it at 0, so changing curve
@@ -675,6 +754,22 @@ impl Engine {
     pub fn fan_mode(&self, fan_id: &FanId) -> Option<FanMode> {
         self.find_fan(fan_id)
             .map(|index| self.fans[index].fan_config.mode.clone())
+    }
+
+    /// The curve an auto fan is actually running right now, when GPU
+    /// throttle relief is lifting it above the configured curve — `None`
+    /// when the configured curve is what runs. The GUI draws it over the
+    /// configured curve and offers to save it as the fan's new curve.
+    #[must_use]
+    pub fn relieved_fan_curve(&self, fan_id: &FanId) -> Option<FanCurve> {
+        let index = self.find_fan(fan_id)?;
+        if !matches!(self.fans[index].fan_config.mode, FanMode::Auto { .. }) {
+            return None;
+        }
+        match self.fans[index].runtime.throttle_relief {
+            ThrottleRelief::Off => None,
+            ThrottleRelief::RaisedPreset(preset) => Some(preset.curve()),
+        }
     }
 
     /// Index of the managed fan driving `fan_id`'s header.
@@ -1390,6 +1485,153 @@ fn approach(from: f64, to: f64, step: f64) -> f64 {
     }
 }
 
+/// The runtime preset relief for a throttled GPU cooler: a curve that is
+/// exactly a quiet or balanced preset runs the preset one space up;
+/// anything else (a custom curve, or the hardest preset) gets no runtime
+/// relief — its cooling comes from [`apply_throttle_relief`]'s saved-
+/// curve nudge instead. Preset relief clears as soon as the card stops
+/// throttling.
+fn preset_bump(throttled: bool, curve: &FanCurve) -> ThrottleRelief {
+    if !throttled {
+        return ThrottleRelief::Off;
+    }
+    match CurvePreset::matching(curve) {
+        Some(CurvePreset::Quiet) => ThrottleRelief::RaisedPreset(CurvePreset::Balanced),
+        Some(CurvePreset::Balanced) => ThrottleRelief::RaisedPreset(CurvePreset::Performance),
+        _ => ThrottleRelief::Off,
+    }
+}
+
+/// One tick of throttle relief for a GPU cooler whose card is (or just
+/// stopped being) thermal throttling; does nothing to other fans. A
+/// curve that is exactly a quiet or balanced preset runs the preset one
+/// space up as runtime relief (the GUI draws that lifted curve and
+/// offers to keep it); anything else — a custom curve, or the hardest
+/// preset — gets its *saved* curve nudged around the temperature it is
+/// running at: the bracketing points up [`THROTTLE_CURVE_RAISE`] (see
+/// [`nudged_curve`]), at most once per cooldown window while the card
+/// keeps throttling, until the nudge would change nothing. The nudge
+/// lands in `entry.fan_config` (the tick then writes the file, in the
+/// process that owns header writes), so it persists across restarts and
+/// every view shows it as the fan's own curve. `note` gets the matching
+/// status message; the return says whether the saved curve was nudged.
+fn apply_throttle_relief(
+    entry: &mut FanEntry,
+    note: &mut Option<String>,
+    mode: &FanMode,
+    throttled: bool,
+    temp_c: f64,
+    cooldown_ticks: u32,
+) -> bool {
+    if !is_gpu_cooler(&entry.header) {
+        return false;
+    }
+    let FanMode::Auto { sensor, curve } = mode else {
+        return false;
+    };
+    entry.runtime.relief_cooldown = entry.runtime.relief_cooldown.saturating_sub(1);
+    entry.runtime.throttle_relief = preset_bump(throttled, curve);
+    let can_nudge = throttled
+        && entry.runtime.throttle_relief == ThrottleRelief::Off
+        && entry.runtime.relief_cooldown == 0;
+    let raised = can_nudge
+        .then(|| nudged_curve(curve, THROTTLE_CURVE_RAISE, temp_c))
+        .flatten();
+    if let Some(raised) = raised {
+        entry.fan_config.mode = FanMode::Auto {
+            sensor: sensor.clone(),
+            curve: raised,
+        };
+        entry.runtime.relief_cooldown = cooldown_ticks;
+        *note = Some(format!(
+            "GPU is thermal throttling — cooler curve raised +{:.0}%",
+            THROTTLE_CURVE_RAISE * 100.0
+        ));
+        return true;
+    }
+    if let Some(message) = relief_note(entry.runtime.throttle_relief) {
+        *note = Some(message);
+    }
+    false
+}
+
+/// The curve nudged around the temperature the fan is running at: the
+/// two points bracketing `temp_c` each gain `raise` (clamped at full
+/// speed). Points colder than the bracket stay exactly as saved — the
+/// fan's idle behaviour is untouched — and a warmer point is only nudged
+/// when it sits below the speed of the point before it, so the nudge
+/// never leaves the tail quieter than its neighbour. `None` when nothing
+/// would change (the bracket is already at full speed and the tail is
+/// not descending), which is where nudging stops.
+fn nudged_curve(curve: &FanCurve, raise: f64, temp_c: f64) -> Option<FanCurve> {
+    let saved = curve.points();
+    let mut points = saved.to_vec();
+    // The curve's point at or just below the current temperature, and
+    // the one just above (temperatures below the first point leave only
+    // that first point to nudge).
+    let bracket = saved
+        .iter()
+        .rposition(|point| point.temp_c <= temp_c)
+        .unwrap_or(0);
+    let last_nudged = (bracket + 1).min(points.len() - 1);
+    for point in &mut points[bracket..=last_nudged] {
+        point.speed = (point.speed + raise).min(1.0);
+    }
+    // Walk on through a tail that would end up quieter than the point
+    // ahead of it, and stop at the first point that still stands taller.
+    for index in last_nudged + 1..points.len() {
+        if points[index].speed >= points[index - 1].speed {
+            break;
+        }
+        points[index].speed = (points[index].speed + raise).min(1.0);
+    }
+    if points == saved {
+        return None;
+    }
+    FanCurve::new(points).ok()
+}
+
+/// How many ticks a fan waits between saved-curve nudges, for a poll
+/// interval in milliseconds.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "the value is bounded by the u32::MAX check below"
+)]
+const fn relief_cooldown_ticks(poll_ms: u64) -> u32 {
+    let poll_ms = if poll_ms == 0 { 1 } else { poll_ms };
+    let ticks = RELIEF_ADJUST_COOLDOWN_SECS * 1_000 / poll_ms;
+    // At least one tick between nudges, and never past `u32::MAX`.
+    let ticks = if ticks == 0 {
+        1
+    } else if ticks > u32::MAX as u64 {
+        u32::MAX as u64
+    } else {
+        ticks
+    };
+    ticks as u32
+}
+
+/// The speed the curve asks for at `temp_c`, with runtime relief applied
+/// (the commanded speed is clamped to `0.0..=1.0` downstream).
+fn relief_speed(curve: &FanCurve, temp_c: f64, relief: ThrottleRelief) -> f64 {
+    match relief {
+        ThrottleRelief::Off => curve.speed_at(temp_c),
+        ThrottleRelief::RaisedPreset(preset) => preset.curve().speed_at(temp_c),
+    }
+}
+
+/// A note explaining active preset relief; `None` when there is none,
+/// which leaves the plain throttle note (if any) standing.
+fn relief_note(relief: ThrottleRelief) -> Option<String> {
+    match relief {
+        ThrottleRelief::Off => None,
+        ThrottleRelief::RaisedPreset(preset) => Some(format!(
+            "GPU is thermal throttling — cooler profile raised to {}",
+            preset.label()
+        )),
+    }
+}
+
 /// The runtime a freshly claimed fan starts with: the ramp baseline is
 /// seeded from the duty the header actually holds at takeover — what the
 /// BIOS, the card's own policy or a previous run left behind — so taking
@@ -1417,6 +1659,8 @@ const fn ramp_baseline_for(mode: &FanMode, previous_commanded: f64, floor: f64) 
     FanRuntime {
         last_commanded,
         hold_temp_c: None,
+        throttle_relief: ThrottleRelief::Off,
+        relief_cooldown: 0,
     }
 }
 
@@ -3103,5 +3347,180 @@ mod tests {
         assert_eq!(gpu_index_in_sensor_id("nvidia-gpu-t1"), None);
         // The cooler id shares the ordinal, but it is not a sensor id.
         assert_eq!(gpu_index_in_sensor_id("nvidia-gpu0-cooler"), Some(0));
+    }
+
+    #[test]
+    fn throttle_relief_bumps_recognised_presets_one_space() {
+        assert_eq!(
+            preset_bump(true, &CurvePreset::Quiet.curve()),
+            ThrottleRelief::RaisedPreset(CurvePreset::Balanced),
+        );
+        assert_eq!(
+            preset_bump(true, &CurvePreset::Balanced.curve()),
+            ThrottleRelief::RaisedPreset(CurvePreset::Performance),
+        );
+        // The hardest preset has nowhere left to bump: its cooling comes
+        // from the saved-curve nudge, not from runtime relief.
+        assert_eq!(
+            preset_bump(true, &CurvePreset::Performance.curve()),
+            ThrottleRelief::Off,
+        );
+        assert_eq!(preset_bump(true, &fixture_curve()), ThrottleRelief::Off);
+        // Runtime relief clears as soon as the card stops throttling.
+        assert_eq!(
+            preset_bump(false, &CurvePreset::Quiet.curve()),
+            ThrottleRelief::Off
+        );
+    }
+
+    /// A curve for the nudge tests: 10 % at 30 °C up to 70 % at 90 °C.
+    fn nudge_curve() -> FanCurve {
+        FanCurve::new(vec![
+            CurvePoint {
+                temp_c: 30.0,
+                speed: 0.10,
+            },
+            CurvePoint {
+                temp_c: 50.0,
+                speed: 0.30,
+            },
+            CurvePoint {
+                temp_c: 70.0,
+                speed: 0.50,
+            },
+            CurvePoint {
+                temp_c: 90.0,
+                speed: 0.70,
+            },
+        ])
+        .expect("curve")
+    }
+
+    fn speeds(curve: &FanCurve) -> Vec<f64> {
+        curve.points().iter().map(|point| point.speed).collect()
+    }
+
+    fn assert_speeds(curve: &FanCurve, expected: &[f64]) {
+        for (had, got) in expected.iter().zip(speeds(curve)) {
+            assert!((had - got).abs() < 1e-9, "expected {had}, got {got}");
+        }
+    }
+
+    #[test]
+    fn a_nudge_only_moves_the_points_around_the_current_temperature() {
+        // Running at 55 °C: the 50 °C and 70 °C points bracket it and
+        // gain +5 %; the 30 °C and 90 °C points stay exactly as saved.
+        let nudged = nudged_curve(&nudge_curve(), THROTTLE_CURVE_RAISE, 55.0).expect("nudged");
+        assert_speeds(&nudged, &[0.10, 0.35, 0.55, 0.70]);
+        // At 95 °C (past the last point) only the last point moves.
+        let nudged = nudged_curve(&nudge_curve(), THROTTLE_CURVE_RAISE, 95.0).expect("nudged");
+        assert_speeds(&nudged, &[0.10, 0.30, 0.50, 0.75]);
+    }
+
+    #[test]
+    fn a_nudge_pulls_up_a_tail_point_left_quieter_than_its_neighbour() {
+        // The 90 °C point is already quieter than the 70 °C one, and the
+        // nudge would leave it further behind — so it comes up too.
+        let curve = FanCurve::new(vec![
+            CurvePoint {
+                temp_c: 30.0,
+                speed: 0.10,
+            },
+            CurvePoint {
+                temp_c: 50.0,
+                speed: 0.30,
+            },
+            CurvePoint {
+                temp_c: 70.0,
+                speed: 0.50,
+            },
+            CurvePoint {
+                temp_c: 90.0,
+                speed: 0.45,
+            },
+        ])
+        .expect("curve");
+        let nudged = nudged_curve(&curve, THROTTLE_CURVE_RAISE, 55.0).expect("nudged");
+        assert_speeds(&nudged, &[0.10, 0.35, 0.55, 0.50]);
+    }
+
+    #[test]
+    fn nudging_stops_once_the_current_temperature_cannot_get_warmer() {
+        // Repeated nudges at 55 °C walk the bracketing points to full
+        // speed (0.2 → 1.0 is 16 nudges) and then report there is
+        // nothing left to change.
+        let mut curve = fixture_curve();
+        let mut nudges = 0;
+        while let Some(nudged) = nudged_curve(&curve, THROTTLE_CURVE_RAISE, 55.0) {
+            curve = nudged;
+            nudges += 1;
+            assert!(nudges < 40, "nudges must stop at full speed");
+        }
+        assert!(
+            (16..=18).contains(&nudges),
+            "0.2 gains 5 % per nudge until 1.0, took {nudges}"
+        );
+        assert_speeds(&curve, &[1.0, 1.0]);
+    }
+
+    #[test]
+    fn nudge_cooldown_is_the_wait_in_poll_intervals() {
+        // 20 s of cooldown, however often the loop ticks.
+        assert_eq!(relief_cooldown_ticks(1_000), 20);
+        assert_eq!(relief_cooldown_ticks(2_000), 10);
+        assert_eq!(relief_cooldown_ticks(5_000), 4);
+        // A poll interval longer than the cooldown still waits a tick,
+        // and a zero interval cannot divide by zero.
+        assert_eq!(relief_cooldown_ticks(30_000), 1);
+        assert_eq!(relief_cooldown_ticks(0), 20_000);
+    }
+
+    #[test]
+    fn relieved_fan_curve_shows_the_lifted_curve_to_the_gui() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        fixture(dir.path());
+        let mut engine = engine_with(dir.path(), HysteresisConfig::default());
+        let id = FanId::new("nct6795-p1");
+        // No relief: the configured curve is what runs, and there is
+        // nothing to offer the user.
+        assert!(engine.relieved_fan_curve(&id).is_none());
+        // A raised preset shows that preset's curve. (A saved-curve
+        // nudge needs no overlay: it is already the fan's own curve.)
+        engine.fans[0].runtime.throttle_relief =
+            ThrottleRelief::RaisedPreset(CurvePreset::Performance);
+        assert_eq!(
+            engine.relieved_fan_curve(&id),
+            Some(CurvePreset::Performance.curve())
+        );
+    }
+
+    #[test]
+    fn relief_speed_cools_above_the_curve() {
+        let quiet = CurvePreset::Quiet.curve();
+        let plain = quiet.speed_at(45.0);
+        assert_eq!(relief_speed(&quiet, 45.0, ThrottleRelief::Off), plain);
+        let raised = relief_speed(
+            &quiet,
+            45.0,
+            ThrottleRelief::RaisedPreset(CurvePreset::Balanced),
+        );
+        assert!(raised > plain, "balanced must out-cool quiet at 45 °C");
+    }
+
+    #[test]
+    fn a_sysfs_fan_never_gets_throttle_relief() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        fixture(dir.path());
+        let mut engine = engine_with(dir.path(), HysteresisConfig::default());
+        engine.tick().expect("tick");
+        engine.tick().expect("tick");
+        // The fixture has no NVIDIA source at all, so relief stays off
+        // even though its one fan is auto and reads its sensor fine.
+        assert_eq!(engine.fans[0].runtime.throttle_relief, ThrottleRelief::Off);
+        assert_eq!(engine.fans[0].runtime.relief_cooldown, 0);
+        // Its saved curve was never nudged.
+        if let FanMode::Auto { curve, .. } = &engine.fans[0].fan_config.mode {
+            assert_eq!(curve, &fixture_curve(), "the saved curve stayed put");
+        }
     }
 }
