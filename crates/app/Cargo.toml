@@ -48,12 +48,17 @@ priority = "optional"
 # removal so the fans are handed back to hardware control.
 maintainer-scripts = "../../packaging/deb-scripts"
 depends = [
-  # "libgtk-4-1t64 (>= 4.14)",
-  # "libpango-1.0-0t64 (>= 1.44)",
-  # "libgdk-pixbuf-2.0-0t64 (>= 2.40)",
-  # "libcairo2 (>= 1.16)",
-  # "libglib2.0-0t64 (>= 2.64)",
-  # "libc6 (>= 2.34)",
+  # Names checked against the Debian trixie and forky/sid archives
+  # (`apt-cache policy`): GTK4's runtime library is `libgtk-4-1` in both —
+  # the GTK3 package is the one with the `t64` suffix — while GLib's is
+  # `libglib2.0-0t64`. GTK4 pulls in the rest of the linked libs
+  # (pangocairo/ft2, cairo-gobject, epoxy, graphene) transitively.
+  "libgtk-4-1 (>= 4.14)",
+  "libpango-1.0-0 (>= 1.44)",
+  "libgdk-pixbuf-2.0-0 (>= 2.40)",
+  "libcairo2 (>= 1.16)",
+  "libglib2.0-0t64 (>= 2.64)",
+  "libc6 (>= 2.34)",
 ]
 assets = [
   # The target/release prefix is special: cargo-deb rewrites it to the real
