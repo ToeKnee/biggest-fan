@@ -32,6 +32,9 @@ serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.145"
 zbus = { version = "6.3.0", features = ["tokio-multithread"] }
 
+[dev-dependencies]
+tempfile = "3.27.0"
+
 # cargo-deb packaging: `cargo deb -p biggest-fan`, then
 # `sudo dpkg -i target/debian/biggest-fan_*.deb` and enable the service
 # (see README). Set the maintainer below to yourself before releasing.

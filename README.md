@@ -359,7 +359,10 @@ speed floor under _extra settings_ (some tachometers report exactly double:
 0.5 halves the reading; the floor keeps an AIO pump turning however quiet
 its curve is). The window opens at
 1600×900 maximised; fans you have not placed yet are laid out on a grid
-inside the case drawing, and saved positions outside the case are
+inside the case drawing, and while every fan still sits on that grid the
+canvas shows a "drag a shape to move it" hint near its bottom edge — it
+vanishes for good once any fan gets a saved position. Saved positions
+outside the case are
 clamped back in at startup — always keeping a small margin from the case
 walls, so no fan shape or its label touches the outline. Each fan row
 sits in its own subtle tile; the tiles flow one per line normally, or two

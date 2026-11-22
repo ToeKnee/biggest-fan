@@ -3,7 +3,9 @@
 //! headers, a card-like rectangle for a whole graphics cooler.
 //!
 //! Dragging a fan shape moves it on the canvas (kept in the engine and
-//! persisted by Save config).
+//! persisted by Save config). While no fan has a saved position the
+//! canvas itself shows a "drag a shape to move it" hint near its bottom
+//! edge.
 
 use biggest_fan_core as core;
 use gtk4::DrawingArea;
@@ -162,6 +164,25 @@ fn draw(engine: &core::Engine, cr: &cairo::Context, width: f64, height: f64) {
 
     for view in engine.case_fans() {
         draw_fan(cr, &view);
+    }
+
+    // Placement hint, drawn on the canvas while every fan still sits on
+    // its auto-placed grid spot: once the user drags one (or touches a
+    // placement control) a slot is saved and the hint never comes back.
+    if engine.all_fans_auto_placed() {
+        cr.select_font_face(
+            "sans-serif",
+            cairo::FontSlant::Normal,
+            cairo::FontWeight::Normal,
+        );
+        cr.set_font_size(13.0);
+        cr.set_source_rgba(0.85, 0.85, 0.88, 0.6);
+        let _ = draw_centered(
+            cr,
+            case_size.width / 2.0,
+            case_size.height - 16.0,
+            "drag a shape to move it",
+        );
     }
     let _ = cr.restore();
 }
@@ -439,5 +460,111 @@ mod tests {
         assert!((scale - 140.0 / 300.0).abs() < 1e-9);
         assert!((offset_x - 10.0).abs() < 1e-9);
         assert!((offset_y - 460.0f64.mul_add(-scale, 240.0) / 2.0).abs() < 1e-9);
+    }
+
+    /// hwmon fixture: one temperature chip and one controllable header
+    /// (the same shape as core's engine tests).
+    fn fixture(root: &std::path::Path) {
+        let cpu = root.join("hwmon0");
+        std::fs::create_dir_all(&cpu).expect("cpu dir");
+        std::fs::write(cpu.join("name"), "k10temp\n").expect("name");
+        std::fs::write(cpu.join("temp1_input"), "55000\n").expect("temp");
+        std::fs::write(cpu.join("temp1_label"), "Tctl\n").expect("label");
+
+        let superio = root.join("hwmon1");
+        std::fs::create_dir_all(&superio).expect("superio dir");
+        std::fs::write(superio.join("name"), "nct6795\n").expect("name");
+        std::fs::write(superio.join("pwm1"), "0\n").expect("pwm");
+        std::fs::write(superio.join("pwm1_enable"), "1\n").expect("enable");
+        std::fs::write(superio.join("fan1_input"), "1000\n").expect("fan");
+    }
+
+    /// One fixed-speed fan, no saved slot — exactly what a fresh
+    /// `init-config` leaves behind.
+    fn one_fan_engine(root: &std::path::Path) -> core::Engine {
+        let config = core::AppConfig {
+            fans: vec![core::config::FanConfig {
+                id: core::FanId::new("nct6795-p1"),
+                name: Some("Rear exhaust".to_string()),
+                rpm_factor: 1.0,
+                min_speed: 0.0,
+                hidden: false,
+                mode: core::FanMode::Fixed { speed: 0.5 },
+                slot: None,
+            }],
+            ..core::AppConfig::default()
+        };
+        core::Engine::startup(
+            config,
+            root.join("config.toml"),
+            &core::EngineOptions {
+                hwmon_root: root.to_path_buf(),
+                use_nvidia: false,
+                apply_writes: false,
+            },
+        )
+        .expect("engine")
+    }
+
+    /// Counts the brighter pixels in the strip where the hint text sits
+    /// on a 330×470 canvas (baseline y ≈ 444, centred near x ≈ 165).
+    /// The hint's dim grey composites to about 143 per channel, well
+    /// above the 33 background but below the fan labels' 217.
+    fn hint_strip_pixels(engine: &core::Engine) -> usize {
+        let (width, height) = (330_i32, 470_i32);
+        let surface =
+            cairo::ImageSurface::create(cairo::Format::ARgb32, width, height).expect("surface");
+        {
+            let cr = cairo::Context::new(&surface).expect("cairo context");
+            draw(engine, &cr, f64::from(width), f64::from(height));
+        }
+        let stride = usize::try_from(surface.stride()).expect("a positive stride");
+        let mut bright = 0_usize;
+        surface
+            .with_data(|data| {
+                bright = data
+                    .chunks(stride.max(1))
+                    .enumerate()
+                    .filter(|(y, _row)| (430..450).contains(y))
+                    // Per-row enumerate: x is the pixel's column on the
+                    // canvas, not an index into the flattened band.
+                    .flat_map(|(_y, row)| {
+                        row.as_chunks::<4>()
+                            .0
+                            .iter()
+                            .enumerate()
+                            .filter(|(x, _pixel)| (70..260).contains(x))
+                    })
+                    .filter(|(_x, pixel)| pixel[0] > 110 && pixel[1] > 110 && pixel[2] > 110)
+                    .count();
+            })
+            .expect("a freshly drawn image surface still has its pixels");
+        bright
+    }
+
+    #[test]
+    fn the_hint_draws_only_while_every_fan_is_auto_placed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        fixture(dir.path());
+        let mut engine = one_fan_engine(dir.path());
+
+        let hinted = hint_strip_pixels(&engine);
+        engine
+            .set_fan_slot(
+                &core::FanId::new("nct6795-p1"),
+                core::FanSlot {
+                    x: 150.0,
+                    y: 60.0,
+                    diameter: 60.0,
+                    rect: None,
+                    airflow: core::Airflow::Exhaust,
+                },
+            )
+            .expect("placed");
+        let plain = hint_strip_pixels(&engine);
+        assert!(
+            hinted > plain + 50,
+            "the hint text did not draw while fans were auto-placed: {hinted} with vs {plain} without"
+        );
     }
 }

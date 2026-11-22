@@ -1070,6 +1070,19 @@ impl Engine {
         self.config.case
     }
 
+    /// Whether every managed fan is still at its auto-placed fallback
+    /// spot (no explicit `slot` saved): nothing has been dragged or
+    /// placed yet, so the GUI can show its "drag to move" hint on the
+    /// case canvas.
+    #[must_use]
+    pub fn all_fans_auto_placed(&self) -> bool {
+        !self.fans.is_empty()
+            && self
+                .fans
+                .iter()
+                .all(|entry| entry.fan_config.slot.is_none())
+    }
+
     /// Where each managed fan should be drawn, using the configured slot
     /// or an auto-placed fallback grid at the top left.
     #[must_use]
@@ -2663,6 +2676,41 @@ mod tests {
             .set_fan_slot(&FanId::new("nope-p9"), slot)
             .expect_err("unknown fan");
         assert!(matches!(error, CoreError::UnknownFan(_)));
+    }
+
+    #[test]
+    fn all_fans_auto_placed_tracks_the_first_saved_slot() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        fixture(dir.path());
+        // No fans at all: there is nothing to drag, so no hint either.
+        let empty = engine_over(dir.path(), false, Vec::new()).expect("empty engine");
+        assert!(
+            !empty.all_fans_auto_placed(),
+            "an engine with no fans shows no hint"
+        );
+
+        let mut engine =
+            engine_over(dir.path(), false, vec![fixed_fan("nct6795-p1", false)]).expect("engine");
+        assert!(
+            engine.all_fans_auto_placed(),
+            "fresh fans sit on the auto grid, so the hint is up"
+        );
+        engine
+            .set_fan_slot(
+                &FanId::new("nct6795-p1"),
+                FanSlot {
+                    x: 90.0,
+                    y: 90.0,
+                    diameter: 60.0,
+                    rect: None,
+                    airflow: Airflow::Internal,
+                },
+            )
+            .expect("placed");
+        assert!(
+            !engine.all_fans_auto_placed(),
+            "one saved slot is enough to hide the hint"
+        );
     }
 
     #[test]
