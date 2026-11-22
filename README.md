@@ -235,11 +235,14 @@ the whole graphics card.
 
 Differences from sysfs headers:
 
-- NVML commands fans in percent and reports no tachometer: the status shows
-  the commanded percent and `-` for rpm. It does read the card's fan speed
-  back, so a cooler's real speed shows too — “no tach, header at 0 %” in a
-  GUI row, `hdr 0%` in the daemon's line — which is how a park becomes
-  visible.
+- NVML commands fans in percent, and reads them back as both percent and
+  real RPM (`nvmlDeviceGetFanSpeedRPM`, driver R525 or newer) — the same
+  figure `nvidia-settings` shows, which gets it from the X `NV-CONTROL`
+  extension rather than anything we would want to bind. So a GPU cooler
+  shows rpm like any other fan, and a park shows as 0 rpm.
+- Older drivers have no RPM call, and then the status falls back to the
+  card's percent read-back — “no tach, header at 0 %” in a GUI row, `hdr 0%`
+  in the daemon's line — which is still how a park becomes visible there.
 - Commanded and reported speeds are compared, and a disagreement raises a fan
   note once five seconds have passed since the last speed change (the card
   parks its fans a couple of seconds after the policy is handed back, and a
@@ -292,7 +295,8 @@ Differences from sysfs headers:
   _Off_ GPU fan is the same call. Only drivers without that
   call get a 0 percent write instead, and those drivers may keep the fans
   at their minimum speed regardless.
-- Detection cannot verify GPU fans (no tachometer), so `detect-fans`
+- Detection does not judge a GPU cooler by its RPM (a driver without NVML's
+  RPM call would look like a fan that never spun), so `detect-fans`
   never hides a cooler.
 - While the GPU's NVML throttle report flags a thermal slowdown, fans
   following that GPU's temperature carry a “GPU is thermal throttling”

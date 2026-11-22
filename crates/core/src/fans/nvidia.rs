@@ -1,9 +1,11 @@
 //! GPU coolers driven through NVML, for NVIDIA cards whose fans are not
 //! exposed as hwmon `pwmN` headers (most `GeForce` cards are like this).
 //!
-//! NVML controls each fan with a 0–100 percent speed setting and offers no
-//! tachometers, so one GPU's fans are driven together as a single logical
-//! cooler.
+//! NVML controls each fan with a 0–100 percent speed setting, so one GPU's
+//! fans are driven together as a single logical cooler. It also reports real
+//! RPM (`nvmlDeviceGetFanSpeedRPM`, drivers from R525 on), which is the same
+//! number `nvidia-settings` shows; drivers without that call report percent
+//! only, and the RPM reads simply come back as nothing.
 
 use crate::error::CoreError;
 use crate::fans::model::{FanDescriptor, FanId};
@@ -290,6 +292,10 @@ pub struct NvidiaFan {
     gpu_index: u32,
     /// How many fans NVML reports for this GPU (a 4070 SUPER has two).
     fan_count: u32,
+    /// Whether NVML's RPM call answers for this card. It needs a driver from
+    /// R525 on and is refused by some cards, so it is probed once here rather
+    /// than guessed from the model.
+    reports_rpm: bool,
     id: FanId,
     default_name: String,
     /// Who holds the fans: `Unknown` until the first write, because NVML
@@ -337,10 +343,14 @@ impl NvidiaFan {
                 continue;
             }
             let model = device.name().unwrap_or_else(|_| format!("GPU {gpu_index}"));
+            // Ask once whether the RPM call works here, so what discovery
+            // reports matches what this machine can actually read.
+            let reports_rpm = device.fan_speed_rpm(0).is_ok();
             coolers.push(Self {
                 nvml: Arc::clone(&nvml),
                 gpu_index,
                 fan_count,
+                reports_rpm,
                 id: FanId::new(format!("nvidia-gpu{gpu_index}-cooler")),
                 default_name: format!("{model} cooler"),
                 ownership: FanOwnership::Unknown,
@@ -366,14 +376,14 @@ impl NvidiaFan {
         &self.default_name
     }
 
-    /// Discovery descriptor. NVML gives no tachometer, hence
-    /// `rpm_supported: false`.
+    /// Discovery descriptor. `rpm_supported` is the probed answer for this
+    /// card, so an older driver (no RPM call) says `false`.
     #[must_use]
     pub fn descriptor(&self) -> FanDescriptor {
         FanDescriptor {
             id: self.id.clone(),
             default_name: self.default_name.clone(),
-            rpm_supported: false,
+            rpm_supported: self.reports_rpm,
         }
     }
 
@@ -608,10 +618,29 @@ impl NvidiaFan {
         Ok(())
     }
 
-    /// NVML reports fan speed as a percent, never RPM: always `None`.
+    /// Measured RPM, averaged over the fans that report it, or `None` when
+    /// none do. NVML's RPM call needs a driver from R525 on and answers
+    /// `NotSupported` for cards it will not report RPM for; both come out as
+    /// `None`, leaving [`NvidiaFan::read_percent`] as the only reading.
+    ///
+    /// This is the same figure `nvidia-settings` prints for a GPU fan — that
+    /// program reads the same hardware through the X `NV-CONTROL` extension,
+    /// which has no Rust bindings worth taking on for one number.
     #[must_use]
-    pub const fn read_rpm(&self) -> Option<f64> {
-        None
+    pub fn read_rpm(&self) -> Option<f64> {
+        if !self.reports_rpm {
+            return None;
+        }
+        let device = self.nvml.device_by_index(self.gpu_index).ok()?;
+        let mut total = 0_u32;
+        let mut readable = 0_u32;
+        for fan_index in 0..self.fan_count {
+            if let Ok(rpm) = device.fan_speed_rpm(fan_index) {
+                total = total.saturating_add(rpm);
+                readable += 1;
+            }
+        }
+        average_rpm(total, readable)
     }
 
     /// Controller-style name used for ordering fans, e.g. `nvidia-gpu0`.
@@ -647,6 +676,14 @@ impl std::fmt::Debug for NvidiaFan {
             .field("default_name", &self.default_name)
             .finish_non_exhaustive()
     }
+}
+
+/// The mean of `readable` fan readings that add up to `total`, or `None`
+/// when nothing was readable. Averaging (rather than the maximum) matches
+/// [`NvidiaFan::read_percent`], so a cooler with one dead tachometer still
+/// reports a believable speed. A parked cooler reads 0, not `None`.
+fn average_rpm(total: u32, readable: u32) -> Option<f64> {
+    (readable > 0).then(|| f64::from(total) / f64::from(readable))
 }
 
 /// Maps a speed fraction (0.0..=1.0) onto NVML's 0–100 percent scale.
@@ -996,5 +1033,17 @@ mod tests {
         // A non-finite fraction clamps to a usable bound, never NaN.
         assert_eq!(speed_percent(f64::NAN), 0);
         assert_eq!(speed_percent(f64::INFINITY), 100);
+    }
+
+    #[test]
+    fn rpm_averages_the_fans_that_reported() {
+        // A two-fan cooler spins both at 1200 rpm.
+        assert_eq!(average_rpm(2400, 2), Some(1200.0));
+        // One tachometer reporting on a two-fan card is still a reading.
+        assert_eq!(average_rpm(900, 1), Some(900.0));
+        // Parked fans report 0 rpm rather than nothing.
+        assert_eq!(average_rpm(0, 2), Some(0.0));
+        // A driver without the RPM call, or a card that refuses it.
+        assert_eq!(average_rpm(0, 0), None);
     }
 }

@@ -187,9 +187,9 @@ fn fan_status_line(fan: &core::FanStatus) -> String {
         core::FanMode::Fixed { .. } => "fixed",
         core::FanMode::Auto { .. } => "auto",
     };
-    // What the hardware reports: RPM where there is a tachometer,
-    // otherwise the header's own speed reading (a GPU cooler has no tach,
-    // so this shows it parking).
+    // What the hardware reports: RPM where there is a tachometer (a sysfs
+    // header, or a GPU cooler on a driver new enough for NVML's RPM call),
+    // otherwise the header's own speed reading.
     let rpm = match (fan.measured_rpm, fan.measured_percent) {
         (Some(rpm), _) => format!("rpm {rpm:.0}"),
         (None, Some(percent)) => format!("hdr {:.0}%", percent * 100.0),
@@ -247,7 +247,7 @@ mod tests {
                     None,
                     None,
                 ),
-                // A parked GPU cooler: no tach, header at 0 %.
+                // A cooler whose driver gives no RPM call: header at 0 %.
                 fan(
                     "nvidia-gpu0-cooler",
                     "GPU cooler",

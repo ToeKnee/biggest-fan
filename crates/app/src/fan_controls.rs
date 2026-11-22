@@ -445,9 +445,10 @@ impl FanControls {
             self.suppress.set(false);
         }
         let speed = format!("{:.0}%", status.commanded_speed * 100.0);
-        // What the hardware reports: RPM where there is a tachometer, and the
-        // speed the header reads back where there is none (a GPU cooler's
-        // parking becomes visible this way, since it has no tach).
+        // What the hardware reports: RPM where it has a tachometer (sysfs
+        // headers and, on a recent driver, a GPU cooler), and the speed the
+        // header reads back where it has none — which is how an older driver
+        // still shows a cooler parking.
         let rpm = match (status.measured_rpm, status.measured_percent) {
             (Some(rpm), _) => format!("{rpm:.0} RPM"),
             (None, Some(percent)) => format!("no tach, header at {:.0}%", percent * 100.0),

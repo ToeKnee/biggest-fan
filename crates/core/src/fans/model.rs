@@ -347,10 +347,11 @@ pub struct FanStatus {
     pub commanded_speed: f64,
     /// Speed fraction the hardware reports for this fan's leader header:
     /// NVML's fan percent for a GPU cooler, the `pwmN` duty for a sysfs
-    /// header. `None` when nothing can be read. This is how a parked GPU
-    /// cooler becomes visible, since it has no tachometer to report 0 rpm.
+    /// header. `None` when nothing can be read. A parked GPU cooler shows up
+    /// here as 0 %, and on a driver with NVML's RPM call as 0 rpm too.
     pub measured_percent: Option<f64>,
-    /// Measured speed in RPM, when the header has a tachometer.
+    /// Measured speed in RPM, when the hardware reports one: a sysfs
+    /// tachometer, or NVML's RPM call for a GPU cooler on a recent driver.
     pub measured_rpm: Option<f64>,
     /// Temperature of the governing sensor in Auto mode.
     pub governing_temp_c: Option<f64>,

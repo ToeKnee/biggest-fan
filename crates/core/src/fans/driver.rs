@@ -118,8 +118,9 @@ impl FanDriver {
         }
     }
 
-    /// Measured RPM when this header has a tachometer (NVML headers
-    /// never do — they report percent only).
+    /// Measured RPM where the hardware reports it: a sysfs tachometer, or
+    /// NVML's RPM call for a GPU cooler (drivers from R525 on). `None` when
+    /// neither exists — the speed percent is the fallback reading.
     #[must_use]
     pub fn read_rpm(&self) -> Option<f64> {
         match self {
@@ -132,9 +133,9 @@ impl FanDriver {
     /// when it reports one at all: NVML's fan percent for a GPU cooler, the
     /// `pwmN` duty for a sysfs header. `None` when nothing can be read.
     ///
-    /// A GPU cooler has no tachometer, so this is how a parked cooler becomes
-    /// visible: once the card has actually stopped its fans they read back at
-    /// 0 %.
+    /// A GPU cooler's speed percent is how a park becomes visible on drivers
+    /// without NVML's RPM call: once the card has actually stopped its fans
+    /// they read back at 0 %.
     #[must_use]
     pub fn read_percent(&self) -> Option<f64> {
         match self {
@@ -157,6 +158,11 @@ impl FanDriver {
     }
 
     /// Whether a tachometer exists to verify this header.
+    ///
+    /// A GPU cooler deliberately answers `false` even though NVML can report
+    /// RPM: fan detection hides a header whose tachometer stays quiet, and a
+    /// driver without the RPM call (pre-R525) would then hide a perfectly
+    /// healthy card. A cooler's percent read-back is what verifies it instead.
     #[must_use]
     pub const fn tach_supported(&self) -> bool {
         match self {
