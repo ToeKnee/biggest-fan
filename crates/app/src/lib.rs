@@ -19,4 +19,3 @@ pub mod fan_controls;
 pub mod power;
 pub mod stress;
 pub mod trend_graph;
-pub mod tune;

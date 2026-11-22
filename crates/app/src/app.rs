@@ -37,14 +37,11 @@ struct GuiState {
     client: dbus::Client,
     /// Answers from that daemon, drained on every tick.
     service_events: Rc<RefCell<mpsc::Receiver<dbus::Event>>>,
-    /// Latest live temperature per sensor, refreshed every tick; the
-    /// Stress lab's auto-tune watches these.
-    last_temps: Rc<RefCell<BTreeMap<core::SensorId, f64>>>,
     /// The Stress lab section, whose progress and results share this
     /// status bar with the control loop (see `tick_once`).
     stress: Rc<stress::StressPanel>,
-    /// Tick counter behind the periodic service-config poll (the nudger's
-    /// learned trims only reach this mirror through the service's config).
+    /// Tick counter behind the periodic service-config poll (the service
+    /// owns the live config, so this mirror follows it).
     config_poll: Cell<u32>,
     /// The service config text last applied to this mirror; an identical
     /// poll answer is skipped, so the mirror is not rebuilt every poll.
@@ -259,8 +256,7 @@ fn build_window(
     let right = GtkBox::new(Orientation::Vertical, 12);
     let fan_panel = append_fans_panel(&right, engine_rc, &case_area, client);
     let sensor_panel = append_sensors_panel(&right, engine_rc, &status_label);
-    let last_temps = Rc::new(RefCell::new(BTreeMap::new()));
-    let stress = wire_stress_panel(&window, &right, engine_rc, client, Rc::clone(&last_temps));
+    let stress = wire_stress_panel(&window, &right);
     let right_scroll = ScrolledWindow::builder()
         .vexpand(true)
         .hscrollbar_policy(PolicyType::Never)
@@ -311,7 +307,6 @@ fn build_window(
         status_label,
         client: client.clone(),
         service_events,
-        last_temps,
         stress,
         config_poll: Cell::new(0),
         service_config: RefCell::new(String::new()),
@@ -462,9 +457,10 @@ fn drain_service_events(state: &GuiState) {
                 }
             }
             dbus::Event::Config(text) => {
-                // The service's config is the live one (learned trims and
-                // all), so the mirror adopts it to draw what the fans are
-                // really doing. An unchanged answer changes nothing here.
+                // The service's config is the live one (it parks fans whose
+                // driver refuses writes, and its file can be hand-edited),
+                // so the mirror adopts it to draw what the fans are really
+                // doing. An unchanged answer changes nothing here.
                 let mut applied = state.service_config.borrow_mut();
                 if text == *applied {
                     continue;
@@ -521,14 +517,8 @@ struct FanPanel {
 /// Appends the Stress lab panel to `right` and ties its stress threads
 /// to the window: closing the window raises their stop flags, so no
 /// load outlives the window that started it.
-fn wire_stress_panel(
-    window: &ApplicationWindow,
-    right: &GtkBox,
-    engine_rc: &Rc<RefCell<core::Engine>>,
-    client: &dbus::Client,
-    last_temps: Rc<RefCell<BTreeMap<core::SensorId, f64>>>,
-) -> Rc<stress::StressPanel> {
-    let stress_panel = stress::append_stress_panel(right, engine_rc, client, last_temps);
+fn wire_stress_panel(window: &ApplicationWindow, right: &GtkBox) -> Rc<stress::StressPanel> {
+    let stress_panel = stress::append_stress_panel(right);
     let close_panel = Rc::clone(&stress_panel);
     window.connect_close_request(move |_window| {
         close_panel.stop_all();
@@ -704,9 +694,10 @@ fn schedule_tick(state: &Rc<GuiState>, source: &Rc<RefCell<Option<SourceId>>>) {
 fn tick_once(state: &GuiState) {
     drain_service_events(state);
 
-    // The service learns fan speeds in the background, so ask for its
-    // config now and then; a queued change (like folding a trim) sits in
-    // the same FIFO queue, so an answer can be one poll behind.
+    // The service owns the live config — it parks fans whose driver
+    // refuses writes, and its file can be hand-edited — so ask it for the
+    // text now and then. A queued change sits in the same FIFO queue, so
+    // an answer can be one poll behind.
     let poll_tick = state.config_poll.get();
     state.config_poll.set(poll_tick.wrapping_add(1));
     if poll_tick.is_multiple_of(SERVICE_CONFIG_POLL_TICKS) {
@@ -723,22 +714,11 @@ fn tick_once(state: &GuiState) {
         }
     };
 
-    // Publish the live temperatures for the Stress lab's auto-tune.
-    {
-        let mut last_temps = state.last_temps.borrow_mut();
-        for sensor in &report.sensors {
-            if let Some(temp) = sensor.temp_c {
-                last_temps.insert(sensor.id.clone(), temp);
-            }
-        }
-    }
-
     let mut notes = Vec::new();
-    let engine = state.engine.borrow();
     for controls in state.fan_controls.borrow().iter() {
         match report.fans.iter().find(|fan| fan.id == *controls.fan_id()) {
             Some(status) => {
-                controls.update(status, &engine);
+                controls.update(status);
                 if let Some(note) = &status.note {
                     notes.push(note.clone());
                 }

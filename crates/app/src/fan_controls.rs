@@ -8,8 +8,8 @@ use crate::trend_graph::TrendGraph;
 use biggest_fan_core as core;
 use gtk4::prelude::*;
 use gtk4::{
-    Box as GtkBox, Button, CheckButton, ComboBoxText, DrawingArea, Entry, Expander, Label,
-    Orientation, Scale, SpinButton,
+    Box as GtkBox, CheckButton, ComboBoxText, DrawingArea, Entry, Expander, Label, Orientation,
+    Scale, SpinButton,
 };
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -95,12 +95,6 @@ pub struct FanControls {
     floor_spin: SpinButton,
     temp_label: Label,
     status_label: Label,
-    /// What the nudger has learned for this fan, and the button that
-    /// folds that learning into the curve; hidden while there is nothing
-    /// learned.
-    nudge_row: GtkBox,
-    nudge_label: Label,
-    fold_button: Button,
     /// Case canvas to repaint when placement changes.
     case_area: DrawingArea,
     /// Per-header checkboxes for driving headers together as one fan.
@@ -209,15 +203,10 @@ impl FanControls {
         let status_label = Label::builder().xalign(0.0).build();
         status_label.set_markup("<span size=\"small\">…</span>");
 
-        // The nudger's learning for this fan: how far below its curve the
-        // fan now runs, and the offer to make that part of the curve.
-        let (nudge_row, nudge_label, fold_button) = Self::nudge_controls();
-
         container.append(&header);
         container.append(&speed_scale);
         container.append(&auto_row);
         container.append(&graphs_row);
-        container.append(&nudge_row);
         container.append(&placement_row);
         container.append(&status_label);
         container.append(&extra_expander);
@@ -241,9 +230,6 @@ impl FanControls {
             floor_spin,
             temp_label,
             status_label,
-            nudge_row,
-            nudge_label,
-            fold_button,
             case_area: case_area.clone(),
             member_checks: Rc::new(member_checks),
             suppress: Rc::new(Cell::new(false)),
@@ -366,24 +352,6 @@ impl FanControls {
         spin
     }
 
-    /// The learned-trim caption and the button that folds the learning
-    /// into the curve; the row starts hidden until there is a trim.
-    fn nudge_controls() -> (GtkBox, Label, Button) {
-        let nudge_label = Label::builder().xalign(0.0).hexpand(true).build();
-        let fold_button = Button::builder()
-            .label("Apply learned trim to curve")
-            .tooltip_text(
-                "write the learned speed reduction into this fan's curve and forget it; \
-                 the fan keeps running at exactly the same speed",
-            )
-            .build();
-        let nudge_row = GtkBox::new(Orientation::Horizontal, 8);
-        nudge_row.append(&nudge_label);
-        nudge_row.append(&fold_button);
-        nudge_row.set_visible(false);
-        (nudge_row, nudge_label, fold_button)
-    }
-
     /// Builds the speed-floor spinner, in whole percents. A fan with a floor
     /// — an AIO pump, or a case fan that must keep the airflow going — can
     /// never be taken below it by a curve or a ramp, though switching it to
@@ -461,8 +429,7 @@ impl FanControls {
     }
 
     /// Syncs the widgets once the engine reports a fan's live state.
-    /// `engine` is the GUI's mirror, consulted for the nudger's learning.
-    pub fn update(&self, status: &core::FanStatus, engine: &core::Engine) {
+    pub fn update(&self, status: &core::FanStatus) {
         self.trend_graph
             .record(status, self.clock.elapsed().as_secs_f64());
         if let core::FanMode::Fixed { speed } = &status.mode {
@@ -508,38 +475,13 @@ impl FanControls {
             self.curve_graph
                 .set_operating_point(status.governing_temp_c, status.commanded_speed);
             // Keep the preset dropdown honest even when the curve changed
-            // without the user touching it (a folded nudge trim makes a
-            // Custom curve).
+            // without the user touching it (a hand-edited config, for
+            // example, shows as Custom).
             self.suppress.set(true);
             self.preset_combo
                 .set_active_id(Some(preset_combo_id(curve)));
             self.suppress.set(false);
-            self.show_nudge_trim(engine);
-        } else {
-            self.nudge_row.set_visible(false);
         }
-    }
-
-    /// Shows how far below its curve the nudger has this fan running, and
-    /// offers to fold that learning into the curve.
-    fn show_nudge_trim(&self, engine: &core::Engine) {
-        let trim = engine.fan_nudge_trim(&self.fan_id);
-        if trim <= 0.0 {
-            self.nudge_row.set_visible(false);
-            return;
-        }
-        #[expect(
-            clippy::cast_possible_truncation,
-            clippy::cast_sign_loss,
-            reason = "the engine's trim is a fraction of speed between 0 and 1, so this is a small positive percent"
-        )]
-        let percent = (trim * 100.0).round() as u32;
-        self.nudge_label.set_markup(&format!(
-            "<span size=\"small\">{percent}% slower than its curve</span>"
-        ));
-        self.fold_button
-            .set_label(&format!("Apply learned −{percent}% to curve"));
-        self.nudge_row.set_visible(true);
     }
 
     /// Sets the initial dropdown and placement state from the engine's
@@ -622,7 +564,6 @@ impl FanControls {
         self.wire_name_signals(engine_rc);
         self.wire_mode_signals(engine_rc);
         self.wire_curve_preset_signal(engine_rc);
-        self.wire_nudge_signal(engine_rc);
         self.wire_placement_signals(engine_rc);
         self.wire_group_signals(engine_rc);
         self.wire_rpm_signal(engine_rc);
@@ -770,39 +711,6 @@ impl FanControls {
             // The draw closure re-reads the curve from the engine, so
             // one redraw shows the new preset at once.
             curve_area.queue_draw();
-        });
-    }
-
-    /// "Apply learned −X% to curve" moves the nudger's learning into the
-    /// mirror's curve straight away (the graph and preset follow at once),
-    /// then asks the service to do the same and save it; the periodic
-    /// config poll brings the service's answer back to this mirror.
-    fn wire_nudge_signal(&self, engine_rc: &Rc<RefCell<core::Engine>>) {
-        let rc = Rc::clone(engine_rc);
-        let fan_id = self.fan_id.clone();
-        let client = self.client.clone();
-        let status_label = self.status_label.clone();
-        let curve_area = self.curve_graph.widget().clone();
-        let nudge_row = self.nudge_row.clone();
-        self.fold_button.connect_clicked(move |_| {
-            // A tick may own the engine borrow; skipping this click is
-            // fine — the row is still there for the next one.
-            let Ok(mut engine) = rc.try_borrow_mut() else {
-                return;
-            };
-            if let Err(error) = engine.fold_fan_nudge_trim(&fan_id) {
-                status_label.set_markup(&format!(
-                    "<span size=\"small\" foreground=\"#c0392b\">⚠ {}</span>",
-                    escape_markup(&error.to_string())
-                ));
-                return;
-            }
-            drop(engine);
-            nudge_row.set_visible(false);
-            curve_area.queue_draw();
-            client.send(dbus::FanRequest::FoldNudgeTrim {
-                fan: fan_id.to_string(),
-            });
         });
     }
 

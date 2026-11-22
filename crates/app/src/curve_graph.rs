@@ -71,9 +71,7 @@ const fn plot_box(width: f64, height: f64) -> Plot {
 }
 
 /// The curve sampled one point per pixel column, as plot coordinates.
-/// `scale` multiplies every speed, so the nudger's learned trim can be
-/// drawn as its own line.
-fn curve_points(curve: &core::FanCurve, plot: Plot, scale: f64) -> Vec<(f64, f64)> {
+fn curve_points(curve: &core::FanCurve, plot: Plot) -> Vec<(f64, f64)> {
     #[expect(
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss,
@@ -87,34 +85,18 @@ fn curve_points(curve: &core::FanCurve, plot: Plot, scale: f64) -> Vec<(f64, f64
                 reason = "column counts are far below f64's exact-integer range"
             )]
             let px = (column as f64 / columns as f64).mul_add(plot.width, plot.x);
-            (px, y_for(plot, curve.speed_at(temp_at(plot, px)) * scale))
+            (px, y_for(plot, curve.speed_at(temp_at(plot, px))))
         })
         .collect()
 }
 
-/// Traces a sampled polyline (callers set their own colour and width
-/// first).
-fn trace(cr: &cairo::Context, points: &[(f64, f64)]) {
-    let Some(&(first_x, first_y)) = points.first() else {
-        return;
-    };
-    cr.move_to(first_x, first_y);
-    for &(x, y) in points.iter().skip(1) {
-        cr.line_to(x, y);
-    }
-    let _ = cr.stroke();
-}
-
 /// Draws the graph: frame, grid, the curve with a filled area under it,
-/// the nudger's effective curve (`curve × (1 - trim)`) as a dimmer dashed
-/// line when a trim applies, and the live operating point as a dashed
-/// temperature line plus a dot.
+/// and the live operating point as a dashed temperature line plus a dot.
 fn draw(
     cr: &cairo::Context,
     width: f64,
     height: f64,
     curve: Option<&core::FanCurve>,
-    trim: f64,
     operating: Option<OperatingPoint>,
 ) {
     cr.set_source_rgb(0.13, 0.13, 0.15);
@@ -162,7 +144,7 @@ fn draw(
         return;
     };
 
-    let points = curve_points(curve, plot, 1.0);
+    let points = curve_points(curve, plot);
     if let (Some(&(first_x, first_y)), Some(&(last_x, _))) = (points.first(), points.last()) {
         cr.move_to(first_x, first_y);
         for &(x, y) in points.iter().skip(1) {
@@ -178,17 +160,6 @@ fn draw(
         cr.close_path();
         cr.set_source_rgba(0.20, 0.50, 0.90, 0.12);
         let _ = cr.fill();
-    }
-
-    // What the fan is actually asked for with the nudger's trim: the same
-    // curve shape, dimmer and dashed, sitting below the user's line.
-    if trim > 0.0 {
-        let trimmed = curve_points(curve, plot, 1.0 - trim);
-        cr.set_source_rgba(0.20, 0.50, 0.90, 0.55);
-        cr.set_line_width(1.2);
-        cr.set_dash(&[4.0, 3.0], 0.0);
-        trace(cr, &trimmed);
-        cr.set_dash(&[], 0.0);
     }
 
     if let Some((temp_c, commanded)) = operating {
@@ -225,7 +196,7 @@ impl CurveGraph {
         area.set_hexpand(true);
         area.set_tooltip_text(Some(
             "this fan's curve: speed against sensor temperature; the dot is where the fan \
-             is now; a dashed line below it is what the fan runs after a learned trim",
+             is now",
         ));
         let operating = Rc::new(RefCell::new(None));
 
@@ -235,20 +206,17 @@ impl CurveGraph {
         area.set_draw_func(move |_area, cr, width, height| {
             // Take a copy of what is needed and release the engine
             // before drawing (same care as the case canvas).
-            let (curve, trim) = draw_engine.try_borrow().ok().map_or((None, 0.0), |engine| {
-                let trim = engine.fan_nudge_trim(&draw_fan_id);
-                let curve = match engine.fan_mode(&draw_fan_id) {
+            let curve = draw_engine.try_borrow().ok().and_then(|engine| {
+                match engine.fan_mode(&draw_fan_id) {
                     Some(core::FanMode::Auto { curve, .. }) => Some(curve),
                     _ => None,
-                };
-                (curve, trim)
+                }
             });
             draw(
                 cr,
                 f64::from(width),
                 f64::from(height),
                 curve.as_ref(),
-                trim,
                 *draw_operating.borrow(),
             );
         });
@@ -320,7 +288,7 @@ mod tests {
     #[test]
     fn curve_points_span_the_plot_and_follow_the_curve() {
         let p = plot();
-        let points = curve_points(&ramp_curve(), p, 1.0);
+        let points = curve_points(&ramp_curve(), p);
         #[expect(
             clippy::cast_possible_truncation,
             clippy::cast_sign_loss,
@@ -343,16 +311,6 @@ mod tests {
             .expect("the 60 °C column");
         assert!((middle.1 - y_for(p, 0.6)).abs() < 0.01);
         assert!((points.last().expect("last").1 - y_for(p, 1.0)).abs() < 1e-6);
-    }
-
-    #[test]
-    fn a_scale_pulls_the_sampled_curve_down() {
-        let p = plot();
-        let points = curve_points(&ramp_curve(), p, 0.75);
-        // Every speed is 25% below the plain curve: 0.2 → 0.15 at the cold
-        // end, 1.0 → 0.75 at the hot end.
-        assert!((points[0].1 - y_for(p, 0.15)).abs() < 1e-6);
-        assert!((points.last().expect("last").1 - y_for(p, 0.75)).abs() < 1e-6);
     }
 
     #[test]

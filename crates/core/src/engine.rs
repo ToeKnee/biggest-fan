@@ -5,10 +5,9 @@ use crate::case::{Airflow, CaseConfig, FanSlot};
 use crate::config::model::{AppConfig, FanConfig, HysteresisConfig};
 use crate::error::CoreError;
 use crate::fans::driver::FanDriver;
-use crate::fans::model::{CurvePoint, FanCurve, FanDescriptor, FanId, FanMode, FanStatus};
+use crate::fans::model::{FanCurve, FanDescriptor, FanId, FanMode, FanStatus};
 use crate::fans::nvidia::NvidiaFan;
 use crate::fans::sysfs::SysfsFan;
-use crate::nudge::{Nudge, NudgeChange, NudgeEffects, NudgeFan, NudgeSensor};
 use crate::sensors::model::{SensorDescriptor, SensorId, SensorSource, SensorStatus};
 use crate::sensors::{HwmonSource, NvidiaSource, SensorCategory, sensor_category};
 use std::collections::BTreeMap;
@@ -276,8 +275,6 @@ pub struct Engine {
     /// Configs of headers found disconnected; skipped until re-enabled.
     hidden_fans: Vec<FanConfig>,
     last_report: TickReport,
-    /// Background learner of slower fan speeds (see [`crate::nudge`]).
-    nudge: Nudge,
 }
 
 impl std::fmt::Debug for Engine {
@@ -295,7 +292,6 @@ impl std::fmt::Debug for Engine {
             .field("all_headers", &self.all_headers)
             .field("hidden_fans", &self.hidden_fans)
             .field("last_report", &self.last_report)
-            .field("nudge", &self.nudge)
             .finish()
     }
 }
@@ -373,7 +369,6 @@ impl Engine {
             all_headers,
             hidden_fans,
             last_report: TickReport::default(),
-            nudge: Nudge::default(),
         })
     }
 
@@ -482,34 +477,6 @@ impl Engine {
 
         let hysteresis = self.config.hysteresis;
         let fail_safe = self.config.fail_safe_speed.clamp(0.0, 1.0);
-        // The background nudger decides trims before any speed is computed,
-        // so a trial's slower speed is applied on the tick it starts. A
-        // dry-run engine (the GUI's read-only mirror) must not experiment:
-        // it would learn trims it has no business applying.
-        let effects = if self.apply_writes {
-            let nudged = self.nudge_fans();
-            let watched = self.nudge_sensors();
-            let gpu_throttling = self
-                .nvidia
-                .as_ref()
-                .is_some_and(NvidiaSource::any_throttled);
-            let poll_ms = self.poll_interval_ms();
-            self.nudge.step(
-                &self.config.nudge,
-                poll_ms,
-                gpu_throttling,
-                &nudged,
-                &watched,
-            )
-        } else {
-            NudgeEffects::default()
-        };
-        for change in effects.changes {
-            self.apply_nudge_change(&change);
-        }
-        if effects.save_needed {
-            self.save_learned_trims();
-        }
         let mut fans = Vec::new();
         for index in 0..self.fans.len() {
             let status = self.control_fan(index, hysteresis, fail_safe)?;
@@ -546,9 +513,6 @@ impl Engine {
     ) -> Result<FanStatus, CoreError> {
         // Work on a copy so `entry` stays free for the writes below.
         let mode = self.fans[index].fan_config.mode.clone();
-        // What the nudger has learned (or is trialling) for this fan; read
-        // before `entry` is borrowed mutably.
-        let trim = self.applied_trim(&self.fans[index].fan_config.id);
         // NVML throttle state must be read before `entry`'s mutable
         // borrow of the fans list below is taken.
         let throttle_note = self.gpu_throttle_note(&mode);
@@ -583,10 +547,7 @@ impl Engine {
                     }
                     Some(temp_c) => {
                         governing_temp_c = Some(temp_c);
-                        // A learned trim scales the curve rather than
-                        // replacing it, so a hotter day still walks the fan
-                        // back up the same shape.
-                        let desired = curve.speed_at(temp_c) * (1.0 - trim);
+                        let desired = curve.speed_at(temp_c);
                         if desired > base {
                             target = desired;
                             entry.runtime.hold_temp_c = Some(temp_c);
@@ -717,10 +678,6 @@ impl Engine {
         let index = self
             .find_group(fan_id)
             .ok_or_else(|| CoreError::UnknownFan(fan_id.to_string()))?;
-        // A fan the user just took over leaves the nudger's experiment: any
-        // trial on it is dropped. The trial's unproven trim never reached
-        // `learned`, so there is nothing else to undo.
-        self.nudge.cancel_fan(&self.config.nudge, fan_id);
         let entry = &mut self.fans[index];
         // The floor is applied to both the write below and the ramp baseline,
         // so a pump never sees a dip even for a tick.
@@ -1012,169 +969,6 @@ impl Engine {
         Ok(())
     }
 
-    /// Every automatic fan as the nudger sees it this tick. Fixed and off
-    /// fans are excluded (a pump must keep the speed it was given), and an
-    /// NVIDIA cooler is reported locked because the card drives it.
-    fn nudge_fans(&self) -> Vec<NudgeFan> {
-        self.fans
-            .iter()
-            .filter_map(|entry| {
-                let FanMode::Auto { sensor, curve } = &entry.fan_config.mode else {
-                    return None;
-                };
-                let temp_c = self.latest.get(sensor).copied()?;
-                Some(NudgeFan {
-                    id: entry.fan_config.id.clone(),
-                    sensor: sensor.clone(),
-                    name: entry.display_name.clone(),
-                    temp_c,
-                    curve_speed: curve.speed_at(temp_c),
-                    floor: entry.fan_config.min_speed.clamp(0.0, 1.0),
-                    trim: self.learned_trim(&entry.fan_config.id),
-                    locked: is_gpu_cooler(&entry.headers[0]),
-                })
-            })
-            .collect()
-    }
-
-    /// Every readable temperature as the nudger sees it. CPU, GPU,
-    /// motherboard and drive sensors are watched, so a slowdown that costs
-    /// one of them is rejected even when the trialled fan's own sensor says
-    /// nothing; case and misc sensors may drift freely.
-    fn nudge_sensors(&self) -> Vec<NudgeSensor> {
-        self.sensors
-            .iter()
-            .filter_map(|sensor| {
-                let temp_c = self.latest.get(&sensor.id).copied()?;
-                Some(NudgeSensor {
-                    id: sensor.id.clone(),
-                    name: self.sensor_names[&sensor.id].clone(),
-                    temp_c,
-                    watched: matches!(
-                        category_of(sensor),
-                        SensorCategory::Cpu | SensorCategory::Gpu | SensorCategory::Motherboard
-                    ),
-                })
-            })
-            .collect()
-    }
-
-    /// Trim the nudger has accepted for a fan — what the config keeps.
-    fn learned_trim(&self, fan_id: &FanId) -> f64 {
-        self.config
-            .nudge
-            .learned
-            .get(fan_id.as_str())
-            .copied()
-            .unwrap_or(0.0)
-            .clamp(0.0, 1.0)
-    }
-
-    /// Trim applied to a fan this tick: the trial's if it is on trial,
-    /// otherwise the learned value. Turning nudging off is a kill switch —
-    /// learned trims go dormant (delete them from the config to forget
-    /// them for good) and the fans follow their plain curves again.
-    fn applied_trim(&self, fan_id: &FanId) -> f64 {
-        if !self.config.nudge.enabled {
-            return 0.0;
-        }
-        self.nudge
-            .trial_trim(fan_id)
-            .unwrap_or_else(|| self.learned_trim(fan_id))
-            .clamp(0.0, 1.0)
-    }
-
-    /// What fraction below its curve a fan currently runs, for the GUI to
-    /// draw: the trial's trim while one is in progress, otherwise the
-    /// learned value. 0.0 when nudging is off or nothing applies.
-    #[must_use]
-    pub fn fan_nudge_trim(&self, fan_id: &FanId) -> f64 {
-        self.applied_trim(fan_id)
-    }
-
-    /// Writes a fan's learned trim into its curve and forgets the trim, so
-    /// the learning becomes part of the curve the user sees and edits (the
-    /// GUI shows the result as a Custom curve). The fan's speed does not
-    /// change: a curve scaled by `1 - trim` asks for exactly what the trim
-    /// was asking for. Folding works even with nudging switched off — it is
-    /// how learned trims are kept. A trial in progress is cancelled rather
-    /// than folded; an unproven trim belongs to neither side.
-    ///
-    /// # Errors
-    ///
-    /// [`CoreError::UnknownFan`] for an invalid id, [`CoreError::InvalidCurve`]
-    /// if the scaled curve cannot be built (it should not happen: scaling
-    /// keeps points sorted and their speeds inside 0.0..=1.0).
-    pub fn fold_fan_nudge_trim(&mut self, fan_id: &FanId) -> Result<(), CoreError> {
-        let index = self
-            .find_group(fan_id)
-            .ok_or_else(|| CoreError::UnknownFan(fan_id.to_string()))?;
-        let trim = self.learned_trim(fan_id);
-        self.nudge.cancel_fan(&self.config.nudge, fan_id);
-        if trim <= 0.0 {
-            return Ok(());
-        }
-        let mode = self.fans[index].fan_config.mode.clone();
-        let FanMode::Auto { sensor, curve } = mode else {
-            return Ok(());
-        };
-        let points = curve
-            .points()
-            .iter()
-            .map(|point| CurvePoint {
-                temp_c: point.temp_c,
-                speed: (point.speed * (1.0 - trim)).clamp(0.0, 1.0),
-            })
-            .collect();
-        self.fans[index].fan_config.mode = FanMode::Auto {
-            sensor,
-            curve: FanCurve::new(points)?,
-        };
-        self.config.nudge.learned.remove(fan_id.as_str());
-        Ok(())
-    }
-
-    /// Applies one decision of the nudger. A trial only releases the fan's
-    /// temperature hold (its unproven trim lives in the nudger, not in the
-    /// config); a kept or reverted trim is what lands in `learned`.
-    fn apply_nudge_change(&mut self, change: &NudgeChange) {
-        let Some(index) = self.find_group(&change.id) else {
-            return;
-        };
-        if change.lift_hold {
-            // Without releasing the hold band the fan would stay at the
-            // speed the trial is trying to leave, and the trial would
-            // measure nothing.
-            self.fans[index].runtime.hold_temp_c = None;
-        } else if change.trim > 0.0 {
-            self.config
-                .nudge
-                .learned
-                .insert(change.id.as_str().to_string(), change.trim);
-        } else {
-            self.config.nudge.learned.remove(change.id.as_str());
-        }
-    }
-
-    /// Writes learned trims to the config file, so what the machine has
-    /// learned survives a restart. A failure is only logged: the trims
-    /// still apply for this run.
-    fn save_learned_trims(&mut self) {
-        if !self.apply_writes {
-            return;
-        }
-        if let Err(error) = self.save_config() {
-            self.nudge
-                .push_note(format!("learned fan speeds could not be saved: {error}"));
-        }
-    }
-
-    /// Log lines the nudger has produced since the last call, for the
-    /// daemon to print.
-    pub fn drain_nudge_notes(&mut self) -> Vec<String> {
-        self.nudge.drain_notes()
-    }
-
     /// Saves the live config (including mode, group and slot changes made
     /// through the engine) back to its file, keeping hidden headers
     /// present but disabled.
@@ -1249,9 +1043,6 @@ impl Engine {
         self.config = config;
         self.fans = fans;
         self.hidden_fans = hidden_fans;
-        // A fresh config may have hand-edited (or removed) learned trims,
-        // and any trial was against the old one: start the learner again.
-        self.nudge = Nudge::default();
         Ok(())
     }
 
@@ -1272,9 +1063,7 @@ impl Engine {
     ///   process) and forget who holds their fans, see [`FanDriver::reset_state`];
     /// * every group's ramp restarts from the duty the hardware holds now, so
     ///   a fan the firmware left at full speed eases down instead of the
-    ///   engine assuming its pre-sleep position;
-    /// * the nudger starts again: its trial and sensor history belong to the
-    ///   pre-sleep machine, while learned trims live in the config.
+    ///   engine assuming its pre-sleep position.
     ///
     /// A configured header that has not re-appeared keeps its old handle, so
     /// its writes fail loudly rather than the fan quietly leaving the config.
@@ -1365,7 +1154,6 @@ impl Engine {
             .map(|header| header.id().to_string())
             .collect();
 
-        self.nudge = Nudge::default();
         Ok(report)
     }
 
@@ -1867,20 +1655,8 @@ mod tests {
         std::fs::write(superio.join("fan1_input"), "1000\n").expect("fan");
     }
 
+    /// The one-fan fixture engine, with the ramp settings pinned.
     fn engine_with(temp_dir: &Path, hysteresis: crate::config::model::HysteresisConfig) -> Engine {
-        engine_nudging(
-            temp_dir,
-            hysteresis,
-            crate::config::model::NudgeConfig::default(),
-        )
-    }
-
-    /// The same one-fan fixture engine, with the nudger configured.
-    fn engine_nudging(
-        temp_dir: &Path,
-        hysteresis: crate::config::model::HysteresisConfig,
-        nudge: crate::config::model::NudgeConfig,
-    ) -> Engine {
         let config = AppConfig {
             fans: vec![FanConfig {
                 id: FanId::new("nct6795-p1"),
@@ -1906,7 +1682,6 @@ mod tests {
                 slot: None,
             }],
             hysteresis,
-            nudge,
             ..AppConfig::default()
         };
         let options = EngineOptions {
@@ -3497,324 +3272,5 @@ mod tests {
         assert_eq!(gpu_index_in_sensor_id("nvidia-gpu-t1"), None);
         // The cooler id shares the ordinal, but it is not a sensor id.
         assert_eq!(gpu_index_in_sensor_id("nvidia-gpu0-cooler"), Some(0));
-    }
-
-    /// Nudger settings for these tests: second-scale timings and one big
-    /// step, so a few ticks are enough to see a whole trial.
-    fn nudging(step: f64, learned: BTreeMap<String, f64>) -> crate::config::model::NudgeConfig {
-        crate::config::model::NudgeConfig {
-            enabled: true,
-            step,
-            max_trim: 0.5,
-            hold_secs: 3,
-            rise_limit_c: 1.5,
-            drop_limit_c: 2.0,
-            min_temp_c: 50.0,
-            steady_band_c: 1.0,
-            cooldown_secs: 0,
-            learned,
-        }
-    }
-
-    /// Hysteresis that never rate-limits, so speeds land where the curve
-    /// (times the trim) puts them.
-    fn free_ramp() -> crate::config::model::HysteresisConfig {
-        crate::config::model::HysteresisConfig {
-            temp_band_c: 2.0,
-            max_step_per_tick: 1.0,
-            max_step_up_per_tick: 1.0,
-        }
-    }
-
-    #[test]
-    fn a_learned_trim_runs_the_fan_below_its_curve() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        fixture(dir.path());
-        let learned = BTreeMap::from([("nct6795-p1".to_string(), 0.25)]);
-        let mut engine = engine_nudging(dir.path(), free_ramp(), nudging(0.25, learned));
-
-        // 60 °C on the 40→0.2 / 80→1.0 curve is 0.6; a 25% trim is 0.45.
-        set_cpu_temp(dir.path(), 60_000);
-        let report = engine.tick().expect("tick");
-        assert!(
-            (report.fans[0].commanded_speed - 0.45).abs() < 1e-9,
-            "the learned trim scales the curve: {:?}",
-            report.fans[0].commanded_speed
-        );
-    }
-
-    #[test]
-    fn turning_the_nudger_off_leaves_learned_trims_dormant() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        fixture(dir.path());
-        let learned = BTreeMap::from([("nct6795-p1".to_string(), 0.25)]);
-        let mut settings = nudging(0.25, learned);
-        settings.enabled = false;
-        let mut engine = engine_nudging(dir.path(), free_ramp(), settings);
-
-        set_cpu_temp(dir.path(), 60_000);
-        let report = engine.tick().expect("tick");
-        assert!(
-            (report.fans[0].commanded_speed - 0.6).abs() < 1e-9,
-            "off means the plain curve again"
-        );
-        for _ in 0..20 {
-            engine.tick().expect("tick");
-        }
-        assert!(
-            engine.drain_nudge_notes().is_empty(),
-            "a disabled nudger must not experiment"
-        );
-    }
-
-    #[test]
-    fn a_steady_load_earns_a_learned_trim_in_the_config() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        fixture(dir.path());
-        let mut engine = engine_nudging(dir.path(), free_ramp(), nudging(0.25, BTreeMap::new()));
-        set_cpu_temp(dir.path(), 60_000);
-
-        // Three steady ticks fill the plateau window, and the next tick
-        // starts the trial: the fan drops below its curve.
-        for _ in 0..3 {
-            let report = engine.tick().expect("tick");
-            assert!(
-                (report.fans[0].commanded_speed - 0.6).abs() < 1e-9,
-                "no trim before a trial has started"
-            );
-        }
-        let report = engine.tick().expect("trial tick");
-        assert!(
-            (report.fans[0].commanded_speed - 0.45).abs() < 1e-9,
-            "the trial trims the fan by one step"
-        );
-        assert!(
-            !engine.drain_nudge_notes().is_empty(),
-            "the daemon should be able to log the trial"
-        );
-        assert!(
-            engine.current_config().nudge.learned.is_empty(),
-            "an unproven trim is not written to the config"
-        );
-
-        // Holding the load for `hold_secs` keeps it: learned, and saved.
-        for _ in 0..3 {
-            engine.tick().expect("hold tick");
-        }
-        let learned = engine.current_config().nudge.learned;
-        assert_eq!(
-            learned.get("nct6795-p1").copied(),
-            Some(0.25),
-            "the held trim is learned: {learned:?}"
-        );
-        let saved = crate::config::from_text(
-            std::fs::read_to_string(dir.path().join("config.toml"))
-                .expect("saved config")
-                .as_str(),
-        )
-        .expect("saved config parses");
-        assert_eq!(
-            saved.nudge.learned.get("nct6795-p1").copied(),
-            Some(0.25),
-            "what was learned survives a restart"
-        );
-    }
-
-    #[test]
-    fn a_temperature_rise_gives_the_trial_trim_back() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        fixture(dir.path());
-        let mut engine = engine_nudging(dir.path(), free_ramp(), nudging(0.25, BTreeMap::new()));
-        set_cpu_temp(dir.path(), 60_000);
-        for _ in 0..5 {
-            engine.tick().expect("tick");
-        }
-        assert!(
-            engine.current_config().nudge.learned.is_empty(),
-            "the trial is running"
-        );
-
-        // The slower speed costs 3 °C — over the 1.5 °C limit.
-        set_cpu_temp(dir.path(), 63_000);
-        let report = engine.tick().expect("rising tick");
-        assert!(
-            (report.fans[0].commanded_speed - 0.66).abs() < 1e-9,
-            "the trim is gone, so the fan follows the plain curve (63 °C → 0.66)"
-        );
-        assert!(
-            engine.current_config().nudge.learned.is_empty(),
-            "a failed trial teaches the nudger nothing"
-        );
-    }
-
-    #[test]
-    fn a_fan_the_user_takes_over_is_never_trimmed() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        fixture(dir.path());
-        let mut engine = engine_nudging(dir.path(), free_ramp(), nudging(0.25, BTreeMap::new()));
-        engine
-            .set_fan_mode(&FanId::new("nct6795-p1"), &FanMode::Fixed { speed: 0.5 })
-            .expect("fixed mode");
-        set_cpu_temp(dir.path(), 60_000);
-
-        for _ in 0..40 {
-            let report = engine.tick().expect("tick");
-            assert!(
-                (report.fans[0].commanded_speed - 0.5).abs() < 1e-9,
-                "a hand-set fan keeps exactly the speed it was given"
-            );
-        }
-        assert!(engine.current_config().nudge.learned.is_empty());
-    }
-
-    #[test]
-    fn folding_a_learned_trim_puts_it_in_the_curve() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        fixture(dir.path());
-        let learned = BTreeMap::from([("nct6795-p1".to_string(), 0.25)]);
-        let mut engine = engine_nudging(dir.path(), free_ramp(), nudging(0.25, learned));
-        let fan_id = FanId::new("nct6795-p1");
-        assert!(
-            (engine.fan_nudge_trim(&fan_id) - 0.25).abs() < 1e-9,
-            "the GUI can ask how far below its curve a fan runs"
-        );
-
-        engine.fold_fan_nudge_trim(&fan_id).expect("fold");
-
-        let Some(FanMode::Auto { curve, .. }) = engine.fan_mode(&fan_id) else {
-            panic!("folding keeps the fan automatic");
-        };
-        let speeds: Vec<f64> = curve.points().iter().map(|point| point.speed).collect();
-        assert_eq!(speeds.len(), 2);
-        assert!(
-            (speeds[0] - 0.15).abs() < 1e-9 && (speeds[1] - 0.75).abs() < 1e-9,
-            "the curve itself is 25% lower: {speeds:?}"
-        );
-        assert!(
-            engine.current_config().nudge.learned.is_empty(),
-            "the trim is forgotten once it is in the curve"
-        );
-        assert!(engine.fan_nudge_trim(&fan_id).abs() < 1e-9);
-
-        // The speed does not dip: 60 °C on the folded curve is what the
-        // trim used to ask for (0.6 × 0.75 = 0.45).
-        set_cpu_temp(dir.path(), 60_000);
-        let report = engine.tick().expect("tick");
-        assert!(
-            (report.fans[0].commanded_speed - 0.45).abs() < 1e-9,
-            "folding changes the curve, not the speed"
-        );
-    }
-
-    #[test]
-    fn folding_works_while_nudging_is_switched_off() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        fixture(dir.path());
-        let learned = BTreeMap::from([("nct6795-p1".to_string(), 0.25)]);
-        let mut settings = nudging(0.25, learned);
-        settings.enabled = false;
-        let mut engine = engine_nudging(dir.path(), free_ramp(), settings);
-        let fan_id = FanId::new("nct6795-p1");
-        assert!(
-            engine.fan_nudge_trim(&fan_id).abs() < 1e-9,
-            "a dormant trim applies nothing"
-        );
-
-        engine.fold_fan_nudge_trim(&fan_id).expect("fold");
-        assert!(
-            engine.current_config().nudge.learned.is_empty(),
-            "folding is how a switched-off learner keeps what it learned"
-        );
-        set_cpu_temp(dir.path(), 60_000);
-        let report = engine.tick().expect("tick");
-        assert!(
-            (report.fans[0].commanded_speed - 0.45).abs() < 1e-9,
-            "the folded curve asks for the learned speed"
-        );
-    }
-
-    #[test]
-    fn folding_a_trial_cancels_it_and_folds_only_what_was_learned() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        fixture(dir.path());
-        let learned = BTreeMap::from([("nct6795-p1".to_string(), 0.1)]);
-        let mut engine = engine_nudging(dir.path(), free_ramp(), nudging(0.25, learned));
-        let fan_id = FanId::new("nct6795-p1");
-        set_cpu_temp(dir.path(), 60_000);
-        for _ in 0..5 {
-            engine.tick().expect("tick");
-        }
-        assert!(
-            (engine.fan_nudge_trim(&fan_id) - 0.35).abs() < 1e-9,
-            "the trial (learned 0.1 + step 0.25) is what the fan now runs at"
-        );
-
-        engine.fold_fan_nudge_trim(&fan_id).expect("fold");
-        assert!(
-            engine.fan_nudge_trim(&fan_id).abs() < 1e-9,
-            "the trial is cancelled and the learned trim is folded in, not applied"
-        );
-        let Some(FanMode::Auto { curve, .. }) = engine.fan_mode(&fan_id) else {
-            panic!("folding keeps the fan automatic");
-        };
-        let speeds: Vec<f64> = curve.points().iter().map(|point| point.speed).collect();
-        assert!(
-            (speeds[0] - 0.18).abs() < 1e-9 && (speeds[1] - 0.9).abs() < 1e-9,
-            "only the learned 10% is folded into the curve: {speeds:?}"
-        );
-    }
-
-    #[test]
-    fn folding_is_a_no_op_without_learning() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        fixture(dir.path());
-        let mut engine = engine_nudging(dir.path(), free_ramp(), nudging(0.25, BTreeMap::new()));
-        let fan_id = FanId::new("nct6795-p1");
-        let curve_before = engine.fan_mode(&fan_id);
-
-        engine
-            .fold_fan_nudge_trim(&fan_id)
-            .expect("nothing to fold");
-        assert_eq!(
-            engine.fan_mode(&fan_id),
-            curve_before,
-            "a fan with no learned trim keeps its curve"
-        );
-        let error = engine
-            .fold_fan_nudge_trim(&FanId::new("nct6795-p9"))
-            .expect_err("an invalid id is an error, not a silent no-op");
-        assert!(
-            error.to_string().contains("unknown fan"),
-            "expected an unknown-fan error, got: {error}"
-        );
-    }
-
-    #[test]
-    fn a_hand_set_fan_keeps_its_mode_when_folding() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        fixture(dir.path());
-        let learned = BTreeMap::from([("nct6795-p1".to_string(), 0.25)]);
-        let mut engine = engine_nudging(dir.path(), free_ramp(), nudging(0.25, learned));
-        let fan_id = FanId::new("nct6795-p1");
-        engine
-            .set_fan_mode(&fan_id, &FanMode::Fixed { speed: 0.5 })
-            .expect("fixed mode");
-
-        engine.fold_fan_nudge_trim(&fan_id).expect("fold");
-        assert_eq!(
-            engine.fan_mode(&fan_id),
-            Some(FanMode::Fixed { speed: 0.5 }),
-            "a hand-set fan is not rewritten as an auto curve"
-        );
-        assert_eq!(
-            engine
-                .current_config()
-                .nudge
-                .learned
-                .get("nct6795-p1")
-                .copied(),
-            Some(0.25),
-            "with nowhere to fold, the learned trim stays put"
-        );
     }
 }

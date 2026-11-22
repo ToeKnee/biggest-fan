@@ -75,12 +75,6 @@ pub enum FanRequest {
         /// Header id to take over.
         fan: String,
     },
-    /// Write a fan's learned nudge trim into its curve and forget the
-    /// trim, then save the config (the GUI's "Apply learned …" button).
-    FoldNudgeTrim {
-        /// Fan group id.
-        fan: String,
-    },
     /// Ask for the full config text the service runs with.
     GetConfig,
     /// Replace the service's config with the GUI's edited TOML text and
@@ -279,13 +273,6 @@ impl ControlService {
         })
     }
 
-    /// Moves a fan's learned nudge trim into its curve and forgets it.
-    fn fold_nudge_trim(&self, fan_id: &str) -> String {
-        self.dispatch(FanRequest::FoldNudgeTrim {
-            fan: fan_id.to_string(),
-        })
-    }
-
     /// The complete config the service currently runs with.
     fn get_config(&self) -> String {
         self.dispatch(FanRequest::GetConfig)
@@ -366,16 +353,6 @@ pub fn apply_request(engine: &mut core::Engine, request: FanRequest) -> String {
                 Err(error) => envelope_err(&error.to_string()),
             }
         }
-        FanRequest::FoldNudgeTrim { fan } => {
-            // What the user chose to keep must survive restarts.
-            match engine
-                .fold_fan_nudge_trim(&core::FanId::new(fan))
-                .and_then(|()| engine.save_config())
-            {
-                Ok(()) => envelope_ok(),
-                Err(error) => envelope_err(&error.to_string()),
-            }
-        }
         FanRequest::GetConfig => match core::config::to_text(&engine.current_config()) {
             Ok(text) => envelope_config(text),
             Err(error) => envelope_err(&error.to_string()),
@@ -449,8 +426,8 @@ pub enum Event {
     /// Fans the service disabled during `Detect`; the GUI parks its own
     /// mirrors of these ids.
     Detected(Vec<String>),
-    /// The service's full config text, from a periodic `GetConfig` poll —
-    /// how the GUI's mirror learns what the nudger has learned.
+    /// The service's full config text, from a periodic `GetConfig` poll:
+    /// the service owns the live config, so the GUI's mirror follows it.
     Config(String),
 }
 
@@ -514,7 +491,6 @@ trait Control {
     async fn set_fan_min_speed(&self, fan_id: &str, speed: f64) -> zbus::Result<String>;
     async fn detect_fans(&self) -> zbus::Result<String>;
     async fn add_fan(&self, fan_id: &str) -> zbus::Result<String>;
-    async fn fold_nudge_trim(&self, fan_id: &str) -> zbus::Result<String>;
     async fn get_config(&self) -> zbus::Result<String>;
     async fn save_config(&self, toml_text: &str) -> zbus::Result<String>;
     async fn set_poll_interval_ms(&self, interval_ms: u64) -> zbus::Result<String>;
@@ -533,7 +509,6 @@ async fn call_service(proxy: &ControlProxy<'_>, request: &FanRequest) -> zbus::R
         FanRequest::SetMinSpeed { fan, speed } => proxy.set_fan_min_speed(fan, *speed).await,
         FanRequest::Detect => proxy.detect_fans().await,
         FanRequest::AddFan { fan } => proxy.add_fan(fan).await,
-        FanRequest::FoldNudgeTrim { fan } => proxy.fold_nudge_trim(fan).await,
         FanRequest::GetConfig => proxy.get_config().await,
         FanRequest::Save { toml_text } => proxy.save_config(toml_text).await,
         FanRequest::SetInterval { ms } => proxy.set_poll_interval_ms(*ms).await,
@@ -672,7 +647,7 @@ mod tests {
                 factor: 0.5,
             },
             FanRequest::SetInterval { ms: 250 },
-            FanRequest::FoldNudgeTrim {
+            FanRequest::AddFan {
                 fan: "arctic_fan-p3".to_string(),
             },
         ];

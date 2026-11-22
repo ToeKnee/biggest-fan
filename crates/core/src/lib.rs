@@ -31,7 +31,6 @@ pub mod config;
 pub mod engine;
 pub mod error;
 pub mod fans;
-pub mod nudge;
 pub mod sensors;
 
 pub use case::{Airflow, CaseConfig, FanSlot};

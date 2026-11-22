@@ -28,7 +28,7 @@ Has adjustable update time (default to 1 second refresh)
 
 | Path                | Crate                    | What it is                                                                                                                                                                                                                      |
 | ------------------- | ------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `crates/core`       | `biggest-fan-core`       | Library: sensor discovery (hwmon + NVML), human naming, fan/PWM control, config (TOML), case layout, the control-loop `Engine` with hysteresis, and the background nudger that learns slower fan speeds.                        |
+| `crates/core`       | `biggest-fan-core`       | Library: sensor discovery (hwmon + NVML), human naming, fan/PWM control, config (TOML), case layout, and the control-loop `Engine` with hysteresis.                                                                             |
 | `crates/app`        | `biggest-fan`            | Library plus two binaries: `biggest-fan` (GTK 4 GUI — case view + fan controls — and the `scan`, `init-config`, `detect-fans` one-shot commands) and `biggest-fan-daemon` (headless control loop, for systemd).                 |
 | `crates/stress-lab` | `biggest-fan-stress-lab` | Library plus developer CLI `stress-lab`: hand-written CPU (AVX-512) and GPU (Vulkan compute) stressors and a CSV temp/fan/PWM monitor. The library also drives the GUI's Stress lab panel; the CLI binary stays developer-only. |
 | `packaging/desktop` | —                        | The `net.ynottony.ten.BiggestFan.desktop` launcher installed by the .deb.                                                                                                                                                       |
@@ -92,7 +92,9 @@ needed for _writes_ only there.
 
 TOML; a missing file is auto-generated from the live hardware on first run
 (review it before trusting it). All fields shown here are optional and fall
-back to the defaults:
+back to the defaults. Keys an older version used but this one no longer has
+(for example a `[nudge]` section) are accepted and ignored, then dropped
+the next time the config is saved:
 
 ```toml
 poll_interval_ms = 1000   # control-loop refresh period (floors at 100 ms)
@@ -425,41 +427,17 @@ the window always stops the load. Run the GUI itself in release mode
 (`cargo run --release -p biggest-fan`) — a debug build runs the
 stressors ~100x too slowly to heat anything.
 
-The panel also has **Run full test**, an auto-tune (`crates/app/src/tune.rs`)
-that answers "how slow can each fan run and still keep up?":
+A fan-row change is live at once, and it only survives a restart when the
+config is saved — an experiment is self-correcting that way: leave the
+config alone and restarting the daemon puts the saved curves back in
+charge.
 
-1. _Detect fans_ runs first, then every tunable fan (visible fans in
-   `auto` mode — fixed pumps and hand-set fans are left alone) is pinned
-   to full speed while both stressors run, for the **warm-up (min)**
-   soak: a few minutes is fine for air, an AIO wants ~10, a custom loop
-   ~20. The soak ends early once the readings have sat still for 20 s —
-   but never before half the requested warm-up, because water takes its
-   time.
-2. Soaked, each fan's speed is _searched_ rather than walked: probes
-   gallop down in doubling steps (90 %, 70 %, 30 %, …) and once one
-   fails the search bisects its last safe/unsafe pair until the two are
-   5 % apart. A fan that fails its very first probe is done there —
-   splitting the top 10 % would be settles spent for nothing. Each probe
-   is judged as soon as the machine has stopped moving (at least 45 s,
-   at most half the warm-up); any sensor rising more than 2 °C above the
-   last accepted state, or NVML GPU thermal throttling, reverts the
-   probe and re-anchors there before the next one.
-3. Each fan's slowest proven speed becomes a suggested curve (the
-   Balanced shape scaled to that speed), applied as transient modes.
-   The end report says whether the GPU ever thermally throttled — the
-   curves are only trustworthy if it didn't.
-
-A tune now costs minutes per fan (a handful of measured settles each)
-rather than the ~10 five-minute notches the first version walked — an
-8-fan machine with a 10-minute AIO soak is around an hour, not six.
-For everyday quieting without any test run, see
-[Background nudging](#background-nudging) instead. Everything it does is reversible: _Save
-config_ keeps the suggested curves; _Stop tune_, _Restore saved modes_
-or closing the window put the fans back in the modes they had before
-the tune (the guard trips do the same). The status bar at the bottom of
-the window shows progress
-("warming up, 4 min left", "fan 3 of 8 — Front intake at 60 %") and the
-full report afterwards.
+The panel used to offer a full automatic curve search (soak the machine,
+then walk each fan down until a temperature rose), and the daemon used to
+trim fans towards quieter speeds by itself during normal use. Both are
+gone: neither measured reliably enough to be trusted with the fans
+unattended. The stressors stay — what they teach you belongs in the
+curves you write.
 
 For scripted experiments the CLI does the same things:
 
@@ -503,83 +481,6 @@ near 80 °C under AVX-512 load no matter what the case fans do — front
 intakes off, exhaust off or everything at full speed all land within a
 degree or two — so the cooler, not the airflow, is the CPU limit and the
 default curve already matches reality up there.
-
-## Background nudging
-
-The **nudger** asks the same question the Stress lab asks — how slowly can
-this fan run and still keep up? — but answers it during normal use, one
-small experiment at a time, with no test run. It is off by default because
-it deliberately changes fan speeds while the machine is in use.
-
-```toml
-[nudge]
-enabled = true      # off by default
-step = 0.05         # give up 5% of the curve speed per successful trial
-max_trim = 0.5      # never run a fan below half the speed its curve asks
-hold_secs = 240     # how long the slower speed must hold before it is kept
-rise_limit_c = 1.5  # a trial fails if the fan's sensor climbs this much
-drop_limit_c = 2.0  # a trial also fails if the load fell away (proved nothing)
-min_temp_c = 55.0   # only trial a fan while its own sensor is this warm
-steady_band_c = 1.0 # the sensor must have been this flat before a trial
-cooldown_secs = 300 # pause between trials
-learned = { "arctic_fan-p1" = 0.10 }  # written by the daemon as it learns
-```
-
-On each tick the daemon looks at every _auto_ fan whose sensor is warm
-(`min_temp_c`) and has been flat (`steady_band_c`), and picks the one that
-has waited longest for a trial (never-trialled fans go first, then they
-take turns): that fan then runs at `curve speed × (1 - trim)` for
-`hold_secs`. A trim _scales_ the curve, so a hotter day still walks the
-fan back up the same shape. If no watched temperature climbs, the trim is
-kept in `learned` and the config file is written, so what the machine
-learned survives a restart.
-
-A trial is judged by every watched temperature — CPU, GPU, motherboard and
-drive sensors, plus the sensor the trialled fan follows — not only by that
-fan's own sensor, because slowing one fan can cost a different component.
-A case fan tracked by the CPU sensor can therefore still be reverted when
-the card gets hotter. Case and misc sensors are free to drift: that is what
-the trial is measuring. If a watched sensor climbs past `rise_limit_c`, the
-GPU starts thermal throttling, or the load falls away (`drop_limit_c`, which
-would be a false pass), the trim is reverted at once. One fan is tried at a
-time, so every verdict belongs to the fan that actually changed.
-
-What it never touches: fans in _fixed_ or _off_ mode (an AIO pump keeps the
-speed it was given), NVIDIA coolers (the card drives those itself), any
-speed below a fan's `min_speed`, and a fan you take over by hand mid-trial
-(the trial is simply dropped). `enabled = false` is a kill switch: learned
-trims go dormant and the fans follow their plain curves again — fold them
-into their curves (below) or delete the `learned` entries to unlearn them
-for good.
-
-`min_temp_c` gates each fan on its _own_ sensor, so a fan that tracks a
-case temperature may never qualify on a cool-running machine; lower it if
-those fans are the ones you want quieter. Each trial costs `hold_secs` plus
-`cooldown_secs`, so a machine with many fans spends hours of real use
-learning — which is the point: it is measured in normal use, not in a
-sitting. Trials and verdicts go to the journal:
-
-```text
-nudge: Rear exhaust: trying 10% below its curve
-nudge: Rear exhaust: now runs 10% below its curve
-```
-
-Only the daemon experiments — the GUI's read-only mirror of the engine and
-`--dry-run` never start trials.
-
-### What the GUI shows
-
-The GUI follows the daemon's config by polling it every few ticks, so
-learned trims appear on their own. A fan with a trim gets a dimmer dashed
-line under its curve (the curve as the fan now runs it, `× (1 - trim)`,
-with the live dot sitting on it) and a caption, "10% slower than its
-curve". Pressing _Apply learned −10% to curve_ **folds** the trim: the
-points are written into the curve and the trim is forgotten, so the fan
-keeps running at exactly the same speed while the preset dropdown reads
-_Custom_ and the learning is now just part of the curve — visible, editable
-and safe from the kill switch. Folding a fan mid-trial drops that trial;
-only accepted learning is ever folded. The folded curve is saved with the
-config, and the journal is untouched.
 
 ## Packaging (deb)
 

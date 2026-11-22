@@ -10,29 +10,16 @@
 //! machine gets hot, so experimenting can never turn into cooking: the
 //! guard trips, the thread wraps up, and the status bar at the bottom
 //! of the window says which temperature hit the limit.
-//!
-//! "Run full test" starts the auto-tune (see [`crate::tune`]): warm-up
-//! under full stress, then each fan's speed is searched downward until a
-//! temperature climbs, and the slowest curves each fan can hold are
-//! suggested (kept only if *Save config* is pressed afterwards).
 
-use crate::dbus::{self, FanRequest};
-use crate::tune;
-use biggest_fan_core as core;
 use biggest_fan_stress_lab::{cpu, gpu, thermal};
 use gtk4::glib::{self, ControlFlow};
 use gtk4::prelude::*;
-use gtk4::{Box as GtkBox, Button, Label, Orientation, SpinButton, ToggleButton};
+use gtk4::{Box as GtkBox, Label, Orientation, SpinButton, ToggleButton};
 use std::cell::RefCell;
-use std::collections::BTreeMap;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
-
-/// A tune keeps the stressors alive as long as a day; the stop flag
-/// normally ends them long before that.
-const TUNE_STRESS_SECS: u64 = 24 * 60 * 60;
 
 /// A live stress thread: the external stop flag, and the join handle
 /// once it finishes so the result can be read back onto the status bar.
@@ -58,35 +45,25 @@ pub struct StressPanel {
     gpu_button: ToggleButton,
     duration_spin: SpinButton,
     guard_spin: SpinButton,
-    tune_button: Button,
-    warmup_spin: SpinButton,
-    restore_button: Button,
     /// What this panel wants on the window's status bar right now (its
     /// own `poll` fills it in; the app's tick decides whether it gets
     /// shown — see [`StressPanel::status_line`]).
     status_line: RefCell<Option<String>>,
-    engine: Rc<RefCell<core::Engine>>,
-    client: dbus::Client,
-    /// Live sensor temperatures, refreshed by the control-loop tick.
-    temps: Rc<RefCell<BTreeMap<core::SensorId, f64>>>,
     runs: RefCell<StressRuns>,
-    tune: RefCell<Option<tune::Tune>>,
-    /// The last tune report or restore confirmation.
-    tune_note: RefCell<Option<String>>,
 }
 
 impl StressPanel {
     /// The line this panel would like on the window's status bar: live
-    /// stressor progress, a tune's state, or the last result — `None`
-    /// while the lab has nothing to say, leaving the bar to the control
-    /// loop and the service.
+    /// stressor progress, or the last result — `None` while the lab has
+    /// nothing to say, leaving the bar to the control loop and the
+    /// service.
     #[must_use]
     pub fn status_line(&self) -> Option<String> {
         self.status_line.borrow().clone()
     }
-    /// Ends any live tune and stressors (called when the window closes).
+
+    /// Ends the stressors (called when the window closes).
     pub fn stop_all(&self) {
-        self.stop_tune();
         let runs = self.runs.borrow();
         for run in [runs.cpu.as_ref(), runs.gpu.as_ref()].into_iter().flatten() {
             run.stop.store(true, Ordering::Relaxed);
@@ -162,88 +139,8 @@ impl StressPanel {
         }
     }
 
-    fn start_tune(&self) {
-        let config = self.engine.borrow().current_config();
-        let warmup = Duration::from_secs(spin_seconds(&self.warmup_spin) * 60);
-        let tuner = tune::Tune::new(&config, warmup, Instant::now());
-        // Detect first so a connected-but-hidden header joins the lineup,
-        // then pin every candidate fan at full speed for the warm-up.
-        self.client.send(FanRequest::Detect);
-        for request in tuner.warmup_requests() {
-            self.client.send(request);
-        }
-        let guard = self.guard_spin.value();
-        self.start_cpu(&cpu::CpuArgs {
-            secs: TUNE_STRESS_SECS,
-            max_temp_c: guard,
-            ..cpu::CpuArgs::default()
-        });
-        self.start_gpu(&gpu::GpuArgs {
-            secs: TUNE_STRESS_SECS,
-            max_temp_c: guard,
-            ..gpu::GpuArgs::default()
-        });
-        self.tune_button.set_label("Stop tune");
-        self.set_manual_sensitive(false);
-        self.tune_note.borrow_mut().take();
-        *self.tune.borrow_mut() = Some(tuner);
-    }
-
-    /// Stops a live tune (restoring the pre-tune modes) and its
-    /// stressors; a no-op on widgets and state when nothing is tuning.
-    fn stop_tune(&self) {
-        if let Some(mut tuner) = self.tune.borrow_mut().take() {
-            tuner.abort(&mut |request| {
-                self.client.send(request);
-            });
-            *self.tune_note.borrow_mut() = Some(tuner.report());
-            Self::stop_run(&self.runs.borrow(), Which::Cpu);
-            Self::stop_run(&self.runs.borrow(), Which::Gpu);
-        }
-        self.tune_button.set_label("Run full test");
-        self.set_manual_sensitive(true);
-    }
-
-    /// Hands every visible fan the mode from the saved config file —
-    /// what a daemon restart would apply.
-    fn restore_saved(&self) {
-        let path = self.engine.borrow().config_path().to_path_buf();
-        let outcome = std::fs::read_to_string(&path)
-            .map_err(|error| format!("could not read {}: {error}", path.display()))
-            .and_then(|text| core::config::from_text(&text).map_err(|error| error.to_string()));
-        match outcome {
-            Ok(config) => {
-                let mut restored = 0;
-                for fan in config.fans.iter().filter(|fan| !fan.hidden) {
-                    if let Ok(mode_json) = serde_json::to_string(&fan.mode) {
-                        self.client.send(FanRequest::SetFanMode {
-                            fan: fan.id.as_str().to_string(),
-                            mode_json,
-                        });
-                        restored += 1;
-                    }
-                }
-                *self.tune_note.borrow_mut() = Some(format!(
-                    "restored {restored} fan modes from the saved config"
-                ));
-            }
-            Err(problem) => {
-                *self.tune_note.borrow_mut() = Some(format!("could not restore: {problem}"));
-            }
-        }
-    }
-
-    fn set_manual_sensitive(&self, enabled: bool) {
-        self.cpu_button.set_sensitive(enabled);
-        self.gpu_button.set_sensitive(enabled);
-        self.duration_spin.set_sensitive(enabled);
-        self.guard_spin.set_sensitive(enabled);
-        self.warmup_spin.set_sensitive(enabled);
-        self.restore_button.set_sensitive(enabled);
-    }
-
-    /// Half-second refresh: collect finished runs into notes, keep live
-    /// runs' elapsed time in the status line, and step a live tune.
+    /// Half-second refresh: collect finished runs into notes and keep live
+    /// runs' elapsed time in the status line.
     fn poll(&self) {
         let mut parts: Vec<String> = Vec::new();
         // Clearing a toggle re-enters the widget handlers, which borrow
@@ -271,10 +168,6 @@ impl StressPanel {
         if gpu_finished {
             self.gpu_button.set_active(false);
         }
-        self.step_tune(&mut parts);
-        if let Some(note) = self.tune_note.borrow().as_ref() {
-            parts.push(note.clone());
-        }
         // The bar is shared: with nothing to report the lab stays quiet
         // rather than hiding a fan note or a service answer.
         *self.status_line.borrow_mut() = if parts.is_empty() {
@@ -282,80 +175,6 @@ impl StressPanel {
         } else {
             Some(parts.join("  ·  "))
         };
-    }
-
-    /// Advances a live tune; aborts it if its stressors died on their own
-    /// (a thermal-guard trip, most likely).
-    fn step_tune(&self, parts: &mut Vec<String>) {
-        let mut slot = self.tune.borrow_mut();
-        let Some(tuner) = slot.as_mut() else { return };
-        let alive = {
-            let runs = self.runs.borrow();
-            let live = |run: &Option<StressRun>| {
-                run.as_ref()
-                    .is_some_and(|run| run.worker.as_ref().is_some_and(|w| !w.is_finished()))
-            };
-            live(&runs.cpu) && live(&runs.gpu)
-        };
-        if !alive {
-            tuner.abort(&mut |request| {
-                self.client.send(request);
-            });
-        }
-        tuner.step(Instant::now(), &self.temps.borrow(), &mut |request| {
-            self.client.send(request);
-        });
-        parts.push(tuner.status(Instant::now()));
-        if tuner.finished() {
-            *self.tune_note.borrow_mut() = Some(tuner.report());
-            self.tune_button.set_label("Run full test");
-            self.set_manual_sensitive(true);
-            slot.take();
-        }
-    }
-}
-
-/// The auto-tune row: its buttons and warm-up spin, ready to append.
-struct TuneRow {
-    row: GtkBox,
-    tune_button: Button,
-    warmup_spin: SpinButton,
-    restore_button: Button,
-}
-
-impl TuneRow {
-    #[must_use]
-    fn new() -> Self {
-        let row = GtkBox::new(Orientation::Horizontal, 8);
-        let tune_button = Button::builder()
-            .label("Run full test")
-            .tooltip_text(
-                "warm up under full stress, then search each fan downward until a \
-                 temperature climbs, and suggest the slowest curves each fan can hold",
-            )
-            .build();
-        let warmup_spin = SpinButton::builder()
-            .digits(0)
-            .adjustment(&gtk4::Adjustment::new(10.0, 2.0, 120.0, 1.0, 5.0, 0.0))
-            .build();
-        let restore_button = Button::builder()
-            .label("Restore saved modes")
-            .tooltip_text("put every fan back in the mode its saved config says")
-            .build();
-        row.append(&tune_button);
-        row.append(&Label::builder().label("warm-up (min):").build());
-        row.append(&warmup_spin);
-        row.append(&restore_button);
-        Self {
-            row,
-            tune_button,
-            warmup_spin,
-            restore_button,
-        }
-    }
-
-    fn append_to(&self, panel: &GtkBox) {
-        panel.append(&self.row);
     }
 }
 
@@ -426,19 +245,13 @@ fn collect(
     true
 }
 
-/// Appends the "Stress lab" section (header, note, controls and
-/// full-test row) to `panel`, wiring the toggles, the tune button and
-/// the half-second status tick.
+/// Appends the "Stress lab" section (header, note and the stressor row)
+/// to `panel`, wiring the toggles and the half-second status tick.
 ///
 /// The lab has no status label of its own: its progress and results go
 /// to the window's status bar through [`StressPanel::status_line`].
 #[must_use]
-pub fn append_stress_panel(
-    panel: &GtkBox,
-    engine_rc: &Rc<RefCell<core::Engine>>,
-    client: &dbus::Client,
-    temps: Rc<RefCell<BTreeMap<core::SensorId, f64>>>,
-) -> Rc<StressPanel> {
+pub fn append_stress_panel(panel: &GtkBox) -> Rc<StressPanel> {
     panel.append(
         &Label::builder()
             .label("<b>Stress lab</b>")
@@ -482,27 +295,13 @@ pub fn append_stress_panel(
     row.append(&Label::builder().label("guard at (°C):").build());
     row.append(&guard_spin);
 
-    // The auto-tune row: warm-up minutes is how long the machine soaks
-    // at full speed before the sweep starts — air-cooled machines get by
-    // with a few, AIO and custom loops want the longer ends.
-    let tune_row = TuneRow::new();
-    tune_row.append_to(panel);
-
     let stress_panel = Rc::new(StressPanel {
         cpu_button: cpu_button.clone(),
         gpu_button: gpu_button.clone(),
         duration_spin,
         guard_spin,
-        tune_button: tune_row.tune_button.clone(),
-        warmup_spin: tune_row.warmup_spin.clone(),
-        restore_button: tune_row.restore_button.clone(),
         status_line: RefCell::new(None),
-        engine: Rc::clone(engine_rc),
-        client: client.clone(),
-        temps,
         runs: RefCell::new(StressRuns::default()),
-        tune: RefCell::new(None),
-        tune_note: RefCell::new(None),
     });
 
     // Toggling on starts the stressor (and replaces any previous run);
@@ -524,25 +323,11 @@ pub fn append_stress_panel(
         }
     });
 
-    // "Run full test" starts the auto-tune and becomes "Stop tune".
-    let tune_panel = Rc::clone(&stress_panel);
-    tune_row.tune_button.connect_clicked(move |_| {
-        if tune_panel.tune.borrow().is_some() {
-            tune_panel.stop_tune();
-        } else {
-            tune_panel.start_tune();
-        }
-    });
-    let restore_panel = Rc::clone(&stress_panel);
-    tune_row
-        .restore_button
-        .connect_clicked(move |_| restore_panel.restore_saved());
-
     panel.append(&row);
 
-    // Half-second status tick: elapsed time while running, results once
-    // a thread has wrapped up, and the live tune's state machine. Like
-    // the control-loop tick, it lives as long as the main loop does.
+    // Half-second status tick: elapsed time while a stressor runs, and the
+    // result once its thread has wrapped up. Like the control-loop tick,
+    // it lives as long as the main loop does.
     let poll_panel = Rc::clone(&stress_panel);
     glib::timeout_add_local(Duration::from_millis(500), move || {
         poll_panel.poll();
