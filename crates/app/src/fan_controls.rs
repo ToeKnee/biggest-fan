@@ -148,9 +148,10 @@ impl FanControls {
         speed_scale.set_range(0.0, 100.0);
 
         let sensor_combo = sensor_dropdown(&engine_rc.borrow(), id);
-        // Curve presets: one dropdown pick instead of hand-writing points.
-        // "Custom" is display-only — a hand-made curve shows up here until
-        // a preset replaces it.
+        // Curve presets: one dropdown pick instead of editing the points
+        // (by hand on the row's graph, or in the config). Picking one
+        // replaces whatever curve the fan has; "Custom" is display-only —
+        // shown while the curve is not one of these three.
         let preset_combo = ComboBoxText::new();
         preset_combo.append(Some(CURVE_QUIET), core::CurvePreset::Quiet.label());
         preset_combo.append(Some(CURVE_BALANCED), core::CurvePreset::Balanced.label());
@@ -172,9 +173,14 @@ impl FanControls {
         let temp_label = Label::builder().xalign(0.0).hexpand(true).build();
         auto_row.append(&temp_label);
 
+        let status_label = Label::builder().xalign(0.0).build();
+        status_label.set_markup("<span size=\"small\">…</span>");
+
         // The fan's curve drawn against sensor temperature, with a dot
-        // for where the fan is now; only shown in auto mode.
-        let curve_graph = CurveGraph::new(engine_rc, id);
+        // for where the fan is now; only shown in auto mode. Dragging its
+        // points edits the fan's curve and reports trouble on the row's
+        // status line.
+        let curve_graph = CurveGraph::new(engine_rc, id, client, &status_label);
 
         // The fan's recent history beside the curve: speed % and
         // governing sensor °C over the last few minutes, every mode.
@@ -199,9 +205,6 @@ impl FanControls {
         let rpm_spin = Self::tach_spin();
         let floor_spin = Self::floor_spin();
         let extra_expander = Self::extras_expander(&rpm_spin, &floor_spin, &member_checks);
-
-        let status_label = Label::builder().xalign(0.0).build();
-        status_label.set_markup("<span size=\"small\">…</span>");
 
         container.append(&header);
         container.append(&speed_scale);
@@ -898,7 +901,7 @@ fn read_mode(
     }
 }
 
-fn push_mode(
+pub(crate) fn push_mode(
     engine_rc: &Rc<RefCell<core::Engine>>,
     fan_id: &core::FanId,
     mode: Option<core::FanMode>,
@@ -967,7 +970,7 @@ fn existing_curve(engine: &core::Engine, fan_id: &core::FanId) -> core::FanCurve
         .unwrap_or_default()
 }
 
-fn escape_markup(text: &str) -> String {
+pub(crate) fn escape_markup(text: &str) -> String {
     text.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")

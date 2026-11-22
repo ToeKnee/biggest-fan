@@ -127,7 +127,8 @@ mode = { type = "auto", sensor = "k10temp-t1", curve = [
 # other modes: { type = "off" }, { type = "fixed", speed = 0.35 }
 # the GUI's curve dropdown can replace `curve` with a preset instead:
 # Quiet (stopped while cool, ramps hard only near the temperature limit),
-# Balanced (the default) or Performance (ramps early); a hand-made curve
+# Balanced (the default) or Performance (ramps early); a curve that is not
+# exactly one of the three — hand-written here, or dragged on the graph —
 # shows as "Custom"
 
 [fans.slot]               # where to draw the fan on the case view
@@ -333,7 +334,15 @@ mode, sensor and a preset curve (Quiet, Balanced, Performance). Every Auto
 fan's curve is drawn as a small graph — speed against sensor temperature —
 with a dot at the speed and temperature the fan is actually at right now
 (off-curve dots show a ramp or hold band at work). Every row uses the same
-20–100 °C domain, so the curves compare straight down the list. Beside it
+20–100 °C domain, so the curves compare straight down the list. The graph
+is where the curve is edited: **hover a point** to print its exact
+"45 % at 60 °C" beside it, **drag a point** to move it (it snaps to whole
+degrees and whole percents and can never cross its neighbours),
+**double-click** an empty spot to add a point, **right-click a point** to
+delete one (two points is the floor — pick a preset for a simpler curve).
+A drag is only committed to the fan and the service when you let go, so a
+half-dragged curve never drives anything; the dropdown then reads
+"Custom", and picking a preset replaces what you drew. Beside it
 every fan also charts its last 5 minutes — speed % (blue) against the
 same 0–100 scale as governing sensor °C (yellow) — so changes over time
 stay visible after the numbers have scrolled past in the status line.
