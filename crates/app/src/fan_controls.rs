@@ -379,11 +379,6 @@ impl FanControls {
         row.append(diameter_label);
         row.append(diameter_spin);
         row.append(size_row);
-        row.append(
-            &Label::builder()
-                .label("· drag the shape on the drawing to move")
-                .build(),
-        );
         row
     }
 
