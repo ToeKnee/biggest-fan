@@ -29,31 +29,24 @@ pub const OBJECT_PATH: &str = "/net/ynottony/ten/biggestfan";
 /// A change the GUI asks the running service to apply to its engine.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum FanRequest {
-    /// Set one fan group's mode; `mode_json` is a [`core::FanMode`] in
+    /// Set one fan's mode; `mode_json` is a [`core::FanMode`] in
     /// JSON, the same shape the config file writes.
     SetFanMode {
-        /// Fan group id.
+        /// Fan id.
         fan: String,
         /// The mode, as JSON.
         mode_json: String,
     },
-    /// Re-group a fan's member headers.
-    SetMembers {
-        /// Group leader header id.
-        leader: String,
-        /// Member header ids (the leader need not repeat itself).
-        members: Vec<String>,
-    },
-    /// Rename a fan group for display.
+    /// Rename a fan for display.
     SetName {
-        /// Fan group id.
+        /// Fan id.
         fan: String,
         /// New display name; empty restores the hardware default.
         name: String,
     },
     /// Corrects a tachometer that reports double (or half).
     SetRpmFactor {
-        /// Fan group id.
+        /// Fan id.
         fan: String,
         /// Measured RPM is multiplied by this.
         factor: f64,
@@ -62,7 +55,7 @@ pub enum FanRequest {
     /// in fixed or auto mode, for something that must keep turning (an AIO
     /// pump). _Off_ mode still stops the fan.
     SetMinSpeed {
-        /// Fan group id.
+        /// Fan id.
         fan: String,
         /// Floor as a fraction of full speed (0.0 = no floor).
         speed: f64,
@@ -219,7 +212,7 @@ impl ControlService {
 
 #[zbus::interface(name = "net.ynottony.ten.biggestfan.Control1")]
 impl ControlService {
-    /// Sets one fan group's mode; `mode_json` uses the config file's
+    /// Sets one fan's mode; `mode_json` uses the config file's
     /// serde shape for a mode.
     fn set_fan_mode(&self, fan_id: &str, mode_json: &str) -> String {
         self.dispatch(FanRequest::SetFanMode {
@@ -228,15 +221,7 @@ impl ControlService {
         })
     }
 
-    /// Replaces a fan group's member headers.
-    fn set_fan_members(&self, leader_id: &str, members: Vec<String>) -> String {
-        self.dispatch(FanRequest::SetMembers {
-            leader: leader_id.to_string(),
-            members,
-        })
-    }
-
-    /// Renames a fan group; an empty name restores the hardware default.
+    /// Renames a fan; an empty name restores the hardware default.
     fn set_fan_name(&self, fan_id: &str, name: &str) -> String {
         self.dispatch(FanRequest::SetName {
             fan: fan_id.to_string(),
@@ -303,13 +288,6 @@ pub fn apply_request(engine: &mut core::Engine, request: FanRequest) -> String {
                     Err(error) => envelope_err(&error.to_string()),
                 },
                 Err(error) => envelope_err(&format!("invalid mode: {error}")),
-            }
-        }
-        FanRequest::SetMembers { leader, members } => {
-            let members: Vec<core::FanId> = members.into_iter().map(core::FanId::new).collect();
-            match engine.set_fan_members(&core::FanId::new(leader), &members) {
-                Ok(()) => envelope_ok(),
-                Err(error) => envelope_err(&error.to_string()),
             }
         }
         FanRequest::SetName { fan, name } => {
@@ -485,7 +463,6 @@ impl Client {
 )]
 trait Control {
     async fn set_fan_mode(&self, fan_id: &str, mode_json: &str) -> zbus::Result<String>;
-    async fn set_fan_members(&self, leader_id: &str, members: Vec<String>) -> zbus::Result<String>;
     async fn set_fan_name(&self, fan_id: &str, name: &str) -> zbus::Result<String>;
     async fn set_fan_rpm_factor(&self, fan_id: &str, factor: f64) -> zbus::Result<String>;
     async fn set_fan_min_speed(&self, fan_id: &str, speed: f64) -> zbus::Result<String>;
@@ -501,9 +478,6 @@ trait Control {
 async fn call_service(proxy: &ControlProxy<'_>, request: &FanRequest) -> zbus::Result<String> {
     match request {
         FanRequest::SetFanMode { fan, mode_json } => proxy.set_fan_mode(fan, mode_json).await,
-        FanRequest::SetMembers { leader, members } => {
-            proxy.set_fan_members(leader, members.clone()).await
-        }
         FanRequest::SetName { fan, name } => proxy.set_fan_name(fan, name).await,
         FanRequest::SetRpmFactor { fan, factor } => proxy.set_fan_rpm_factor(fan, *factor).await,
         FanRequest::SetMinSpeed { fan, speed } => proxy.set_fan_min_speed(fan, *speed).await,

@@ -112,9 +112,8 @@ max_step_up_per_tick = 0.5  # rocket: max speed rise per tick (0 or 1.0 = at onc
 "k10temp-t3" = "CPU CCD 1 temperature"
 
 [[fans]]
-id = "nct6795-p1"         # leader header id from `biggest-fan scan`
+id = "nct6795-p1"         # the header this fan drives, from `biggest-fan scan`
 name = "Front 120mm intake"
-members = ["nct6795-p4"]  # extra headers driven as one fan (an AIO's fans…)
 hidden = false            # `detect-fans` sets true when nothing is connected
 rpm_factor = 1.0          # tach correction: shown rpm = reported × this
                           # (0.5 halves a doubled tachometer)
@@ -227,7 +226,7 @@ GPU that reports fans appears as one logical cooler — id
 `nvidia-gpuN-cooler`, named e.g. “NVIDIA GeForce RTX 4070 SUPER cooler” —
 whose _all_ fans move together. Coolers are
 managed exactly like sysfs fans: off / fixed / auto with curves,
-hysteresis and grouping; `init-config` binds one to the GPU's NVML
+hysteresis; `init-config` binds one to the GPU's NVML
 temperature automatically. On the case view a cooler is drawn as a card —
 a rectangle whose size the fan row's shape/width/height controls set
 (`rect = [width, height]` in the config) — not a circle, since it spans
@@ -332,7 +331,7 @@ hands the fans back too). Only stop the service when another controller
 `biggest-fan gui` needs no root but **requires** the running service: it
 joins the service on the system bus, mirrors the _service's_ config
 (which is the live one), and forwards mode, sensor and curve preset, fan
-name, tach correction, speed floor, grouping, detection, refresh-rate and
+name, tach correction, speed floor, detection, refresh-rate and
 save changes to it over D-Bus. Each fan row can rename the fan inline, pick
 mode, sensor and a preset curve (Quiet, Balanced, Performance). Every Auto
 fan's curve is drawn as a small graph — speed against sensor temperature —
@@ -397,7 +396,7 @@ usually back in hardware-automatic mode, and a graphics card has spent
 the sleep running its own fan policy. So after a resume the daemon
 re-reads the hardware and re-asserts every fan
 (`Engine::resync_hardware`): headers are discovered afresh and re-bound
-to their group by id (ids are chip-name based, so renumbering cannot
+to their fan by id (ids are chip-name based, so renumbering cannot
 break the config), each ramp restarts from the duty the firmware left —
 one feather step from what the header actually reads rather than from
 the pre-sleep value — NVIDIA coolers forget who drives them and take
@@ -413,11 +412,11 @@ journal gets one line per resume whatever `--quiet` says:
 resume: re-bound 8 fan header(s) and re-asserted every fan
 ```
 
-plus a line naming any configured header that is not back yet (its group
+plus a line naming any configured header that is not back yet (its fan
 keeps the old handle, so the config is not silently dropped and the
 failed write keeps being reported until the driver returns) and any
 header the machine now exposes that the config has never heard of — a
-group parked as hidden (nothing plugged in, or the driver refuses
+fan parked as hidden (nothing plugged in, or the driver refuses
 software control) is deliberately undriven and never listed. A machine
 without logind, or a system bus the daemon cannot reach, is reported
 once at startup and simply never notices a resume: fan control carries

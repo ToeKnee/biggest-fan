@@ -36,7 +36,7 @@ impl FanDriver {
         }
     }
 
-    /// Pre-discovery descriptor for listings and group editing.
+    /// Pre-discovery descriptor for listings and fan pickers.
     #[must_use]
     pub fn descriptor(&self) -> FanDescriptor {
         match self {

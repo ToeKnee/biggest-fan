@@ -1,6 +1,6 @@
 //! Per-fan control rows in the GUI: name (rename), mode selector, speed
-//! slider, sensor binding, curve preset, case-view placement, tachometer
-//! correction and fan grouping.
+//! slider, sensor binding, curve preset, case-view placement and
+//! tachometer correction.
 
 use crate::curve_graph::CurveGraph;
 use crate::dbus;
@@ -8,8 +8,8 @@ use crate::trend_graph::TrendGraph;
 use biggest_fan_core as core;
 use gtk4::prelude::*;
 use gtk4::{
-    Box as GtkBox, CheckButton, ComboBoxText, DrawingArea, Entry, Expander, Label, Orientation,
-    Scale, SpinButton,
+    Box as GtkBox, ComboBoxText, DrawingArea, Entry, Expander, Label, Orientation, Scale,
+    SpinButton,
 };
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -64,7 +64,7 @@ struct PlacementWidgets {
     height_spin: SpinButton,
 }
 
-/// One fan group's row: name, mode dropdown, speed slider, sensor
+/// One fan's row: name, mode dropdown, speed slider, sensor
 /// dropdown, curve preset, placement controls and a live status line.
 pub struct FanControls {
     /// The row container, to be added to the window.
@@ -97,8 +97,6 @@ pub struct FanControls {
     status_label: Label,
     /// Case canvas to repaint when placement changes.
     case_area: DrawingArea,
-    /// Per-header checkboxes for driving headers together as one fan.
-    member_checks: Rc<Vec<(core::FanId, CheckButton)>>,
     /// Set while the tick updates widgets so signal handlers do not write
     /// the same value straight back to the engine.
     suppress: Rc<Cell<bool>>,
@@ -107,10 +105,10 @@ pub struct FanControls {
 }
 
 impl FanControls {
-    /// Builds the row for one managed fan group; `engine_rc` is consulted
+    /// Builds the row for one managed fan; `engine_rc` is consulted
     /// by the signal handlers whenever the user changes a control,
     /// `case_area` is repainted when placement changes, and `client`
-    /// mirrors mode and grouping changes to the running root service.
+    /// mirrors mode changes to the running root service.
     #[must_use]
     pub fn new(
         engine_rc: &Rc<RefCell<core::Engine>>,
@@ -201,10 +199,9 @@ impl FanControls {
             &size_row,
         );
 
-        let member_checks = Self::member_check_buttons(engine_rc, id);
         let rpm_spin = Self::tach_spin();
         let floor_spin = Self::floor_spin();
-        let extra_expander = Self::extras_expander(&rpm_spin, &floor_spin, &member_checks);
+        let extra_expander = Self::extras_expander(&rpm_spin, &floor_spin);
 
         container.append(&header);
         container.append(&speed_scale);
@@ -234,7 +231,6 @@ impl FanControls {
             temp_label,
             status_label,
             case_area: case_area.clone(),
-            member_checks: Rc::new(member_checks),
             suppress: Rc::new(Cell::new(false)),
             client: client.clone(),
         };
@@ -260,33 +256,6 @@ impl FanControls {
         {
             cell.set_visible(false);
         }
-    }
-
-    /// Builds one checkbox per fan header for driving headers together as
-    /// one fan: the group leader is checked and locked, and headers already
-    /// owned by another group are locked to that group.
-    #[must_use]
-    fn member_check_buttons(
-        engine_rc: &RefCell<core::Engine>,
-        id: &core::FanId,
-    ) -> Vec<(core::FanId, CheckButton)> {
-        let engine = engine_rc.borrow();
-        engine
-            .fan_headers()
-            .into_iter()
-            .map(|header| {
-                let check = CheckButton::builder().label(&header.default_name).build();
-                if header.id == *id {
-                    // The group leader is always part of its own group.
-                    check.set_active(true);
-                    check.set_sensitive(false);
-                } else if let Some(owner) = engine.fan_owner(&header.id) {
-                    check.set_active(owner == *id);
-                    check.set_sensitive(owner == *id);
-                }
-                (header.id, check)
-            })
-            .collect()
     }
 
     /// Builds the airflow, shape and size widgets for the placement row,
@@ -372,14 +341,10 @@ impl FanControls {
         spin
     }
 
-    /// Wraps the tach correction, the speed floor and the group member
-    /// checkboxes in a collapsed section, keeping the main row simple.
+    /// Wraps the tach correction and the speed floor in a collapsed
+    /// section, keeping the main row simple.
     #[must_use]
-    fn extras_expander(
-        rpm_spin: &SpinButton,
-        floor_spin: &SpinButton,
-        member_checks: &[(core::FanId, CheckButton)],
-    ) -> Expander {
+    fn extras_expander(rpm_spin: &SpinButton, floor_spin: &SpinButton) -> Expander {
         let rpm_row = GtkBox::new(Orientation::Horizontal, 8);
         rpm_row.append(&Label::builder().label("RPM reading ×").build());
         rpm_row.append(rpm_spin);
@@ -391,15 +356,6 @@ impl FanControls {
         let extra_box = GtkBox::new(Orientation::Vertical, 2);
         extra_box.append(&floor_row);
         extra_box.append(&rpm_row);
-        extra_box.append(
-            &Label::builder()
-                .label("Drive extra headers as one fan")
-                .xalign(0.0)
-                .build(),
-        );
-        for (_, check) in member_checks {
-            extra_box.append(check);
-        }
         let expander = Expander::builder().label("Extra settings").build();
         expander.set_child(Some(&extra_box));
         expander
@@ -569,7 +525,6 @@ impl FanControls {
         self.wire_mode_signals(engine_rc);
         self.wire_curve_preset_signal(engine_rc);
         self.wire_placement_signals(engine_rc);
-        self.wire_group_signals(engine_rc);
         self.wire_rpm_signal(engine_rc);
         self.wire_floor_signal(engine_rc);
     }
@@ -718,7 +673,7 @@ impl FanControls {
         });
     }
 
-    /// Connects the placement controls to the fan group's case-view slot.
+    /// Connects the placement controls to the fan's case-view slot.
     /// Every control pushes the whole slot, so switching shape (circle ↔
     /// card) converts the drawing in place. (Dragging on the canvas moves
     /// the shape itself; see `case_view`.)
@@ -806,41 +761,9 @@ impl FanControls {
             });
         });
     }
-
-    /// Connects the group checkboxes: whatever is ticked drives this fan
-    /// as one logical fan.
-    fn wire_group_signals(&self, engine_rc: &Rc<RefCell<core::Engine>>) {
-        for (_header_id, check) in self.member_checks.iter() {
-            let rc = Rc::clone(engine_rc);
-            let checks = Rc::clone(&self.member_checks);
-            let status_label = self.status_label.clone();
-            let fan_id = self.fan_id.clone();
-            let client = self.client.clone();
-            check.connect_toggled(move |_| {
-                let members: Vec<core::FanId> = checks
-                    .iter()
-                    .filter(|(_, check)| check.is_active())
-                    .map(|(member_id, _)| member_id.clone())
-                    .collect();
-                let mut engine = rc.borrow_mut();
-                if let Err(error) = engine.set_fan_members(&fan_id, &members) {
-                    status_label.set_markup(&format!(
-                        "<span size=\"small\" foreground=\"#c0392b\">⚠ {}</span>",
-                        escape_markup(&error.to_string())
-                    ));
-                    return;
-                }
-                drop(engine);
-                client.send(dbus::FanRequest::SetMembers {
-                    leader: fan_id.to_string(),
-                    members: members.iter().map(ToString::to_string).collect(),
-                });
-            });
-        }
-    }
 }
 
-/// Copies the placement widgets' values into the fan group's case-view
+/// Copies the placement widgets' values into the fan's case-view
 /// slot, keeping the position chosen by dragging on the drawing.
 fn push_slot(
     engine_rc: &Rc<RefCell<core::Engine>>,

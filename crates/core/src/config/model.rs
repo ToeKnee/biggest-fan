@@ -21,7 +21,6 @@
 //! name = "Front 120mm intake"
 //! rpm_factor = 0.5                   # halve a tach that reports double
 //! min_speed = 0.4                    # never slower than this (an AIO pump)
-//! members = ["nct6795-p2", "nct6795-p3"]  # driven together as one fan
 //! mode = { type = "auto", sensor = "k10temp-t1" }
 //!
 //! [fans.slot]
@@ -74,11 +73,12 @@ impl Default for HysteresisConfig {
     }
 }
 
-/// One logical fan's configuration: a leader header plus any extra headers
-/// driven together with it (an AIO radiator's three fans, for example).
+/// One fan's configuration: the header it drives plus its display and
+/// control settings. Each fan owns exactly one header.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct FanConfig {
-    /// Leader header, e.g. `nct6795-p1` (see `biggest-fan scan`).
+    /// The header this fan drives, e.g. `nct6795-p1` (see `biggest-fan
+    /// scan`). Each header belongs to at most one fan.
     pub id: FanId,
     /// Display name; overrides the hardware-derived default when set.
     #[serde(default)]
@@ -99,10 +99,6 @@ pub struct FanConfig {
     /// so it effectively parks the cooler.
     #[serde(default)]
     pub min_speed: f64,
-    /// Extra headers driven as one with the leader; every member must be a
-    /// header discovered on this machine and belongs to at most one group.
-    #[serde(default)]
-    pub members: Vec<FanId>,
     /// Headers found to have nothing plugged in, or whose driver refuses
     /// software control, are disabled and hidden from the lists. Detection
     /// (`biggest-fan detect-fans`) sets this, and so does a control-loop
@@ -187,7 +183,6 @@ mod tests {
             [[fans]]
             id = "nct6795-p1"
             name = "Front 120mm intake"
-            members = ["nct6795-p2", "it87-p4"]
             mode = { type = "auto", sensor = "k10temp-t1", curve = [
                 { temp_c = 40.0, speed = 0.2 },
                 { temp_c = 80.0, speed = 1.0 },
@@ -223,12 +218,6 @@ mod tests {
             config.fans[0].min_speed == 0.0,
             "a config without min_speed has no floor"
         );
-        let members: Vec<String> = config.fans[0]
-            .members
-            .iter()
-            .map(ToString::to_string)
-            .collect();
-        assert_eq!(members, ["nct6795-p2", "it87-p4"]);
         assert!(!config.fans[0].hidden);
         let slot = config.fans[0].slot.expect("slot");
         assert_eq!(slot.airflow, crate::case::Airflow::Intake);
@@ -320,7 +309,7 @@ mod tests {
     }
 
     #[test]
-    fn fan_groups_and_hidden_flags_round_trip() {
+    fn fan_names_and_hidden_flags_round_trip() {
         let config = AppConfig {
             fans: vec![
                 FanConfig {
@@ -328,7 +317,6 @@ mod tests {
                     name: Some("AIO radiator".to_string()),
                     rpm_factor: 1.0,
                     min_speed: 0.4,
-                    members: vec![FanId::new("nct6795-p2"), FanId::new("nct6795-p3")],
                     hidden: false,
                     mode: crate::fans::FanMode::Fixed { speed: 0.5 },
                     slot: None,
@@ -338,7 +326,6 @@ mod tests {
                     name: None,
                     rpm_factor: 0.5,
                     min_speed: 0.0,
-                    members: Vec::new(),
                     hidden: true,
                     mode: crate::fans::FanMode::Off,
                     slot: None,
@@ -386,7 +373,6 @@ mod tests {
                     name: None,
                     rpm_factor: 1.0,
                     min_speed: 0.0,
-                    members: Vec::new(),
                     hidden: false,
                     mode: crate::fans::FanMode::Fixed { speed: 0.35 },
                     slot: None,
@@ -396,7 +382,6 @@ mod tests {
                     name: Some("Top exhaust".to_string()),
                     rpm_factor: 1.0,
                     min_speed: 0.0,
-                    members: Vec::new(),
                     hidden: false,
                     mode: crate::fans::FanMode::Auto {
                         sensor: SensorId::new("k10temp-t1"),

@@ -414,7 +414,7 @@ fn on_add_fan_clicked(state: &GuiState) {
 }
 
 /// Asks the service to apply and save the GUI's current config (mode and
-/// grouping changes from the controls, placement from the canvas); the
+/// name changes from the controls, placement from the canvas); the
 /// service's config file is the live one.
 fn on_save_clicked(state: &GuiState) {
     let engine = state.engine.borrow();
@@ -504,7 +504,7 @@ fn wire_interval_spin(
     });
 }
 
-/// The "Fans" panel: one control row per managed fan group (in a flow
+/// The "Fans" panel: one control row per managed fan (in a flow
 /// new rows can be inserted into) with an "add a fan header" row
 /// underneath.
 struct FanPanel {
@@ -527,8 +527,8 @@ fn wire_stress_panel(window: &ApplicationWindow, right: &GtkBox) -> Rc<stress::S
     stress_panel
 }
 
-/// Appends the fan section (header, one control row per managed fan
-/// group, then the add row under them all) to `panel`.
+/// Appends the fan section (header, one control row per managed fan,
+/// then the add row under them all) to `panel`.
 fn append_fans_panel(
     panel: &GtkBox,
     engine_rc: &Rc<RefCell<core::Engine>>,

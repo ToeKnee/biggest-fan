@@ -30,9 +30,6 @@ pub enum CoreError {
     /// Duplicate fan ids in the config.
     #[error("duplicate fan id '{0}' in the config")]
     DuplicateFan(String),
-    /// A fan header is used by more than one logical fan (group).
-    #[error("fan header '{0}' is driven by more than one fan — group it or remove it")]
-    DuplicateFanMember(String),
     /// A fan curve is not usable (empty, unsorted or out-of-range speeds).
     #[error("invalid fan curve: {0}")]
     InvalidCurve(String),

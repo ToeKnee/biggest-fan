@@ -428,7 +428,7 @@ pub struct CurveGraph {
 }
 
 impl CurveGraph {
-    /// Builds the editable graph for one fan group; `engine_rc` is
+    /// Builds the editable graph for one fan; `engine_rc` is
     /// consulted on every draw (missing or non-auto fans draw the empty
     /// frame only), and an edit goes through `client` to the service,
     /// reporting trouble on `status_label`.

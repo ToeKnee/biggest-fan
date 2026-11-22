@@ -27,12 +27,12 @@ pub struct Discovery {
 /// again (after a resume from suspend, normally).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ResyncReport {
-    /// Configured headers found again and re-bound to their group.
+    /// Configured headers found again and re-bound to their fan.
     pub rebound: usize,
-    /// Configured headers the machine is not exposing (yet); their group
+    /// Configured headers the machine is not exposing (yet); their fan
     /// keeps the old handle, so their failed writes keep being reported.
     pub missing_headers: Vec<String>,
-    /// Headers the machine now exposes that no group drives, not even one
+    /// Headers the machine now exposes that no fan drives, not even one
     /// parked as `hidden` — a header the config has never heard of.
     pub unclaimed_headers: Vec<String>,
 }
@@ -102,7 +102,6 @@ pub fn default_config(discovery: &Discovery) -> AppConfig {
                 name: None,
                 rpm_factor: 1.0,
                 min_speed: 0.0,
-                members: Vec::new(),
                 hidden: false,
                 mode: governing_sensor_for(&discovery.sensors, fan).map_or_else(
                     || FanMode::Fixed { speed: 0.5 },
@@ -218,7 +217,7 @@ pub struct TickReport {
 /// A fan as the case view should draw it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct CaseFanView {
-    /// Leader header id of this fan group (what slot edits address).
+    /// Header id of this fan (what slot edits address).
     pub id: FanId,
     /// Display name.
     pub name: String,
@@ -246,12 +245,11 @@ struct FanRuntime {
 #[derive(Debug)]
 struct FanEntry {
     fan_config: FanConfig,
-    /// Headers driven as one logical fan: the leader (`fan_config.id`) is
-    /// first, followed by any extra members.
-    headers: Vec<FanDriver>,
+    /// The one header this fan drives (its id matches `fan_config.id`).
+    header: FanDriver,
     runtime: FanRuntime,
     display_name: String,
-    /// Set when a write proved these headers cannot be driven by software
+    /// Set when a write proved this header cannot be driven by software
     /// (the driver refuses even though the register opens for writing);
     /// the fan then carries a note and is parked as `hidden`.
     lost_control: Option<String>,
@@ -298,16 +296,15 @@ impl std::fmt::Debug for Engine {
 
 impl Engine {
     /// Wires an engine to live hardware according to `options`, validating
-    /// that every configured fan header (leader and members) and auto-mode
-    /// sensor id exists. Auto fans start their ramp from the duty their
-    /// header currently holds, so taking over never dips a spinning fan.
+    /// that every configured fan header and auto-mode sensor id exists.
+    /// Auto fans start their ramp from the duty their header currently
+    /// holds, so taking over never dips a spinning fan.
     ///
     /// # Errors
     ///
     /// [`CoreError::UnknownFan`] / [`CoreError::UnknownSensor`] when the
     /// config references hardware that is not present,
     /// [`CoreError::DuplicateFan`] for repeated fan ids,
-    /// [`CoreError::DuplicateFanMember`] for headers driven by two groups,
     /// or [`CoreError::Io`] when discovery fails.
     pub fn startup(
         mut config: AppConfig,
@@ -372,17 +369,15 @@ impl Engine {
         })
     }
 
-    /// Claims configured fan groups against the discovered headers: a
-    /// group's leader header comes first, every header belongs to at most
-    /// one group, groups flagged `hidden` go to the parked list, slots are
-    /// clamped back inside the case canvas, and managed fans end up ordered
-    /// by controller name then header number.
+    /// Claims configured fans against the discovered headers: a fan's
+    /// header must exist, fans flagged `hidden` go to the parked list,
+    /// slots are clamped back inside the case canvas, and managed fans end
+    /// up ordered by controller name then header number.
     ///
     /// # Errors
     ///
-    /// [`CoreError::DuplicateFan`], [`CoreError::DuplicateFanMember`],
-    /// [`CoreError::UnknownFan`] or [`CoreError::UnknownSensor`] as for
-    /// [`Engine::startup`].
+    /// [`CoreError::DuplicateFan`], [`CoreError::UnknownFan`] or
+    /// [`CoreError::UnknownSensor`] as for [`Engine::startup`].
     fn claim_fans(
         all_headers: &[FanDriver],
         sensor_names: &BTreeMap<SensorId, String>,
@@ -391,9 +386,6 @@ impl Engine {
     ) -> Result<(Vec<FanEntry>, Vec<FanConfig>), CoreError> {
         let mut fans = Vec::new();
         let mut hidden_fans = Vec::new();
-        // Headers already driven by some logical fan; each header may
-        // belong to only one group.
-        let mut claimed: Vec<FanId> = Vec::new();
         for mut fan_config in fan_configs {
             // A slot saved off-canvas (or grown past the edge) would put
             // the circle where no drag can ever reach it again.
@@ -402,7 +394,7 @@ impl Engine {
             }
             if fans
                 .iter()
-                .any(|entry: &FanEntry| entry.headers[0].id() == &fan_config.id)
+                .any(|entry: &FanEntry| entry.fan_config.id == fan_config.id)
             {
                 return Err(CoreError::DuplicateFan(fan_config.id.to_string()));
             }
@@ -410,31 +402,21 @@ impl Engine {
                 hidden_fans.push(fan_config);
                 continue;
             }
-            let member_ids: Vec<FanId> = std::iter::once(fan_config.id.clone())
-                .chain(fan_config.members.iter().cloned())
-                .collect();
-            let mut headers = Vec::new();
-            for member_id in &member_ids {
-                if claimed.iter().any(|claimed_id| claimed_id == member_id) {
-                    return Err(CoreError::DuplicateFanMember(member_id.to_string()));
-                }
-                let matched = all_headers
-                    .iter()
-                    .find(|fan| fan.id() == member_id)
-                    .ok_or_else(|| CoreError::UnknownFan(member_id.to_string()))?;
-                headers.push(matched.clone());
-                claimed.push(member_id.clone());
-            }
+            let header = all_headers
+                .iter()
+                .find(|fan| fan.id() == &fan_config.id)
+                .ok_or_else(|| CoreError::UnknownFan(fan_config.id.to_string()))?
+                .clone();
             if let FanMode::Auto { sensor, .. } = &fan_config.mode
                 && !sensor_names.contains_key(sensor)
             {
                 return Err(CoreError::UnknownSensor(sensor.to_string()));
             }
-            let display_name = display_name_for(&fan_config, &headers);
-            let runtime = claimed_runtime(&fan_config, &headers);
+            let display_name = display_name_for(&fan_config, &header);
+            let runtime = claimed_runtime(&fan_config, &header);
             fans.push(FanEntry {
                 fan_config,
-                headers,
+                header,
                 runtime,
                 display_name,
                 lost_control: None,
@@ -442,7 +424,7 @@ impl Engine {
         }
         // Show and save fans in controller-name then header-number order,
         // whatever order the config file listed them in.
-        fans.sort_by_key(|entry| entry.headers[0].sort_key());
+        fans.sort_by_key(|entry| entry.header.sort_key());
         Ok((fans, hidden_fans))
     }
 
@@ -602,22 +584,17 @@ impl Engine {
         let effective = if matches!(mode, FanMode::Off) {
             0.0
         } else {
-            entry.headers[0].effective_speed(commanded)
+            entry.header.effective_speed(commanded)
         };
         if self.apply_writes {
-            write_headers(
-                &mut entry.headers,
-                &mode,
-                commanded,
-                &mut entry.lost_control,
-            )?;
+            write_header(&mut entry.header, &mode, commanded, &mut entry.lost_control)?;
         }
         entry.runtime.last_commanded = commanded;
         // A note when the read-back contradicts the speed just written: a
         // GPU cooler whose stop the driver refused, or one that never
         // started turning. A lost header outranks that note — it is about
         // to be parked anyway.
-        if let Some(readback) = entry.headers[0].speed_note(effective) {
+        if let Some(readback) = entry.header.speed_note(effective) {
             note.get_or_insert(readback);
         }
         if let Some(message) = &entry.lost_control {
@@ -628,18 +605,17 @@ impl Engine {
             id: entry.fan_config.id.clone(),
             name: entry.display_name.clone(),
             mode,
-            // Report the speed the leader header can actually run, not
-            // just what the curve asked for (an NVIDIA cooler parks below
-            // 25 %, holds 30 % inside the band, and takes a card-driven
-            // cooler above its floor at the floor); the ramp and hold band
-            // still use the requested value, so groups that mix driver
-            // kinds are approximated.
+            // Report the speed the header can actually run, not just what
+            // the curve asked for (an NVIDIA cooler parks below 25 %, holds
+            // 30 % inside the band, and takes a card-driven cooler above
+            // its floor at the floor); the ramp and hold band still use
+            // the requested value, so the driver's floor is only an
+            // approximation in the curve.
             commanded_speed: effective,
-            measured_percent: entry.headers.iter().find_map(FanDriver::read_percent),
+            measured_percent: entry.header.read_percent(),
             measured_rpm: entry
-                .headers
-                .iter()
-                .find_map(FanDriver::read_rpm)
+                .header
+                .read_rpm()
                 .map(|rpm| rpm * entry.fan_config.rpm_factor),
             governing_temp_c,
             note,
@@ -658,8 +634,7 @@ impl Engine {
         })
     }
 
-    /// Refreshes one fan group's mode and (unless dry-run) applies it at
-    /// once. `fan_id` may be the group leader or one of its members.
+    /// Refreshes one fan's mode and (unless dry-run) applies it at once.
     /// Switching to _auto_ continues the speed ramp from the speed the fan
     /// is already at instead of restarting it at 0, so changing curve
     /// profiles (the GUI's Quiet / Balanced / Performance dropdown) never
@@ -676,7 +651,7 @@ impl Engine {
             return Err(CoreError::UnknownSensor(sensor.to_string()));
         }
         let index = self
-            .find_group(fan_id)
+            .find_fan(fan_id)
             .ok_or_else(|| CoreError::UnknownFan(fan_id.to_string()))?;
         let entry = &mut self.fans[index];
         // The floor is applied to both the write below and the ramp baseline,
@@ -686,12 +661,10 @@ impl Engine {
         entry.runtime = ramp_baseline_for(mode, entry.runtime.last_commanded, floor);
         let commanded = entry.runtime.last_commanded;
         if self.apply_writes {
-            for header in &mut entry.headers {
-                match mode {
-                    FanMode::Off => header.stop()?,
-                    FanMode::Fixed { .. } => header.apply(commanded)?,
-                    FanMode::Auto { .. } => {}
-                }
+            match mode {
+                FanMode::Off => entry.header.stop()?,
+                FanMode::Fixed { .. } => entry.header.apply(commanded)?,
+                FanMode::Auto { .. } => {}
             }
         }
         Ok(())
@@ -700,15 +673,15 @@ impl Engine {
     /// Current mode of a managed fan (used to keep curves when re-binding).
     #[must_use]
     pub fn fan_mode(&self, fan_id: &FanId) -> Option<FanMode> {
-        self.find_group(fan_id)
+        self.find_fan(fan_id)
             .map(|index| self.fans[index].fan_config.mode.clone())
     }
 
-    /// Index of the fan group whose leader or members include `fan_id`.
-    fn find_group(&self, fan_id: &FanId) -> Option<usize> {
+    /// Index of the managed fan driving `fan_id`'s header.
+    fn find_fan(&self, fan_id: &FanId) -> Option<usize> {
         self.fans
             .iter()
-            .position(|entry| entry.headers.iter().any(|header| header.id() == fan_id))
+            .position(|entry| entry.header.id() == fan_id)
     }
 
     /// Every fan header this machine exposes, managed or not.
@@ -717,13 +690,13 @@ impl Engine {
         self.all_headers.iter().map(FanDriver::descriptor).collect()
     }
 
-    /// Fan headers no managed group drives yet (parked ones included) —
+    /// Fan headers no managed fan drives yet (parked ones included) —
     /// the pool the GUI's "add fan" choice picks from.
     #[must_use]
     pub fn unclaimed_headers(&self) -> Vec<FanDescriptor> {
         self.all_headers
             .iter()
-            .filter(|header| self.find_group(header.id()).is_none())
+            .filter(|header| self.find_fan(header.id()).is_none())
             .map(FanDriver::descriptor)
             .collect()
     }
@@ -737,11 +710,10 @@ impl Engine {
     /// # Errors
     ///
     /// [`CoreError::UnknownFan`] when the machine has no such header,
-    /// [`CoreError::DuplicateFanMember`] when a managed group already
-    /// drives it.
+    /// [`CoreError::DuplicateFan`] when a managed fan already drives it.
     pub fn add_fan(&mut self, fan_id: &FanId) -> Result<(), CoreError> {
-        if self.find_group(fan_id).is_some() {
-            return Err(CoreError::DuplicateFanMember(fan_id.to_string()));
+        if self.find_fan(fan_id).is_some() {
+            return Err(CoreError::DuplicateFan(fan_id.to_string()));
         }
         let mut fan_config = if let Some(position) = self
             .hidden_fans
@@ -762,7 +734,6 @@ impl Engine {
                 name: None,
                 rpm_factor: 1.0,
                 min_speed: 0.0,
-                members: Vec::new(),
                 hidden: false,
                 mode: governing_sensor_for(&self.sensors, &header.descriptor()).map_or_else(
                     || FanMode::Fixed { speed: 0.5 },
@@ -775,104 +746,28 @@ impl Engine {
             }
         };
         // A revived config may name a header whose hardware has since
-        // vanished; without its leader it cannot be managed.
-        let headers: Vec<FanDriver> = std::iter::once(fan_id)
-            .chain(fan_config.members.iter())
-            .filter_map(|member_id| {
-                self.all_headers
-                    .iter()
-                    .find(|header| header.id() == member_id)
-                    .cloned()
-            })
-            .collect();
-        if headers.is_empty() || headers[0].id() != fan_id {
+        // vanished; without it the fan cannot be managed.
+        let Some(header) = self
+            .all_headers
+            .iter()
+            .find(|header| header.id() == fan_id)
+            .cloned()
+        else {
             return Err(CoreError::UnknownFan(fan_id.to_string()));
-        }
+        };
         if let Some(slot) = fan_config.slot {
             fan_config.slot = Some(fit_slot(slot, &self.config.case));
         }
-        let display_name = display_name_for(&fan_config, &headers);
-        let runtime = claimed_runtime(&fan_config, &headers);
+        let display_name = display_name_for(&fan_config, &header);
+        let runtime = claimed_runtime(&fan_config, &header);
         self.fans.push(FanEntry {
             fan_config,
-            headers,
+            header,
             runtime,
             display_name,
             lost_control: None,
         });
-        self.fans.sort_by_key(|entry| entry.headers[0].sort_key());
-        Ok(())
-    }
-
-    /// Extra headers driven together with `fan_id`'s group (empty when it
-    /// drives a single header). `fan_id` may be the leader or a member.
-    #[must_use]
-    pub fn fan_group(&self, fan_id: &FanId) -> Option<Vec<FanId>> {
-        let index = self.find_group(fan_id)?;
-        Some(self.fans[index].fan_config.members.clone())
-    }
-
-    /// The leader of the group currently driving `header_id`, if that
-    /// header is managed at all.
-    #[must_use]
-    pub fn fan_owner(&self, header_id: &FanId) -> Option<FanId> {
-        self.fans
-            .iter()
-            .find(|entry| entry.headers.iter().any(|header| header.id() == header_id))
-            .map(|entry| entry.fan_config.id.clone())
-    }
-
-    /// Replaces the extra headers driven together with `fan_id`'s group,
-    /// so several headers (an AIO's fans, for example) behave as one.
-    /// `member_ids` excludes the group's leader.
-    ///
-    /// # Errors
-    ///
-    /// [`CoreError::UnknownFan`] when `fan_id` is not managed or a member
-    /// header does not exist, [`CoreError::DuplicateFanMember`] when a
-    /// member is already driven by another group.
-    pub fn set_fan_members(
-        &mut self,
-        fan_id: &FanId,
-        member_ids: &[FanId],
-    ) -> Result<(), CoreError> {
-        let index = self
-            .find_group(fan_id)
-            .ok_or_else(|| CoreError::UnknownFan(fan_id.to_string()))?;
-        let leader = self.fans[index].fan_config.id.clone();
-        let member_ids: Vec<FanId> = member_ids
-            .iter()
-            .filter(|id| **id != leader)
-            .cloned()
-            .collect();
-        for member_id in &member_ids {
-            if !self
-                .all_headers
-                .iter()
-                .any(|header| header.id() == member_id)
-            {
-                return Err(CoreError::UnknownFan(member_id.to_string()));
-            }
-            if self.fans.iter().enumerate().any(|(other, entry)| {
-                other != index && entry.headers.iter().any(|header| header.id() == member_id)
-            }) {
-                return Err(CoreError::DuplicateFanMember(member_id.to_string()));
-            }
-        }
-        let mut headers = Vec::new();
-        for header_id in std::iter::once(&leader).chain(member_ids.iter()) {
-            let header = self
-                .all_headers
-                .iter()
-                .find(|header| header.id() == header_id)
-                .ok_or_else(|| CoreError::UnknownFan(header_id.to_string()))?;
-            headers.push(header.clone());
-        }
-        let entry = &mut self.fans[index];
-        entry.headers = headers;
-        entry.fan_config.members = member_ids;
-        let name = display_name_for(&entry.fan_config, &entry.headers);
-        entry.display_name = name;
+        self.fans.sort_by_key(|entry| entry.header.sort_key());
         Ok(())
     }
 
@@ -880,14 +775,14 @@ impl Engine {
     /// or the auto-placed fallback when none is set.
     #[must_use]
     pub fn fan_slot(&self, fan_id: &FanId) -> Option<FanSlot> {
-        let index = self.find_group(fan_id)?;
+        let index = self.find_fan(fan_id)?;
         let entry = &self.fans[index];
         Some(entry.fan_config.slot.unwrap_or_else(|| {
             default_slot(
                 index,
                 self.fans.len(),
                 &self.config.case,
-                is_gpu_cooler(&entry.headers[0]),
+                is_gpu_cooler(&entry.header),
             )
         }))
     }
@@ -900,13 +795,13 @@ impl Engine {
     /// [`CoreError::UnknownFan`] when the fan is not managed.
     pub fn set_fan_slot(&mut self, fan_id: &FanId, slot: FanSlot) -> Result<(), CoreError> {
         let index = self
-            .find_group(fan_id)
+            .find_fan(fan_id)
             .ok_or_else(|| CoreError::UnknownFan(fan_id.to_string()))?;
         self.fans[index].fan_config.slot = Some(fit_slot(slot, &self.config.case));
         Ok(())
     }
 
-    /// Renames a managed fan group for display (and for `Save config`). An
+    /// Renames a managed fan for display (and for `Save config`). An
     /// empty name falls back to the hardware-derived default again.
     ///
     /// # Errors
@@ -914,12 +809,12 @@ impl Engine {
     /// [`CoreError::UnknownFan`] when the fan is not managed.
     pub fn set_fan_name(&mut self, fan_id: &FanId, name: &str) -> Result<(), CoreError> {
         let index = self
-            .find_group(fan_id)
+            .find_fan(fan_id)
             .ok_or_else(|| CoreError::UnknownFan(fan_id.to_string()))?;
         let trimmed = name.trim();
         let entry = &mut self.fans[index];
         entry.fan_config.name = (!trimmed.is_empty()).then(|| trimmed.to_string());
-        entry.display_name = display_name_for(&entry.fan_config, &entry.headers);
+        entry.display_name = display_name_for(&entry.fan_config, &entry.header);
         Ok(())
     }
 
@@ -932,7 +827,7 @@ impl Engine {
     /// [`CoreError::UnknownFan`] when the fan is not managed.
     pub fn set_fan_rpm_factor(&mut self, fan_id: &FanId, factor: f64) -> Result<(), CoreError> {
         let index = self
-            .find_group(fan_id)
+            .find_fan(fan_id)
             .ok_or_else(|| CoreError::UnknownFan(fan_id.to_string()))?;
         self.fans[index].fan_config.rpm_factor = factor.clamp(0.01, 8.0);
         Ok(())
@@ -941,7 +836,7 @@ impl Engine {
     /// The tachometer correction currently configured for a managed fan.
     #[must_use]
     pub fn fan_rpm_factor(&self, fan_id: &FanId) -> Option<f64> {
-        self.find_group(fan_id)
+        self.find_fan(fan_id)
             .map(|index| self.fans[index].fan_config.rpm_factor)
     }
 
@@ -949,7 +844,7 @@ impl Engine {
     /// fraction the engine may command in fixed or auto mode.
     #[must_use]
     pub fn fan_min_speed(&self, fan_id: &FanId) -> Option<f64> {
-        self.find_group(fan_id)
+        self.find_fan(fan_id)
             .map(|index| self.fans[index].fan_config.min_speed)
     }
 
@@ -963,13 +858,13 @@ impl Engine {
     /// [`CoreError::UnknownFan`] when the fan is not managed.
     pub fn set_fan_min_speed(&mut self, fan_id: &FanId, speed: f64) -> Result<(), CoreError> {
         let index = self
-            .find_group(fan_id)
+            .find_fan(fan_id)
             .ok_or_else(|| CoreError::UnknownFan(fan_id.to_string()))?;
         self.fans[index].fan_config.min_speed = speed.clamp(0.0, 1.0);
         Ok(())
     }
 
-    /// Saves the live config (including mode, group and slot changes made
+    /// Saves the live config (including mode, name and slot changes made
     /// through the engine) back to its file, keeping hidden headers
     /// present but disabled.
     ///
@@ -1000,10 +895,10 @@ impl Engine {
     }
 
     /// Swaps in a whole config (the D-Bus service calls this when the GUI
-    /// saves its edits): fan groups are re-claimed against the discovered
+    /// saves its edits): fans are re-claimed against the discovered
     /// headers and sensor display names refreshed, just like at startup.
-    /// Groups keep the ramp position of the group they replace, so saving
-    /// a config never dips a running fan.
+    /// Fans keep the ramp position of the fan they replace, so saving a
+    /// config never dips a running fan.
     ///
     /// # Errors
     ///
@@ -1056,12 +951,12 @@ impl Engine {
     ///
     /// * sensors are discovered again — their ids come from the chip name,
     ///   so a re-numbered directory keeps its id and its config name;
-    /// * `pwmN` headers are discovered again and every group is re-bound to
+    /// * `pwmN` headers are discovered again and every fan is re-bound to
     ///   the header with its id, which re-asserts manual control on the next
     ///   write;
     /// * NVIDIA coolers keep their NVML handles (NVML is initialised once per
     ///   process) and forget who holds their fans, see [`FanDriver::reset_state`];
-    /// * every group's ramp restarts from the duty the hardware holds now, so
+    /// * every fan's ramp restarts from the duty the hardware holds now, so
     ///   a fan the firmware left at full speed eases down instead of the
     ///   engine assuming its pre-sleep position.
     ///
@@ -1113,39 +1008,31 @@ impl Engine {
 
         let mut report = ResyncReport::default();
         for entry in &mut self.fans {
-            let previous = std::mem::take(&mut entry.headers);
-            let mut headers = Vec::with_capacity(previous.len());
-            for header in previous {
-                let id = header.id().clone();
-                if let Some(found) = self.all_headers.iter().find(|found| found.id() == &id) {
-                    headers.push(found.clone());
-                    report.rebound += 1;
-                } else {
-                    // Not back yet: keep the stale handle so the control
-                    // loop reports the failed writes for this fan.
-                    headers.push(header);
-                    report.missing_headers.push(id.to_string());
-                }
+            let id = entry.header.id().clone();
+            if let Some(found) = self.all_headers.iter().find(|found| found.id() == &id) {
+                entry.header = found.clone();
+                report.rebound += 1;
+            } else {
+                // Not back yet: keep the stale handle so the control
+                // loop reports the failed writes for this fan.
+                report.missing_headers.push(id.to_string());
             }
-            entry.headers = headers;
-            entry.display_name = display_name_for(&entry.fan_config, &entry.headers);
-            entry.runtime = claimed_runtime(&entry.fan_config, &entry.headers);
+            entry.display_name = display_name_for(&entry.fan_config, &entry.header);
+            entry.runtime = claimed_runtime(&entry.fan_config, &entry.header);
             // Whatever made a header unmanageable may have gone with the
             // sleep; the next write decides whether it is still true.
             entry.lost_control = None;
         }
 
-        // Headers no group drives at all. A header belonging to a group the
-        // config parks as `hidden` (Detect found nothing plugged in, or the
+        // Headers no fan drives at all. A header belonging to a config the
+        // engine parks as `hidden` (Detect found nothing plugged in, or the
         // driver refuses software control) is deliberately left alone, so
         // naming it after every resume would just be noise.
         let driven: Vec<FanId> = self
             .fans
             .iter()
-            .flat_map(|entry| entry.headers.iter().map(|header| header.id().clone()))
-            .chain(self.hidden_fans.iter().flat_map(|hidden| {
-                std::iter::once(hidden.id.clone()).chain(hidden.members.iter().cloned())
-            }))
+            .map(|entry| entry.header.id().clone())
+            .chain(self.hidden_fans.iter().map(|hidden| hidden.id.clone()))
             .collect();
         report.unclaimed_headers = self
             .all_headers
@@ -1196,16 +1083,16 @@ impl Engine {
                         index,
                         self.fans.len(),
                         &self.config.case,
-                        is_gpu_cooler(&entry.headers[0]),
+                        is_gpu_cooler(&entry.header),
                     )
                 });
                 let status = self
                     .last_report
                     .fans
                     .iter()
-                    .find(|status| &status.id == entry.headers[0].id());
+                    .find(|status| &status.id == entry.header.id());
                 CaseFanView {
-                    id: entry.headers[0].id().clone(),
+                    id: entry.header.id().clone(),
                     name: entry.display_name.clone(),
                     slot,
                     speed: status.map_or(0.0, |status| status.commanded_speed),
@@ -1222,13 +1109,12 @@ impl Engine {
         &self.sensors
     }
 
-    /// The managed fan groups as (leader id, display name), in listing
-    /// order.
+    /// The managed fans as (header id, display name), in listing order.
     #[must_use]
     pub fn managed_fans(&self) -> Vec<(FanId, String)> {
         self.fans
             .iter()
-            .map(|entry| (entry.headers[0].id().clone(), entry.display_name.clone()))
+            .map(|entry| (entry.header.id().clone(), entry.display_name.clone()))
             .collect()
     }
 
@@ -1289,15 +1175,15 @@ impl Engine {
         self.apply_writes
     }
 
-    /// Spins every managed fan up to full, reads tachometers after
-    /// `settle`, and disables any fan group whose headers either report no
-    /// RPM (nothing is plugged in) or refuse the spin-up write because the
-    /// driver exposes them as not software-controllable. Groups with a
-    /// tachometer that spin up stay visible. Newly-hidden groups go back to
+    /// Spins every managed fan up to full, reads its tachometer after
+    /// `settle`, and disables any fan whose header either reports no RPM
+    /// (nothing is plugged in) or refuses the spin-up write because the
+    /// driver exposes it as not software-controllable. Fans with a
+    /// tachometer that spin up stay visible. Newly-hidden fans go back to
     /// the motherboard's control where possible and are recorded in the
     /// config (`hidden = true`) until re-enabled by editing the file.
     ///
-    /// Returns the leader ids of the newly-hidden groups.
+    /// Returns the ids of the newly-hidden fans.
     ///
     /// # Errors
     ///
@@ -1311,18 +1197,16 @@ impl Engine {
             ));
         }
         for entry in &mut self.fans {
-            for header in &mut entry.headers {
-                if let Err(error) = header.apply(1.0) {
-                    if header.write_refused(&error) {
-                        // A permission error on a register that opens for
-                        // writing is the driver refusing software control,
-                        // not a lack of privileges: disable this group.
-                        entry.lost_control = Some(format!(
-                            "{} refuses writes — not software-controllable",
-                            header.id()
-                        ));
-                        break;
-                    }
+            if let Err(error) = entry.header.apply(1.0) {
+                if entry.header.write_refused(&error) {
+                    // A permission error on a register that opens for
+                    // writing is the driver refusing software control,
+                    // not a lack of privileges: disable this fan.
+                    entry.lost_control = Some(format!(
+                        "{} refuses writes — not software-controllable",
+                        entry.header.id()
+                    ));
+                } else {
                     return Err(error);
                 }
             }
@@ -1335,11 +1219,8 @@ impl Engine {
             .enumerate()
             .filter(|(_index, entry)| {
                 entry.lost_control.is_some()
-                    || (entry.headers.iter().any(FanDriver::tach_supported)
-                        && !entry
-                            .headers
-                            .iter()
-                            .any(|header| header.read_rpm().is_some_and(|rpm| rpm > 1.0)))
+                    || (entry.header.tach_supported()
+                        && !entry.header.read_rpm().is_some_and(|rpm| rpm > 1.0))
             })
             .map(|(index, _entry)| index)
             .collect();
@@ -1347,14 +1228,12 @@ impl Engine {
         let mut newly_hidden = Vec::new();
         for index in parked.into_iter().rev() {
             let mut entry = self.fans.remove(index);
-            for header in &mut entry.headers {
-                // Zero the duty the spin-up left at full speed, then hand
-                // the enable mode back. A driver-refused header refuses
-                // these too; ignoring the failure is correct — there is
-                // nothing left to fix.
-                header.stop().ok();
-                header.restore_control().ok();
-            }
+            // Zero the duty the spin-up left at full speed, then hand
+            // the enable mode back. A driver-refused header refuses
+            // these too; ignoring the failure is correct — there is
+            // nothing left to fix.
+            entry.header.stop().ok();
+            entry.header.restore_control().ok();
             newly_hidden.push(entry.fan_config.id.clone());
             entry.fan_config.hidden = true;
             self.hidden_fans.push(entry.fan_config);
@@ -1364,14 +1243,10 @@ impl Engine {
         // detection spin-up.
         for entry in &mut self.fans {
             if matches!(entry.fan_config.mode, FanMode::Off) {
-                for header in &mut entry.headers {
-                    header.stop()?;
-                }
+                entry.header.stop()?;
             } else {
                 let speed = entry.runtime.last_commanded;
-                for header in &mut entry.headers {
-                    header.apply(speed)?;
-                }
+                entry.header.apply(speed)?;
             }
         }
         Ok(newly_hidden)
@@ -1417,44 +1292,40 @@ impl Engine {
         }
         let mut first_error = None;
         for entry in &mut self.fans {
-            for header in &mut entry.headers {
-                if let Err(error) = header.restore_control() {
-                    first_error.get_or_insert(error);
-                }
+            if let Err(error) = entry.header.restore_control() {
+                first_error.get_or_insert(error);
             }
         }
         first_error.map_or(Ok(()), Err)
     }
 }
 
-/// Commands one fan group's headers: a stop where _Off_ asks for one,
-/// otherwise the commanded fraction. A header whose driver refuses software
-/// control entirely is reported through `lost_control` (the tick parks that
-/// group afterwards) instead of failing every tick from then on.
-fn write_headers(
-    headers: &mut [FanDriver],
+/// Commands one fan's header: a stop where _Off_ asks for one, otherwise
+/// the commanded fraction. A header whose driver refuses software control
+/// entirely is reported through `lost_control` (the tick parks that fan
+/// afterwards) instead of failing every tick from then on.
+fn write_header(
+    header: &mut FanDriver,
     mode: &FanMode,
     commanded: f64,
     lost_control: &mut Option<String>,
 ) -> Result<(), CoreError> {
-    for header in headers {
-        let written = if matches!(mode, FanMode::Off) {
-            header.stop()
-        } else {
-            header.apply(commanded)
-        };
-        if let Err(error) = written {
-            if header.write_refused(&error) {
-                // The register opens for writing yet the driver still
-                // refuses: software can never drive this header.
-                *lost_control = Some(format!(
-                    "{} refuses writes — the driver exposes this header as not software-controllable; disabled",
-                    header.id()
-                ));
-                break;
-            }
-            return Err(error);
+    let written = if matches!(mode, FanMode::Off) {
+        header.stop()
+    } else {
+        header.apply(commanded)
+    };
+    if let Err(error) = written {
+        if header.write_refused(&error) {
+            // The register opens for writing yet the driver still
+            // refuses: software can never drive this header.
+            *lost_control = Some(format!(
+                "{} refuses writes — the driver exposes this header as not software-controllable; disabled",
+                header.id()
+            ));
+            return Ok(());
         }
+        return Err(error);
     }
     Ok(())
 }
@@ -1476,17 +1347,13 @@ fn fail_safe_note(
     )
 }
 
-/// Group display name: a user-chosen `name` always wins; a lone header
-/// shows its hardware default, and a group notes its extra members.
-fn display_name_for(fan_config: &FanConfig, headers: &[FanDriver]) -> String {
-    if let Some(name) = &fan_config.name {
-        return name.clone();
-    }
-    let primary = headers[0].default_name();
-    match headers.len() {
-        1 => primary.to_string(),
-        extra => format!("{primary} (+{} more)", extra - 1),
-    }
+/// Fan display name: a user-chosen `name` always wins; otherwise the
+/// header's hardware default.
+fn display_name_for(fan_config: &FanConfig, header: &FanDriver) -> String {
+    fan_config
+        .name
+        .clone()
+        .unwrap_or_else(|| header.default_name().to_string())
 }
 
 /// GPU ordinal encoded in an NVML sensor id, e.g. `nvidia-gpu0-t1` → 0.
@@ -1510,17 +1377,14 @@ fn approach(from: f64, to: f64, step: f64) -> f64 {
     }
 }
 
-/// The runtime a freshly claimed group starts with: the ramp baseline is
+/// The runtime a freshly claimed fan starts with: the ramp baseline is
 /// seeded from the duty the header actually holds at takeover — what the
 /// BIOS, the card's own policy or a previous run left behind — so taking
 /// over a spinning fan eases it toward the curve instead of dropping it to
 /// the first ramp step and crawling back up. Headers whose duty cannot be
 /// read (or headers already parked at 0) start from 0.
-fn claimed_runtime(fan_config: &FanConfig, headers: &[FanDriver]) -> FanRuntime {
-    let held = headers
-        .iter()
-        .find_map(FanDriver::read_percent)
-        .unwrap_or(0.0);
+fn claimed_runtime(fan_config: &FanConfig, header: &FanDriver) -> FanRuntime {
+    let held = header.read_percent().unwrap_or(0.0);
     ramp_baseline_for(&fan_config.mode, held, fan_config.min_speed.clamp(0.0, 1.0))
 }
 
@@ -1663,7 +1527,6 @@ mod tests {
                 name: Some("Rear exhaust".to_string()),
                 rpm_factor: 1.0,
                 min_speed: 0.0,
-                members: Vec::new(),
                 hidden: false,
                 mode: FanMode::Auto {
                     sensor: SensorId::new("k10temp-t1"),
@@ -2087,7 +1950,7 @@ mod tests {
         assert_eq!(report.rebound, 0);
         assert_eq!(report.missing_headers, vec!["nct6795-p1".to_string()]);
         assert!(report.unclaimed_headers.is_empty(), "{report:?}");
-        // The group stays managed — its writes fail loudly until the
+        // The fan stays managed — its writes fail loudly until the
         // controller returns — rather than the fan leaving the config.
         assert!(
             engine
@@ -2109,7 +1972,7 @@ mod tests {
         );
 
         // What Detect does to a header with nothing plugged in: park the
-        // group as `hidden`. Nothing drives it on purpose, so a resume has
+        // fan as `hidden`. Nothing drives it on purpose, so a resume has
         // nothing to tell the user about it.
         engine.park_fans(&[FanId::new("nct6795-p1")]);
         let report = engine.resync_hardware().expect("resync");
@@ -2297,7 +2160,6 @@ mod tests {
                 name: None,
                 rpm_factor: 1.0,
                 min_speed: 0.0,
-                members: Vec::new(),
                 hidden: false,
                 mode: FanMode::Fixed { speed: 1.0 },
                 slot: None,
@@ -2332,7 +2194,6 @@ mod tests {
                 name: None,
                 rpm_factor: 1.0,
                 min_speed: 0.0,
-                members: Vec::new(),
                 hidden: false,
                 mode: FanMode::Off,
                 slot: None,
@@ -2348,7 +2209,6 @@ mod tests {
                 name: None,
                 rpm_factor: 1.0,
                 min_speed: 0.0,
-                members: Vec::new(),
                 hidden: false,
                 mode: FanMode::Auto {
                     sensor: SensorId::new("k10temp-t9"),
@@ -2535,92 +2395,16 @@ mod tests {
             .to_string()
     }
 
-    fn fixed_fan(id: &str, members: &[&str], hidden: bool) -> FanConfig {
+    fn fixed_fan(id: &str, hidden: bool) -> FanConfig {
         FanConfig {
             id: FanId::new(id),
             name: None,
             rpm_factor: 1.0,
             min_speed: 0.0,
-            members: members.iter().map(|id| FanId::new(*id)).collect(),
             hidden,
             mode: FanMode::Fixed { speed: 0.5 },
             slot: None,
         }
-    }
-
-    #[test]
-    fn fan_groups_drive_every_member_header() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        fixture(dir.path());
-        std::fs::write(dir.path().join("hwmon1/pwm2"), "0\n").expect("pwm2");
-        std::fs::write(dir.path().join("hwmon1/fan2_input"), "1234\n").expect("fan2");
-        let mut engine = engine_over(
-            dir.path(),
-            true,
-            vec![fixed_fan("nct6795-p1", &["nct6795-p2"], false)],
-        )
-        .expect("engine");
-        assert_eq!(
-            engine.fan_group(&FanId::new("nct6795-p1")).expect("group"),
-            vec![FanId::new("nct6795-p2")]
-        );
-        // A group of two gets a display name that says so.
-        assert_eq!(engine.managed_fans()[0].1, "Fan 1 on NCT 6795 (+1 more)");
-        let report = engine.tick().expect("tick");
-        assert_eq!(read_pwm(dir.path()), 128);
-        assert_eq!(read_sysfs(dir.path(), "pwm2"), "128");
-        assert_eq!(report.fans[0].measured_rpm, Some(1000.0));
-    }
-
-    #[test]
-    fn group_member_conflicts_are_rejected() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        fixture(dir.path());
-        std::fs::write(dir.path().join("hwmon1/pwm2"), "0\n").expect("pwm2");
-
-        // The same header claimed by two groups.
-        let doubled = engine_over(
-            dir.path(),
-            false,
-            vec![
-                fixed_fan("nct6795-p1", &["nct6795-p2"], false),
-                fixed_fan("nct6795-p2", &[], false),
-            ],
-        )
-        .expect_err("header driven twice");
-        assert!(matches!(doubled, CoreError::DuplicateFanMember(_)));
-
-        // A header that does not exist.
-        let unknown = engine_over(
-            dir.path(),
-            false,
-            vec![fixed_fan("nct6795-p1", &["nct6795-p7"], false)],
-        )
-        .expect_err("unknown member");
-        assert!(matches!(unknown, CoreError::UnknownFan(_)));
-    }
-
-    #[test]
-    fn set_fan_members_reattaches_headers_live() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        fixture(dir.path());
-        std::fs::write(dir.path().join("hwmon1/pwm2"), "0\n").expect("pwm2");
-        let mut engine = engine_over(dir.path(), true, vec![fixed_fan("nct6795-p1", &[], false)])
-            .expect("engine");
-        engine
-            .set_fan_members(&FanId::new("nct6795-p1"), &[FanId::new("nct6795-p2")])
-            .expect("grouped");
-        engine
-            .set_fan_mode(&FanId::new("nct6795-p1"), &FanMode::Off)
-            .expect("off via leader");
-        assert_eq!(read_sysfs(dir.path(), "pwm2"), "0");
-        // Off writes enable=0 on both headers.
-        assert_eq!(read_sysfs(dir.path(), "pwm1_enable"), "0");
-        // A member id also names its group.
-        assert_eq!(
-            engine.fan_mode(&FanId::new("nct6795-p2")),
-            Some(FanMode::Off)
-        );
     }
 
     #[test]
@@ -2633,8 +2417,8 @@ mod tests {
             dir.path(),
             false,
             vec![
-                fixed_fan("nct6795-p1", &[], false),
-                fixed_fan("nct6795-p2", &[], true),
+                fixed_fan("nct6795-p1", false),
+                fixed_fan("nct6795-p2", true),
             ],
         )
         .expect("engine");
@@ -2661,8 +2445,8 @@ mod tests {
             dir.path(),
             true,
             vec![
-                fixed_fan("nct6795-p1", &[], false),
-                fixed_fan("nct6795-p2", &[], false),
+                fixed_fan("nct6795-p1", false),
+                fixed_fan("nct6795-p2", false),
             ],
         )
         .expect("engine");
@@ -2696,8 +2480,8 @@ mod tests {
     fn detect_requires_write_access() {
         let dir = tempfile::tempdir().expect("tempdir");
         fixture(dir.path());
-        let mut engine = engine_over(dir.path(), false, vec![fixed_fan("nct6795-p1", &[], false)])
-            .expect("engine");
+        let mut engine =
+            engine_over(dir.path(), false, vec![fixed_fan("nct6795-p1", false)]).expect("engine");
         let error = engine
             .detect_unconnected_fans(std::time::Duration::from_millis(1))
             .expect_err("dry run must refuse");
@@ -2737,8 +2521,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         fixture(dir.path());
         std::fs::write(dir.path().join("hwmon1/pwm2"), "0\n").expect("pwm2");
-        let mut engine = engine_over(dir.path(), true, vec![fixed_fan("nct6795-p1", &[], false)])
-            .expect("engine");
+        let mut engine =
+            engine_over(dir.path(), true, vec![fixed_fan("nct6795-p1", false)]).expect("engine");
         engine.tick().expect("tick at 50%");
         assert_eq!(read_pwm(dir.path()), 128);
 
@@ -2746,9 +2530,9 @@ mod tests {
             fans: vec![
                 FanConfig {
                     mode: FanMode::Fixed { speed: 0.25 },
-                    ..fixed_fan("nct6795-p1", &[], false)
+                    ..fixed_fan("nct6795-p1", false)
                 },
-                fixed_fan("nct6795-p2", &[], true),
+                fixed_fan("nct6795-p2", true),
             ],
             ..AppConfig::default()
         };
@@ -2777,7 +2561,7 @@ mod tests {
         // A config naming hardware that is not present is rejected,
         // leaving the running engine untouched.
         let bogus = AppConfig {
-            fans: vec![fixed_fan("nope-p9", &[], false)],
+            fans: vec![fixed_fan("nope-p9", false)],
             ..AppConfig::default()
         };
         assert!(matches!(
@@ -2824,8 +2608,8 @@ mod tests {
             dir.path(),
             false,
             vec![
-                fixed_fan("nct6795-p1", &[], false),
-                fixed_fan("nct6795-p2", &[], false),
+                fixed_fan("nct6795-p1", false),
+                fixed_fan("nct6795-p2", false),
             ],
         )
         .expect("engine");
@@ -2847,8 +2631,8 @@ mod tests {
         fixture(dir.path());
         // The chip originally drives this header automatically.
         std::fs::write(dir.path().join("hwmon1/pwm1_enable"), "2\n").expect("enable 2");
-        let mut engine = engine_over(dir.path(), true, vec![fixed_fan("nct6795-p1", &[], false)])
-            .expect("engine");
+        let mut engine =
+            engine_over(dir.path(), true, vec![fixed_fan("nct6795-p1", false)]).expect("engine");
         engine.tick().expect("tick");
         assert_eq!(read_sysfs(dir.path(), "pwm1_enable"), "1");
         engine.release_control().expect("release");
@@ -2859,8 +2643,8 @@ mod tests {
     fn fan_slots_round_trip_and_reject_unknown_fans() {
         let dir = tempfile::tempdir().expect("tempdir");
         fixture(dir.path());
-        let mut engine = engine_over(dir.path(), false, vec![fixed_fan("nct6795-p1", &[], false)])
-            .expect("engine");
+        let mut engine =
+            engine_over(dir.path(), false, vec![fixed_fan("nct6795-p1", false)]).expect("engine");
         // Auto-placed fallback slot before anything is configured.
         let auto = engine.fan_slot(&FanId::new("nct6795-p1")).expect("slot");
         assert!((auto.diameter - 60.0).abs() < 1e-9);
@@ -2913,8 +2697,8 @@ mod tests {
     fn far_off_canvas_slots_are_clamped_back_into_the_case() {
         let dir = tempfile::tempdir().expect("tempdir");
         fixture(dir.path());
-        let mut engine = engine_over(dir.path(), false, vec![fixed_fan("nct6795-p1", &[], false)])
-            .expect("engine");
+        let mut engine =
+            engine_over(dir.path(), false, vec![fixed_fan("nct6795-p1", false)]).expect("engine");
         let far = FanSlot {
             x: 4000.0,
             y: -100.0,
@@ -2947,7 +2731,7 @@ mod tests {
         // can draw and drag it.
         let dir = tempfile::tempdir().expect("tempdir");
         fixture(dir.path());
-        let mut fan = fixed_fan("nct6795-p1", &[], false);
+        let mut fan = fixed_fan("nct6795-p1", false);
         fan.slot = Some(FanSlot {
             x: 282.0,
             y: 900.0,
@@ -2965,8 +2749,8 @@ mod tests {
     fn rectangular_slots_are_clamped_and_survive_saving() {
         let dir = tempfile::tempdir().expect("tempdir");
         fixture(dir.path());
-        let mut engine = engine_over(dir.path(), false, vec![fixed_fan("nct6795-p1", &[], false)])
-            .expect("engine");
+        let mut engine =
+            engine_over(dir.path(), false, vec![fixed_fan("nct6795-p1", false)]).expect("engine");
         // A card wider than the 300-wide canvas is trimmed to fit inside
         // the padded walls.
         engine
@@ -3008,8 +2792,8 @@ mod tests {
         fixture(dir.path());
         std::fs::write(dir.path().join("hwmon1/pwm2"), "0\n").expect("pwm2");
         std::fs::write(dir.path().join("hwmon1/fan2_input"), "800\n").expect("fan2");
-        let mut engine = engine_over(dir.path(), false, vec![fixed_fan("nct6795-p1", &[], false)])
-            .expect("engine");
+        let mut engine =
+            engine_over(dir.path(), false, vec![fixed_fan("nct6795-p1", false)]).expect("engine");
         let unclaimed: Vec<String> = engine
             .unclaimed_headers()
             .into_iter()
@@ -3034,7 +2818,7 @@ mod tests {
         let again = engine
             .add_fan(&FanId::new("nct6795-p2"))
             .expect_err("already managed");
-        assert!(matches!(again, CoreError::DuplicateFanMember(_)));
+        assert!(matches!(again, CoreError::DuplicateFan(_)));
         let missing = engine
             .add_fan(&FanId::new("nct6795-p9"))
             .expect_err("no such header");
@@ -3055,8 +2839,8 @@ mod tests {
     fn add_fan_revives_a_parked_header_keeping_its_settings() {
         let dir = tempfile::tempdir().expect("tempdir");
         fixture(dir.path());
-        let mut engine = engine_over(dir.path(), false, vec![fixed_fan("nct6795-p1", &[], true)])
-            .expect("engine");
+        let mut engine =
+            engine_over(dir.path(), false, vec![fixed_fan("nct6795-p1", true)]).expect("engine");
         assert!(engine.fans.is_empty());
         // Parked headers still show up as addable.
         assert_eq!(engine.unclaimed_headers().len(), 1);
@@ -3075,8 +2859,8 @@ mod tests {
     fn renaming_a_fan_shows_and_saves_and_empty_restores_the_default() {
         let dir = tempfile::tempdir().expect("tempdir");
         fixture(dir.path());
-        let mut engine = engine_over(dir.path(), false, vec![fixed_fan("nct6795-p1", &[], false)])
-            .expect("engine");
+        let mut engine =
+            engine_over(dir.path(), false, vec![fixed_fan("nct6795-p1", false)]).expect("engine");
         engine
             .set_fan_name(&FanId::new("nct6795-p1"), " Front intake ")
             .expect("rename");
@@ -3202,7 +2986,6 @@ mod tests {
                 name: None,
                 rpm_factor: 1.0,
                 min_speed: 0.0,
-                members: Vec::new(),
                 hidden: false,
                 mode: FanMode::Auto {
                     sensor: SensorId::new("k10temp-t1"),
@@ -3240,8 +3023,8 @@ mod tests {
         // double needs a factor of 0.5.
         let dir = tempfile::tempdir().expect("tempdir");
         fixture(dir.path());
-        let mut engine = engine_over(dir.path(), false, vec![fixed_fan("nct6795-p1", &[], false)])
-            .expect("engine");
+        let mut engine =
+            engine_over(dir.path(), false, vec![fixed_fan("nct6795-p1", false)]).expect("engine");
         let report = engine.tick().expect("tick");
         assert_eq!(report.fans[0].measured_rpm, Some(1000.0));
         engine

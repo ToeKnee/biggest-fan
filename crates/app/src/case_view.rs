@@ -13,7 +13,7 @@ use std::rc::Rc;
 
 const TAU: f64 = std::f64::consts::TAU;
 
-/// The fan group grabbed at drag start, with the slot it had then; `None`
+/// The fan grabbed at drag start, with the slot it had then; `None`
 /// while a drag is not moving a fan.
 type DragState = Rc<RefCell<Option<(core::FanId, core::FanSlot)>>>;
 
