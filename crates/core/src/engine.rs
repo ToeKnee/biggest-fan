@@ -24,6 +24,20 @@ pub struct Discovery {
     pub fans: Vec<FanDescriptor>,
 }
 
+/// What [`Engine::resync_hardware`] found when it looked at the machine
+/// again (after a resume from suspend, normally).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ResyncReport {
+    /// Configured headers found again and re-bound to their group.
+    pub rebound: usize,
+    /// Configured headers the machine is not exposing (yet); their group
+    /// keeps the old handle, so their failed writes keep being reported.
+    pub missing_headers: Vec<String>,
+    /// Headers the machine now exposes that no group drives, not even one
+    /// parked as `hidden` — a header the config has never heard of.
+    pub unclaimed_headers: Vec<String>,
+}
+
 /// Discovers sensors and fan headers.
 ///
 /// `hwmon_root` is normally `/sys/class/hwmon`; tests may point it at a
@@ -1241,6 +1255,120 @@ impl Engine {
         Ok(())
     }
 
+    /// Looks at the hardware again and re-binds the config to it — what the
+    /// control loop needs after the machine wakes from suspend.
+    ///
+    /// A suspend can re-number the `/sys/class/hwmon/hwmonN` directories (a
+    /// USB fan controller re-binding, for example), leave the board's
+    /// `pwmN_enable` files back in hardware-automatic mode, and let the
+    /// graphics card run its own fan policy meanwhile. So:
+    ///
+    /// * sensors are discovered again — their ids come from the chip name,
+    ///   so a re-numbered directory keeps its id and its config name;
+    /// * `pwmN` headers are discovered again and every group is re-bound to
+    ///   the header with its id, which re-asserts manual control on the next
+    ///   write;
+    /// * NVIDIA coolers keep their NVML handles (NVML is initialised once per
+    ///   process) and forget who holds their fans, see [`FanDriver::reset_state`];
+    /// * every group's ramp restarts from the duty the hardware holds now, so
+    ///   a fan the firmware left at full speed eases down instead of the
+    ///   engine assuming its pre-sleep position;
+    /// * the nudger starts again: its trial and sensor history belong to the
+    ///   pre-sleep machine, while learned trims live in the config.
+    ///
+    /// A configured header that has not re-appeared keeps its old handle, so
+    /// its writes fail loudly rather than the fan quietly leaving the config.
+    ///
+    /// # Errors
+    ///
+    /// [`CoreError::Io`] when the hwmon tree cannot be read at all, in which
+    /// case the bindings are left as they were.
+    pub fn resync_hardware(&mut self) -> Result<ResyncReport, CoreError> {
+        // Read everything into locals first, so a tree that cannot be read
+        // leaves the engine's bindings alone.
+        let mut sensors = self.hwmon.discover()?;
+        if let Some(nvidia) = &mut self.nvidia {
+            sensors.extend(nvidia.discover()?);
+        }
+        order_sensors(&mut sensors);
+        self.sensor_names = sensors
+            .iter()
+            .map(|sensor| {
+                let name = self
+                    .config
+                    .sensor_names
+                    .get(sensor.id.as_str())
+                    .cloned()
+                    .unwrap_or_else(|| sensor.default_name.clone());
+                (sensor.id.clone(), name)
+            })
+            .collect();
+        self.sensors = sensors;
+
+        // `pwmN` headers come from a fresh scan; GPU coolers keep their
+        // handles and forget the state the sleep invalidated.
+        let mut headers: Vec<FanDriver> = SysfsFan::discover_all(self.hwmon.root())?
+            .into_iter()
+            .map(FanDriver::Sysfs)
+            .collect();
+        headers.extend(
+            self.all_headers
+                .iter()
+                .filter(|header| matches!(header, FanDriver::Nvidia(_)))
+                .cloned(),
+        );
+        for header in &mut headers {
+            header.reset_state();
+        }
+        self.all_headers = headers;
+
+        let mut report = ResyncReport::default();
+        for entry in &mut self.fans {
+            let previous = std::mem::take(&mut entry.headers);
+            let mut headers = Vec::with_capacity(previous.len());
+            for header in previous {
+                let id = header.id().clone();
+                if let Some(found) = self.all_headers.iter().find(|found| found.id() == &id) {
+                    headers.push(found.clone());
+                    report.rebound += 1;
+                } else {
+                    // Not back yet: keep the stale handle so the control
+                    // loop reports the failed writes for this fan.
+                    headers.push(header);
+                    report.missing_headers.push(id.to_string());
+                }
+            }
+            entry.headers = headers;
+            entry.display_name = display_name_for(&entry.fan_config, &entry.headers);
+            entry.runtime = claimed_runtime(&entry.fan_config, &entry.headers);
+            // Whatever made a header unmanageable may have gone with the
+            // sleep; the next write decides whether it is still true.
+            entry.lost_control = None;
+        }
+
+        // Headers no group drives at all. A header belonging to a group the
+        // config parks as `hidden` (Detect found nothing plugged in, or the
+        // driver refuses software control) is deliberately left alone, so
+        // naming it after every resume would just be noise.
+        let driven: Vec<FanId> = self
+            .fans
+            .iter()
+            .flat_map(|entry| entry.headers.iter().map(|header| header.id().clone()))
+            .chain(self.hidden_fans.iter().flat_map(|hidden| {
+                std::iter::once(hidden.id.clone()).chain(hidden.members.iter().cloned())
+            }))
+            .collect();
+        report.unclaimed_headers = self
+            .all_headers
+            .iter()
+            .filter(|header| !driven.iter().any(|id| id == header.id()))
+            .map(|header| header.id().to_string())
+            .collect();
+
+        self.nudge = Nudge::default();
+        Ok(report)
+    }
+
     /// Configured refresh period, floored at 100 ms.
     #[must_use]
     pub fn poll_interval_ms(&self) -> u64 {
@@ -2112,6 +2240,119 @@ mod tests {
         assert!(
             (added.commanded_speed - 0.7).abs() < 1e-9,
             "one step down from the 80 % taken over, not 0.1 up from a stop"
+        );
+    }
+
+    #[test]
+    fn resync_finds_a_header_whose_hwmon_directory_was_renumbered() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        fixture(dir.path());
+        let mut engine = engine_with(
+            dir.path(),
+            crate::config::model::HysteresisConfig {
+                temp_band_c: 0.0,
+                max_step_per_tick: 1.0,
+                max_step_up_per_tick: 1.0,
+            },
+        );
+        engine.tick().expect("first tick");
+
+        // A controller that re-binds while the machine sleeps comes back on a
+        // different hwmon number; the fan id (chip name plus header) does not
+        // change, so re-discovery finds the header again.
+        std::fs::rename(dir.path().join("hwmon1"), dir.path().join("hwmon7")).expect("rename");
+        let report = engine.resync_hardware().expect("resync");
+        assert_eq!(report.rebound, 1, "the header is found again by id");
+        assert!(report.missing_headers.is_empty(), "{report:?}");
+
+        set_cpu_temp(dir.path(), 80_000); // the fixture curve wants full speed
+        engine.tick().expect("tick after resume");
+        let pwm = std::fs::read_to_string(dir.path().join("hwmon7/pwm1")).expect("pwm7");
+        assert_eq!(pwm.trim(), "255", "writes follow the re-numbered path");
+    }
+
+    #[test]
+    fn resync_restarts_the_ramp_from_the_duty_the_firmware_left() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        fixture(dir.path());
+        let mut engine = engine_with(
+            dir.path(),
+            crate::config::model::HysteresisConfig {
+                temp_band_c: 0.0,
+                max_step_per_tick: 0.1,
+                max_step_up_per_tick: 0.1,
+            },
+        );
+        engine.tick().expect("first tick"); // 55 °C on the fixture curve wants 0.5
+
+        // On the way out of suspend the firmware put this fan back to full
+        // speed. The engine must not assume it is still where it left it.
+        std::fs::write(dir.path().join("hwmon1/pwm1"), "255\n").expect("firmware duty");
+        engine.resync_hardware().expect("resync");
+        let report = engine.tick().expect("tick after resume");
+        assert!(
+            (report.fans[0].commanded_speed - 0.9).abs() < 1e-9,
+            "one feather step down from the 100 % the fan was left at, not from \
+             the 50 % the engine remembered"
+        );
+        assert_eq!(read_pwm(dir.path()), 230);
+    }
+
+    #[test]
+    fn resync_keeps_a_header_the_machine_has_not_given_back() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        fixture(dir.path());
+        let mut engine = engine_with(
+            dir.path(),
+            crate::config::model::HysteresisConfig::default(),
+        );
+        std::fs::remove_dir_all(dir.path().join("hwmon1")).expect("remove the chip");
+
+        let report = engine.resync_hardware().expect("resync");
+        assert_eq!(report.rebound, 0);
+        assert_eq!(report.missing_headers, vec!["nct6795-p1".to_string()]);
+        assert!(report.unclaimed_headers.is_empty(), "{report:?}");
+        // The group stays managed — its writes fail loudly until the
+        // controller returns — rather than the fan leaving the config.
+        assert!(
+            engine
+                .current_config()
+                .fans
+                .iter()
+                .any(|fan| fan.id.as_str() == "nct6795-p1" && !fan.hidden),
+            "still managed, waiting for its header back"
+        );
+    }
+
+    #[test]
+    fn resync_leaves_a_parked_header_out_of_the_unclaimed_list() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        fixture(dir.path());
+        let mut engine = engine_with(
+            dir.path(),
+            crate::config::model::HysteresisConfig::default(),
+        );
+
+        // What Detect does to a header with nothing plugged in: park the
+        // group as `hidden`. Nothing drives it on purpose, so a resume has
+        // nothing to tell the user about it.
+        engine.park_fans(&[FanId::new("nct6795-p1")]);
+        let report = engine.resync_hardware().expect("resync");
+        assert_eq!(report.rebound, 0, "no managed fan is left to re-bind");
+        assert!(
+            report.unclaimed_headers.is_empty(),
+            "a parked header is deliberate, not news: {report:?}"
+        );
+
+        // A header the config really has never seen is still reported.
+        let superio = dir.path().join("hwmon1");
+        std::fs::write(superio.join("pwm2"), "0\n").expect("new header");
+        std::fs::write(superio.join("pwm2_enable"), "1\n").expect("new enable");
+        let report = engine.resync_hardware().expect("second resync");
+        assert_eq!(
+            report.unclaimed_headers,
+            vec!["nct6795-p2".to_string()],
+            "{report:?}"
         );
     }
 

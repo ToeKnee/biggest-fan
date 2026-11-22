@@ -500,6 +500,21 @@ impl NvidiaFan {
         Ok(())
     }
 
+    /// Forgets everything this cooler was doing, the state a suspend leaves
+    /// behind: the card has had its fans back under its own policy while the
+    /// machine slept, so who holds them is unknown again, and a take-over
+    /// hold from before the sleep says nothing about what the card wants now.
+    ///
+    /// The next tick then hands the fans to the card once (clearing any mode
+    /// an earlier run left) and takes them back if the card has them running
+    /// above the spin floor.
+    pub fn reset_state(&mut self) {
+        self.ownership = FanOwnership::Unknown;
+        self.pin.release();
+        self.last_effective = 0.0;
+        self.last_speed_change = Instant::now();
+    }
+
     /// The cooler's current fan speed as NVML reports it (0.0–1.0), averaged
     /// over its fans, or `None` when the card reports nothing. This is what
     /// makes a park visible: a `GeForce` cooler under the card's own policy

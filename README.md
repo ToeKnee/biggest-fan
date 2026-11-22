@@ -373,6 +373,41 @@ The bridge:
   how) — it is the only thing letting ordinary users change fan
   behaviour.
 
+## Suspend and resume
+
+A wake-up leaves the hardware in a state the control loop's memory does
+not match: hwmon directories get re-numbered when a controller re-binds
+(every stored path is then stale), the board's `pwmN_enable` files are
+usually back in hardware-automatic mode, and a graphics card has spent
+the sleep running its own fan policy. So after a resume the daemon
+re-reads the hardware and re-asserts every fan
+(`Engine::resync_hardware`): headers are discovered afresh and re-bound
+to their group by id (ids are chip-name based, so renumbering cannot
+break the config), each ramp restarts from the duty the firmware left —
+one feather step from what the header actually reads rather than from
+the pre-sleep value — NVIDIA coolers forget who drives them and take
+over again on the next tick, and display names are refreshed.
+
+Detection is logind's `PrepareForSleep` signal on the system bus
+(`crates/app/src/power.rs`, which runs on its own `zbus::block_on`
+thread like the D-Bus service does); the wake message is handled between
+ticks, on the engine's only thread, exactly like a GUI request. The
+journal gets one line per resume whatever `--quiet` says:
+
+```
+resume: re-bound 8 fan header(s) and re-asserted every fan
+```
+
+plus a line naming any configured header that is not back yet (its group
+keeps the old handle, so the config is not silently dropped and the
+failed write keeps being reported until the driver returns) and any
+header the machine now exposes that the config has never heard of — a
+group parked as hidden (nothing plugged in, or the driver refuses
+software control) is deliberately undriven and never listed. A machine
+without logind, or a system bus the daemon cannot reach, is reported
+once at startup and simply never notices a resume: fan control carries
+on.
+
 ## Stress lab
 
 `crates/stress-lab` exists to answer "which fan actually cools what?" with

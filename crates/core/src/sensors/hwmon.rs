@@ -143,6 +143,13 @@ impl HwmonSource {
         }
     }
 
+    /// The hwmon class directory this source reads (normally
+    /// `/sys/class/hwmon`).
+    #[must_use]
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
     /// Builds a unique, stable id for one temp input of one chip.
     fn input_id(chip: &HwmonChip, index: usize) -> SensorId {
         if chip.same_name_count > 1 {

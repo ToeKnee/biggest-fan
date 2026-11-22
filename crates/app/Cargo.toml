@@ -22,6 +22,9 @@ biggest-fan-core = { workspace = true }
 biggest-fan-stress-lab = { workspace = true }
 cairo-rs = "0.22"
 clap = { version = "4.6.8", features = ["derive"] }
+# Streams logind's `PrepareForSleep` signal in `power.rs` (zbus's own
+# dependency, so this adds no new crates to the tree).
+futures-util = "0.3.34"
 glib = "0.22.11"
 gtk4 = "0.11.5"
 signal-hook = "0.4.6"

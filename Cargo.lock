@@ -101,6 +101,7 @@ dependencies = [
  "biggest-fan-stress-lab",
  "cairo-rs",
  "clap",
+ "futures-util",
  "glib",
  "gtk4",
  "serde",

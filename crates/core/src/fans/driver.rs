@@ -68,6 +68,19 @@ impl FanDriver {
         }
     }
 
+    /// Forgets what this header was doing, for the first control loop after
+    /// the machine wakes from suspend. NVIDIA coolers take that literally
+    /// ([`NvidiaFan::reset_state`]): the card has been running its own fan
+    /// policy meanwhile, so the remembered owner and take-over hold are
+    /// stale. A `pwmN` header needs nothing — every write re-asserts the
+    /// manual enable mode anyway.
+    pub fn reset_state(&mut self) {
+        match self {
+            Self::Sysfs(_) => {}
+            Self::Nvidia(fan) => fan.reset_state(),
+        }
+    }
+
     /// Commands a speed fraction (0.0..=1.0).
     ///
     /// # Errors

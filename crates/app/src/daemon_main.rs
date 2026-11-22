@@ -16,6 +16,7 @@
 
 use biggest_fan::dbus;
 use biggest_fan::engine_setup;
+use biggest_fan::power;
 use biggest_fan_core as core;
 use clap::Parser;
 use std::io::Write;
@@ -86,9 +87,16 @@ fn run(mut engine: core::Engine, quiet: bool) -> Result<(), core::CoreError> {
     // only — thread, between ticks and inside the sleep quanta.
     let (command_tx, command_rx) = std::sync::mpsc::channel();
     dbus::spawn_server(command_tx, Arc::clone(&stopping));
+    // A wake-up from suspend or hibernation arrives here as one message,
+    // so the hardware gets re-read on the engine's own thread.
+    let (wake_tx, wake_rx) = std::sync::mpsc::channel();
+    power::spawn_resume_watcher(wake_tx);
     let mut first_tick = true;
     while !stopping.load(Ordering::Relaxed) {
         dbus::drain_commands(&mut engine, &command_rx);
+        if wake_rx.try_recv().is_ok() {
+            resync_after_resume(&mut engine);
+        }
         match engine.tick() {
             Ok(report) => {
                 for line in status_table(quiet, first_tick, &report) {
@@ -131,6 +139,39 @@ fn run(mut engine: core::Engine, quiet: bool) -> Result<(), core::CoreError> {
     }
     eprintln!("biggest-fan-daemon: stopping — returning fans to hardware control");
     engine.release_control()
+}
+
+/// Re-reads the hardware and re-asserts every fan after the machine wakes
+/// from sleep, then reports what changed. Printed regardless of `--quiet`:
+/// resumes are rare, and this is the journal's only record that the
+/// headers were re-bound.
+fn resync_after_resume(engine: &mut core::Engine) {
+    match engine.resync_hardware() {
+        Ok(report) => {
+            println!(
+                "resume: re-bound {} fan header(s) and re-asserted every fan",
+                report.rebound
+            );
+            if !report.missing_headers.is_empty() {
+                eprintln!(
+                    "biggest-fan-daemon: configured headers are not back yet: {}",
+                    report.missing_headers.join(", ")
+                );
+            }
+            if !report.unclaimed_headers.is_empty() {
+                eprintln!(
+                    "biggest-fan-daemon: headers the config has no fan for: {}",
+                    report.unclaimed_headers.join(", ")
+                );
+            }
+        }
+        // The engine kept its old bindings, so the control loop carries on
+        // exactly as it was before the sleep.
+        Err(error) => {
+            eprintln!("biggest-fan-daemon: hardware re-read after resume failed: {error}");
+        }
+    }
+    std::io::stdout().flush().ok();
 }
 
 /// The tick's fan status table, one line per fan worth showing. Normally
