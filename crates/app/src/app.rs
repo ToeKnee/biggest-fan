@@ -9,8 +9,8 @@ use biggest_fan_core as core;
 use glib::{ControlFlow, Propagation, SourceId};
 use gtk4::prelude::*;
 use gtk4::{
-    Application, ApplicationWindow, Box as GtkBox, Button, ComboBoxText, FlowBox, HeaderBar, Label,
-    ListBox, ListBoxRow, Orientation, PolicyType, ScrolledWindow, SpinButton, gio,
+    Application, ApplicationWindow, Box as GtkBox, Button, FlowBox, HeaderBar, Label, ListBox,
+    ListBoxRow, Orientation, PolicyType, ScrolledWindow, SpinButton, gio,
 };
 use std::cell::Cell;
 use std::cell::RefCell;
@@ -22,13 +22,16 @@ use std::time::Duration;
 /// Everything the periodic tick needs to touch.
 struct GuiState {
     engine: Rc<RefCell<core::Engine>>,
-    /// Fan rows, in panel order; "Add fan" appends more at runtime.
+    /// Fan rows, in panel order; showing a hidden fan appends more at runtime.
     fan_controls: RefCell<Vec<FanControls>>,
     /// The flow of fan row tiles (new rows are inserted into it).
     fans_flow: FlowBox,
-    /// Unmanaged headers offered by "Add fan", and its button.
-    unclaimed_combo: ComboBoxText,
-    add_button: Button,
+    /// Fans parked as `hidden` (by Detect or a lost driver): a reveal
+    /// button and one row per parked fan with a "Show" button, the way
+    /// the sensor list treats hidden temperatures.
+    hidden_fans_list: ListBox,
+    hidden_fans_reveal: Button,
+    showing_hidden_fans: Cell<bool>,
     /// The sensor readout list with its hide/show plumbing.
     sensor_panel: Rc<SensorPanel>,
     case_area: gtk4::DrawingArea,
@@ -116,19 +119,21 @@ impl SensorPanel {
         self.refresh_reveal();
     }
 
-    /// Keeps the reveal button's label and sensitivity in step with the
-    /// hidden count.
+    /// Keeps the reveal button's label and visibility in step with the
+    /// hidden count — with nothing hidden there is nothing to reveal,
+    /// so the button leaves the panel entirely.
     fn refresh_reveal(&self) {
         let hidden = self
             .rows
             .keys()
             .filter(|id| self.engine.borrow().sensor_hidden(id))
             .count();
-        self.reveal.set_sensitive(hidden > 0);
+        self.reveal.set_visible(hidden > 0);
         self.reveal.set_label(&match hidden {
-            0 => "No hidden sensors".to_string(),
+            1 if self.showing_hidden.get() => "Hide the shown sensor".to_string(),
+            1 => "Show 1 hidden temperature".to_string(),
             n if self.showing_hidden.get() => format!("Hide the {n} shown sensors"),
-            n => format!("{n} hidden — Show"),
+            n => format!("Show {n} hidden temperatures"),
         });
     }
 }
@@ -366,8 +371,9 @@ fn build_window(
         engine: Rc::clone(engine_rc),
         fan_controls: RefCell::new(fan_panel.controls),
         fans_flow: fan_panel.fans_flow,
-        unclaimed_combo: fan_panel.unclaimed_combo,
-        add_button: fan_panel.add_button,
+        hidden_fans_list: fan_panel.hidden_fans_list,
+        hidden_fans_reveal: fan_panel.hidden_fans_reveal,
+        showing_hidden_fans: Cell::new(false),
         sensor_panel,
         case_area,
         status_label,
@@ -380,13 +386,16 @@ fn build_window(
     let tick_source = Rc::new(RefCell::new(None::<SourceId>));
     schedule_tick(&state, &tick_source);
 
-    // Add fan: take a header the machine exposes but no fan drives yet
-    // (a parked one, or a graphics-card cooler missing from an older
-    // config) under management.
-    let add_state = Rc::clone(&state);
-    state
-        .add_button
-        .connect_clicked(move |_| on_add_fan_clicked(&add_state));
+    // Hidden fans: the reveal line shows or hides the parked-fan rows,
+    // each of which has a Show button that revives its fan.
+    refresh_hidden_fans(&state);
+    let hidden_state = Rc::clone(&state);
+    state.hidden_fans_reveal.connect_clicked(move |_| {
+        hidden_state
+            .showing_hidden_fans
+            .set(!hidden_state.showing_hidden_fans.get());
+        refresh_hidden_fans(&hidden_state);
+    });
 
     // Detect fans: spin every header up briefly and disable the ones with
     // nothing connected (no RPM) or whose driver refuses the spin-up.
@@ -429,25 +438,26 @@ fn hide_control_rows(state: &GuiState, ids: &[core::FanId]) {
     state.case_area.queue_draw();
 }
 
-/// Takes a discovered-but-unmanaged header (for example the
-/// graphics-card cooler missing from a config written before GPU
-/// coolers existed, or a header detection had parked) under
-/// management: the mirror engine adopts it at once, the service is
-/// asked to do the same and save, and a control row appears
-/// immediately.
-fn on_add_fan_clicked(state: &GuiState) {
-    let Some(header_id) = state.unclaimed_combo.active_id() else {
-        return;
-    };
-    let fan_id = core::FanId::new(header_id.to_string());
+/// Revives a fan parked as `hidden` (the hidden-fans row's Show button):
+/// the engine restores the settings detection left behind, so the fan
+/// comes back exactly as it was configured.
+fn on_show_fan_clicked(state: &Rc<GuiState>, fan_id: &core::FanId) {
+    add_fan_to_panel(state, fan_id);
+}
+
+/// Puts one parked header back under management: the mirror engine adopts
+/// it at once, the service is asked to do the same and save, and a control
+/// row appears immediately ([`core::Engine::add_fan`] revives a parked
+/// config with its settings).
+fn add_fan_to_panel(state: &Rc<GuiState>, fan_id: &core::FanId) {
     let display_name = {
         let mut engine = state.engine.borrow_mut();
-        match engine.add_fan(&fan_id) {
+        match engine.add_fan(fan_id) {
             Ok(()) => engine
                 .managed_fans()
                 .into_iter()
-                .find(|(managed_id, _)| *managed_id == fan_id)
-                .map_or_else(|| header_id.to_string(), |(_, name)| name),
+                .find(|(managed_id, _)| managed_id == fan_id)
+                .map_or_else(|| fan_id.to_string(), |(_, name)| name),
             Err(error) => {
                 state
                     .status_label
@@ -461,22 +471,61 @@ fn on_add_fan_clicked(state: &GuiState) {
     });
     let controls = FanControls::new(
         &state.engine,
-        &fan_id,
+        fan_id,
         &display_name,
         &state.case_area,
         &state.client,
     );
     state.fans_flow.insert(&controls.container, -1);
     state.fan_controls.borrow_mut().push(controls);
-    populate_addable_headers(
-        &state.unclaimed_combo,
-        &state.add_button,
-        &state.engine.borrow(),
-    );
+    refresh_hidden_fans(state);
     state.case_area.queue_draw();
     state.status_label.set_text(&format!(
         "{display_name} added — the service has taken over its header"
     ));
+}
+
+/// Rebuilds the hidden-fans rows and the reveal line from the engine's
+/// parked set — the fans-panel twin of the sensor panel's hidden plumbing.
+fn refresh_hidden_fans(state: &Rc<GuiState>) {
+    while let Some(child) = state.hidden_fans_list.last_child() {
+        state.hidden_fans_list.remove(&child);
+    }
+    let hidden = state.engine.borrow().hidden_fans();
+    for (fan_id, name) in &hidden {
+        let row_box = GtkBox::new(Orientation::Horizontal, 8);
+        row_box.append(
+            &Label::builder()
+                .label(name)
+                .xalign(0.0)
+                .hexpand(true)
+                .build(),
+        );
+        let show = Button::builder()
+            .label("Show")
+            .tooltip_text("take this fan back under control — it keeps its settings")
+            .build();
+        row_box.append(&show);
+        let row = ListBoxRow::new();
+        row.set_child(Some(&row_box));
+        state.hidden_fans_list.append(&row);
+        let show_state = Rc::clone(state);
+        let show_id = fan_id.clone();
+        show.connect_clicked(move |_| on_show_fan_clicked(&show_state, &show_id));
+    }
+    let count = hidden.len();
+    state
+        .hidden_fans_list
+        .set_visible(state.showing_hidden_fans.get() && count > 0);
+    // With nothing parked there is nothing to reveal: the line leaves
+    // the panel until the count is back above zero.
+    state.hidden_fans_reveal.set_visible(count > 0);
+    state.hidden_fans_reveal.set_label(&match count {
+        1 if state.showing_hidden_fans.get() => "Hide the shown fan".to_string(),
+        1 => "Show 1 hidden fan".to_string(),
+        n if state.showing_hidden_fans.get() => format!("Hide the {n} shown fans"),
+        n => format!("Show {n} hidden fans"),
+    });
 }
 
 /// Asks the service to apply and save the GUI's current config (mode and
@@ -498,7 +547,7 @@ fn on_save_clicked(state: &GuiState) {
 }
 
 /// Applies whatever the service answered since the last tick.
-fn drain_service_events(state: &GuiState) {
+fn drain_service_events(state: &Rc<GuiState>) {
     let guard = state.service_events.borrow_mut();
     while let Ok(event) = guard.try_recv() {
         match event {
@@ -507,6 +556,7 @@ fn drain_service_events(state: &GuiState) {
                 let ids: Vec<core::FanId> = ids.into_iter().map(core::FanId::new).collect();
                 state.engine.borrow_mut().park_fans(&ids);
                 hide_control_rows(state, &ids);
+                refresh_hidden_fans(state);
                 if ids.is_empty() {
                     state.status_label.set_text(
                         "the service found nothing to disable — every managed header spun up",
@@ -540,6 +590,10 @@ fn drain_service_events(state: &GuiState) {
                     state
                         .status_label
                         .set_text(&format!("service config did not apply: {error}"));
+                } else {
+                    // A hand-edited service config can hide or show fans;
+                    // the hidden-fans line follows it.
+                    refresh_hidden_fans(state);
                 }
             }
         }
@@ -571,13 +625,13 @@ fn wire_interval_spin(
 }
 
 /// The "Fans" panel: one control row per managed fan (in a flow
-/// new rows can be inserted into) with an "add a fan header" row
-/// underneath.
+/// new rows can be inserted into) and the parked-as-hidden fans
+/// behind a reveal line.
 struct FanPanel {
     controls: Vec<FanControls>,
     fans_flow: FlowBox,
-    unclaimed_combo: ComboBoxText,
-    add_button: Button,
+    hidden_fans_list: ListBox,
+    hidden_fans_reveal: Button,
 }
 
 /// Appends the Stress lab panel to `right` and ties its stress threads
@@ -594,7 +648,7 @@ fn wire_stress_panel(window: &ApplicationWindow, right: &GtkBox) -> Rc<stress::S
 }
 
 /// Appends the fan section (header, one control row per managed fan,
-/// then the add row under them all) to `panel`.
+/// then the hidden-fans reveal line under them all) to `panel`.
 fn append_fans_panel(
     panel: &GtkBox,
     engine_rc: &Rc<RefCell<core::Engine>>,
@@ -625,45 +679,24 @@ fn append_fans_panel(
         fans_flow.insert(&controls.container, -1);
         fan_controls.push(controls);
     }
-    // The add row sits below the existing fans: new rows join the list
-    // above it, and adding is a rare setup action, not the panel's focus.
-    let add_row = GtkBox::new(Orientation::Horizontal, 8);
-    let unclaimed_combo = ComboBoxText::new();
-    let add_button = Button::builder()
-        .label("Add fan")
-        .tooltip_text("take over a fan header nothing drives yet (also revives parked ones)")
+    // Hidden fans get the hidden-sensors treatment: collapsed behind a
+    // named count line, each with a Show button that takes it back under
+    // control — no config editing needed.
+    let hidden_fans_reveal = Button::builder()
+        .tooltip_text("show the hidden fans again, so one can be taken back under control")
         .build();
-    add_row.append(&Label::builder().label("Add:").build());
-    add_row.append(&unclaimed_combo);
-    add_row.append(&add_button);
-    section.append(&add_row);
+    let hidden_fans_list = ListBox::new();
+    hidden_fans_list.set_selection_mode(gtk4::SelectionMode::None);
+    hidden_fans_list.set_visible(false);
+    section.append(&hidden_fans_reveal);
+    section.append(&hidden_fans_list);
     panel.append(&section);
-    let panel = FanPanel {
+    FanPanel {
         controls: fan_controls,
         fans_flow,
-        unclaimed_combo,
-        add_button,
-    };
-    populate_addable_headers(
-        &panel.unclaimed_combo,
-        &panel.add_button,
-        &engine_rc.borrow(),
-    );
-    panel
-}
-
-/// Refills the "add fan" dropdown with headers no managed fan drives
-/// yet; the button only works while there is something to add.
-fn populate_addable_headers(combo: &ComboBoxText, button: &Button, engine: &core::Engine) {
-    combo.remove_all();
-    let headers = engine.unclaimed_headers();
-    for header in &headers {
-        combo.append(Some(header.id.as_str()), &header.default_name);
+        hidden_fans_list,
+        hidden_fans_reveal,
     }
-    if !headers.is_empty() {
-        combo.set_active(Some(0));
-    }
-    button.set_sensitive(!headers.is_empty());
 }
 
 /// Appends the sensor section (header, a readout and a hide button per
@@ -755,7 +788,7 @@ fn schedule_tick(state: &Rc<GuiState>, source: &Rc<RefCell<Option<SourceId>>>) {
 }
 
 /// One control-loop iteration, pushing results into the widgets.
-fn tick_once(state: &GuiState) {
+fn tick_once(state: &Rc<GuiState>) {
     drain_service_events(state);
 
     // The service owns the live config — it parks fans whose driver

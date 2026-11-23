@@ -758,17 +758,6 @@ impl Engine {
         self.all_headers.iter().map(FanDriver::descriptor).collect()
     }
 
-    /// Fan headers no managed fan drives yet (parked ones included) —
-    /// the pool the GUI's "add fan" choice picks from.
-    #[must_use]
-    pub fn unclaimed_headers(&self) -> Vec<FanDescriptor> {
-        self.all_headers
-            .iter()
-            .filter(|header| self.find_fan(header.id()).is_none())
-            .map(FanDriver::descriptor)
-            .collect()
-    }
-
     /// Takes one header over as a managed fan of its own: a new entry
     /// auto-bound to its most likely governing sensor (a half-speed
     /// constant when the machine offers no sensor), or the revival of a
@@ -1199,6 +1188,30 @@ impl Engine {
             .collect()
     }
 
+    /// The fans parked as `hidden` (by detection, a lost driver, or the
+    /// config) as (header id, display name). The GUI counts them on a
+    /// "Show N hidden fans" line, the way hidden sensors are listed, so
+    /// one can come back without editing the config; [`Engine::add_fan`]
+    /// revives a parked fan with the settings it had.
+    #[must_use]
+    pub fn hidden_fans(&self) -> Vec<(FanId, String)> {
+        self.hidden_fans
+            .iter()
+            .map(|config| {
+                let name = config.name.clone().unwrap_or_else(|| {
+                    self.all_headers
+                        .iter()
+                        .find(|header| header.id() == &config.id)
+                        .map_or_else(
+                            || config.id.to_string(),
+                            |header| header.default_name().to_string(),
+                        )
+                });
+                (config.id.clone(), name)
+            })
+            .collect()
+    }
+
     /// Whether a sensor is hidden from the GUI's temperature list.
     /// Hiding is display-only: the sensor is still read every tick and
     /// can still drive the fans bound to it.
@@ -1262,7 +1275,8 @@ impl Engine {
     /// driver exposes it as not software-controllable. Fans with a
     /// tachometer that spin up stay visible. Newly-hidden fans go back to
     /// the motherboard's control where possible and are recorded in the
-    /// config (`hidden = true`) until re-enabled by editing the file.
+    /// config (`hidden = true`) until shown again from the GUI's hidden-
+    /// fans row (or by editing the file).
     ///
     /// Returns the ids of the newly-hidden fans.
     ///
@@ -3156,15 +3170,8 @@ mod tests {
         std::fs::write(dir.path().join("hwmon1/fan2_input"), "800\n").expect("fan2");
         let mut engine =
             engine_over(dir.path(), false, vec![fixed_fan("nct6795-p1", false)]).expect("engine");
-        let unclaimed: Vec<String> = engine
-            .unclaimed_headers()
-            .into_iter()
-            .map(|header| header.id.to_string())
-            .collect();
-        assert_eq!(unclaimed, vec!["nct6795-p2"]);
 
         engine.add_fan(&FanId::new("nct6795-p2")).expect("add");
-        assert_eq!(engine.unclaimed_headers(), Vec::<FanDescriptor>::new());
         // A fresh auto fan binds to the most likely sensor on offer.
         assert!(
             matches!(
@@ -3204,8 +3211,13 @@ mod tests {
         let mut engine =
             engine_over(dir.path(), false, vec![fixed_fan("nct6795-p1", true)]).expect("engine");
         assert!(engine.fans.is_empty());
-        // Parked headers still show up as addable.
-        assert_eq!(engine.unclaimed_headers().len(), 1);
+        // A parked fan waits in the hidden-fans list, under its display
+        // name.
+        assert_eq!(
+            engine.hidden_fans(),
+            vec![(FanId::new("nct6795-p1"), "Fan 1 on NCT 6795".to_string())],
+            "the parked fan is listed with its header's default name"
+        );
 
         engine.add_fan(&FanId::new("nct6795-p1")).expect("revive");
         assert_eq!(engine.hidden_fans, Vec::<FanConfig>::new());
@@ -3215,6 +3227,35 @@ mod tests {
             Some(FanMode::Fixed { speed: 0.5 }),
             "the parked fan comes back with the mode it had"
         );
+    }
+
+    #[test]
+    fn hidden_fans_keep_their_friendly_names() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        fixture(dir.path());
+        std::fs::write(dir.path().join("hwmon1/pwm2"), "0\n").expect("pwm2");
+        std::fs::write(dir.path().join("hwmon1/fan2_input"), "800\n").expect("fan2");
+        let mut parked = fixed_fan("nct6795-p2", true);
+        parked.name = Some("Front intake".to_string());
+        let mut engine = engine_over(
+            dir.path(),
+            false,
+            vec![fixed_fan("nct6795-p1", false), parked],
+        )
+        .expect("engine");
+
+        // The hidden fan is listed under the name the user gave it, not
+        // its hardware default — the same friendly-name treatment the
+        // hidden-sensor list gets.
+        assert_eq!(
+            engine.hidden_fans(),
+            vec![(FanId::new("nct6795-p2"), "Front intake".to_string())]
+        );
+
+        // Showing it (the GUI's Show button) revives it with its name.
+        engine.add_fan(&FanId::new("nct6795-p2")).expect("show");
+        assert_eq!(engine.hidden_fans(), Vec::<(FanId, String)>::new());
+        assert_eq!(engine.managed_fans()[1].1, "Front intake");
     }
 
     #[test]

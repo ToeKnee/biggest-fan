@@ -182,7 +182,8 @@ under the park point cannot start the fans, so it parks the cooler instead
   hide button, or `hidden_sensors` in the config). Hiding is display-only:
   hidden sensors are still read every tick, and a fan bound to a hidden
   temperature keeps working exactly as before — the hidden rows come back
-  under the list's "N hidden — show" line if a hide was a mistake.
+  under the list's "Show N hidden temperatures" line (it appears only
+  while something is hidden) if a hide was a mistake.
 - Fan headers are listed by controller name, then header number.
 - `init-config` auto-matches each header to a likely sensor: `CPU_FAN`-
   style headers follow CPU temperatures, GPU/aux headers the graphics card
@@ -194,8 +195,11 @@ under the park point cannot start the fans, so it parks the cooler instead
 `biggest-fan detect-fans` (or the GUI's _Detect fans_ button) spins every
 managed header up briefly and reads tachometers: headers whose fan never
 spins are assumed to have nothing plugged in, are removed from control and
-recorded as `hidden = true` in the config. Set `hidden = false` by hand —
-or pick the header in the GUI's _Add fan_ dropdown — to bring one back.
+recorded as `hidden = true` in the config. Hidden fans wait in the GUI's
+Fans panel behind a "Show N hidden fans" line (it appears only while some
+are hidden) — pressing _Show_ on a listed fan brings it back under
+management with its name and settings — or set `hidden = false` by hand
+in the config.
 Headers without a tachometer cannot be judged and are left
 alone. Parked headers get their duty written to zero — not left at the
 detection spin-up speed — before their enable mode is handed back to the
@@ -372,9 +376,14 @@ every fan also charts its last 5 minutes — speed % (blue) against the
 same 0–100 scale as governing sensor °C (yellow) — so changes over time
 stay visible after the numbers have scrolled past in the status line.
 The **Sensors** readout has a hide button on every row: hidden
-temperatures leave the list behind an "N hidden — show" line (kept in
-`hidden_sensors` when the config is saved), but stay read — a fan bound
-to a hidden temperature keeps working and charts normally.
+temperatures leave the list behind a "Show N hidden temperatures" line
+(kept in `hidden_sensors` when the config is saved), but stay read — a
+fan bound to a hidden temperature keeps working and charts normally.
+The **Fans** panel treats hidden fans the same way: fans parked by
+Detect (or a driver that refuses control) collapse behind a
+"Show N hidden fans" line, and a parked fan's _Show_ button takes it
+back under management with its name and settings. Both lines appear
+only while something is hidden.
 Each row
 can also set the "rpm reading ×" tach correction and the "never below %"
 speed floor under _extra settings_ (some tachometers report exactly double:
