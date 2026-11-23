@@ -8,14 +8,14 @@
 //!
 //! A thermal guard (k10temp + GPU temperature) aborts the load if the
 //! machine gets hot, so experimenting can never turn into cooking: the
-//! guard trips, the thread wraps up, and the status bar at the bottom
-//! of the window says which temperature hit the limit.
+//! guard trips, the thread wraps up, and the panel's own status line
+//! says which temperature hit the limit.
 
-use crate::app::{SECTION_CLASS, section_title};
+use crate::app::{SECTION_CLASS, accessible_name, section_title};
 use biggest_fan_stress_lab::{cpu, gpu, thermal};
 use gtk4::glib::{self, ControlFlow};
 use gtk4::prelude::*;
-use gtk4::{Box as GtkBox, Label, Orientation, SpinButton, ToggleButton};
+use gtk4::{Box as GtkBox, Label, Orientation, ProgressBar, SpinButton, ToggleButton};
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -23,10 +23,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 /// A live stress thread: the external stop flag, and the join handle
-/// once it finishes so the result can be read back onto the status bar.
+/// once it finishes so the result can be read back onto the panel.
 struct StressRun {
     stop: Arc<AtomicBool>,
     started: Instant,
+    /// Planned length in seconds, captured at start so the progress bar
+    /// can show elapsed/duration even if the spin changes mid-run.
+    duration_secs: u64,
     worker: Option<std::thread::JoinHandle<Result<thermal::StressReport, thermal::LabError>>>,
 }
 
@@ -46,23 +49,16 @@ pub struct StressPanel {
     gpu_button: ToggleButton,
     duration_spin: SpinButton,
     guard_spin: SpinButton,
-    /// What this panel wants on the window's status bar right now (its
-    /// own `poll` fills it in; the app's tick decides whether it gets
-    /// shown — see [`StressPanel::status_line`]).
-    status_line: RefCell<Option<String>>,
+    /// One bar per stressor: hidden unless that stressor is running.
+    cpu_progress: ProgressBar,
+    gpu_progress: ProgressBar,
+    /// The last result, shown inline under the buttons (ongoing state
+    /// stays in the progress bars, not in a toast).
+    status: Label,
     runs: RefCell<StressRuns>,
 }
 
 impl StressPanel {
-    /// The line this panel would like on the window's status bar: live
-    /// stressor progress, or the last result — `None` while the lab has
-    /// nothing to say, leaving the bar to the control loop and the
-    /// service.
-    #[must_use]
-    pub fn status_line(&self) -> Option<String> {
-        self.status_line.borrow().clone()
-    }
-
     /// Ends the stressors (called when the window closes).
     pub fn stop_all(&self) {
         let runs = self.runs.borrow();
@@ -73,6 +69,7 @@ impl StressPanel {
 
     fn start_cpu(&self, args: &cpu::CpuArgs) {
         let args = args.clone();
+        let duration_secs = args.secs;
         let stop = Arc::new(AtomicBool::new(false));
         let worker_stop = Arc::clone(&stop);
         let worker = std::thread::Builder::new()
@@ -85,6 +82,7 @@ impl StressPanel {
         if let Some(old) = runs.cpu.replace(StressRun {
             stop,
             started: Instant::now(),
+            duration_secs,
             worker: Some(worker),
         }) {
             old.stop.store(true, Ordering::Relaxed);
@@ -94,6 +92,7 @@ impl StressPanel {
 
     fn start_gpu(&self, args: &gpu::GpuArgs) {
         let args = args.clone();
+        let duration_secs = args.secs;
         let stop = Arc::new(AtomicBool::new(false));
         let worker_stop = Arc::clone(&stop);
         let worker = std::thread::Builder::new()
@@ -104,6 +103,7 @@ impl StressPanel {
         if let Some(old) = runs.gpu.replace(StressRun {
             stop,
             started: Instant::now(),
+            duration_secs,
             worker: Some(worker),
         }) {
             old.stop.store(true, Ordering::Relaxed);
@@ -141,7 +141,7 @@ impl StressPanel {
     }
 
     /// Half-second refresh: collect finished runs into notes and keep live
-    /// runs' elapsed time in the status line.
+    /// runs' progress on their bars.
     fn poll(&self) {
         let mut parts: Vec<String> = Vec::new();
         // Clearing a toggle re-enters the widget handlers, which borrow
@@ -150,10 +150,10 @@ impl StressPanel {
         let mut gpu_finished = false;
         {
             let runs = &mut *self.runs.borrow_mut();
-            if collect(&mut runs.cpu, "CPU", &mut runs.cpu_note, &mut parts) {
+            if collect(&mut runs.cpu, "CPU", &mut runs.cpu_note, &self.cpu_progress) {
                 cpu_finished = true;
             }
-            if collect(&mut runs.gpu, "GPU", &mut runs.gpu_note, &mut parts) {
+            if collect(&mut runs.gpu, "GPU", &mut runs.gpu_note, &self.gpu_progress) {
                 gpu_finished = true;
             }
             if let Some(note) = &runs.cpu_note {
@@ -169,13 +169,12 @@ impl StressPanel {
         if gpu_finished {
             self.gpu_button.set_active(false);
         }
-        // The bar is shared: with nothing to report the lab stays quiet
-        // rather than hiding a fan note or a service answer.
-        *self.status_line.borrow_mut() = if parts.is_empty() {
-            None
+        self.status.set_text(&if parts.is_empty() {
+            String::new()
         } else {
-            Some(parts.join("  ·  "))
-        };
+            parts.join("  ·  ")
+        });
+        self.status.set_visible(!parts.is_empty());
     }
 }
 
@@ -199,17 +198,18 @@ enum Which {
     Gpu,
 }
 
-/// Moves a finished run's outcome onto the status parts, clearing its
-/// entry; an unfinished run contributes its elapsed time. Returns whether
-/// the run just finished (the caller then clears its toggle, outside the
-/// `runs` borrow).
+/// Moves a finished run's outcome onto the status parts and hides its
+/// bar; an unfinished run updates its bar with elapsed/duration instead.
+/// Returns whether the run just finished (the caller then clears its
+/// toggle, outside the `runs` borrow).
 fn collect(
     run: &mut Option<StressRun>,
     kind: &str,
     note_slot: &mut Option<String>,
-    parts: &mut Vec<String>,
+    progress: &ProgressBar,
 ) -> bool {
     let Some(current) = run.as_mut() else {
+        progress.set_visible(false);
         return false;
     };
     let finished = current
@@ -218,9 +218,20 @@ fn collect(
         .is_some_and(std::thread::JoinHandle::is_finished);
     if !finished {
         let elapsed = current.started.elapsed().as_secs();
-        parts.push(format!("{kind} stress running ({elapsed} s)"));
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "durations are minutes, not exponents"
+        )]
+        let fraction = (elapsed as f64 / current.duration_secs as f64).min(1.0);
+        progress.set_fraction(fraction);
+        progress.set_text(Some(&format!(
+            "{kind} stress {elapsed} s of {} s",
+            current.duration_secs
+        )));
+        progress.set_visible(true);
         return false;
     }
+    progress.set_visible(false);
     let worker = current
         .worker
         .take()
@@ -246,11 +257,23 @@ fn collect(
     true
 }
 
-/// Appends the "Stress lab" section (header, note and the stressor row)
-/// to `panel`, wiring the toggles and the half-second status tick.
+/// One stressor's progress bar: hidden until the run starts, with the
+/// elapsed/duration countdown as its text.
+fn stress_progress_bar(accessible: &str) -> ProgressBar {
+    let bar = ProgressBar::builder()
+        .show_text(true)
+        .visible(false)
+        .build();
+    accessible_name(&bar, accessible);
+    bar
+}
+
+/// Appends the "Stress lab" section (header, note, the stressor row,
+/// per-stressor progress bars and a result line) to `panel`, wiring the
+/// toggles and the half-second status tick.
 ///
-/// The lab has no status label of its own: its progress and results go
-/// to the window's status bar through [`StressPanel::status_line`].
+/// The returned panel is needed to stop the stressors when the window
+/// closes.
 #[must_use]
 pub fn append_stress_panel(panel: &GtkBox) -> Rc<StressPanel> {
     panel.append(&section_title("Stress lab"));
@@ -260,8 +283,7 @@ pub fn append_stress_panel(panel: &GtkBox) -> Rc<StressPanel> {
         &Label::builder()
             .label(
                 "Heat up the machine and watch the fans respond; a thermal guard stops the \
-                 load if things get too hot. Progress and results appear in the status bar \
-                 at the bottom of the window.",
+                 load if things get too hot. Progress and results appear under the buttons.",
             )
             .wrap(true)
             .xalign(0.0)
@@ -271,11 +293,11 @@ pub fn append_stress_panel(panel: &GtkBox) -> Rc<StressPanel> {
     let row = GtkBox::new(Orientation::Horizontal, 8);
     let cpu_button = ToggleButton::builder()
         .label("CPU load")
-        .tooltip_text("burn every core with AVX-512 hot instructions")
+        .tooltip_text("Burn every core with AVX-512 hot instructions")
         .build();
     let gpu_button = ToggleButton::builder()
         .label("GPU load")
-        .tooltip_text("keep the graphics card busy with its Vulkan compute hot loop")
+        .tooltip_text("Keep the graphics card busy with its Vulkan compute hot loop")
         .build();
     let duration_spin = SpinButton::builder()
         .digits(0)
@@ -285,19 +307,45 @@ pub fn append_stress_panel(panel: &GtkBox) -> Rc<StressPanel> {
         .digits(0)
         .adjustment(&gtk4::Adjustment::new(88.0, 55.0, 95.0, 1.0, 5.0, 0.0))
         .build();
+    // HIG: spin button numbers are right-justified.
+    duration_spin.set_alignment(1.0);
+    guard_spin.set_alignment(1.0);
+    let duration_label = Label::builder()
+        .label("_Stop after (s)")
+        .use_underline(true)
+        .mnemonic_widget(&duration_spin)
+        .build();
+    let guard_label = Label::builder()
+        .label("_Guard at (°C)")
+        .use_underline(true)
+        .mnemonic_widget(&guard_spin)
+        .build();
+    accessible_name(&duration_spin, "Stop after seconds");
+    accessible_name(&guard_spin, "Thermal guard temperature");
     row.append(&cpu_button);
     row.append(&gpu_button);
-    row.append(&Label::builder().label("stop after (s):").build());
+    row.append(&duration_label);
     row.append(&duration_spin);
-    row.append(&Label::builder().label("guard at (°C):").build());
+    row.append(&guard_label);
     row.append(&guard_spin);
 
+    let status = Label::builder()
+        .xalign(0.0)
+        .wrap(true)
+        .visible(false)
+        .build();
+    // One bar per stressor, hidden until that stressor runs; the bar
+    // text carries the elapsed/duration countdown.
+    let cpu_progress = stress_progress_bar("CPU stress progress");
+    let gpu_progress = stress_progress_bar("GPU stress progress");
     let stress_panel = Rc::new(StressPanel {
         cpu_button: cpu_button.clone(),
         gpu_button: gpu_button.clone(),
         duration_spin,
         guard_spin,
-        status_line: RefCell::new(None),
+        cpu_progress: cpu_progress.clone(),
+        gpu_progress: gpu_progress.clone(),
+        status,
         runs: RefCell::new(StressRuns::default()),
     });
 
@@ -321,6 +369,9 @@ pub fn append_stress_panel(panel: &GtkBox) -> Rc<StressPanel> {
     });
 
     section.append(&row);
+    section.append(&cpu_progress);
+    section.append(&gpu_progress);
+    section.append(&stress_panel.status);
     panel.append(&section);
 
     // Half-second status tick: elapsed time while a stressor runs, and the

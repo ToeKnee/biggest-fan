@@ -89,7 +89,7 @@ impl SensorSource for NvidiaSource {
                 id,
                 kind: SensorSourceKind::Nvidia,
                 raw_label: format!("NVML GPU {nvml_index}"),
-                default_name: format!("{model} temperature"),
+                default_name: model,
             });
         }
         Ok(descriptors)

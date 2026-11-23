@@ -26,11 +26,16 @@ clap = { version = "4.6.8", features = ["derive"] }
 # dependency, so this adds no new crates to the tree).
 futures-util = "0.3.34"
 glib = "0.22.11"
-gtk4 = "0.11.5"
+# `v4_10` exposes the accessible-property API (`gtk4::accessible`) used to
+# name controls for screen readers; the .deb already requires GTK >= 4.14.
+gtk4 = { version = "0.11.5", features = ["v4_10"] }
 signal-hook = "0.4.6"
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.145"
 zbus = { version = "6.3.0", features = ["tokio-multithread"] }
+# `v1_6` exposes `StyleManager::accent_color_rgba`, which the graphs use
+# to follow the user's chosen accent colour.
+libadwaita = { version = "0.9.2", features = ["v1_6"] }
 
 [dev-dependencies]
 tempfile = "3.27.0"
@@ -51,9 +56,11 @@ depends = [
   # Names checked against the Debian trixie and forky/sid archives
   # (`apt-cache policy`): GTK4's runtime library is `libgtk-4-1` in both —
   # the GTK3 package is the one with the `t64` suffix — while GLib's is
-  # `libglib2.0-0t64`. GTK4 pulls in the rest of the linked libs
-  # (pangocairo/ft2, cairo-gobject, epoxy, graphene) transitively.
+  # `libglib2.0-0t64`; libadwaita's is plain `libadwaita-1-0`. GTK4 pulls
+  # in the rest of the linked libs (pangocairo/ft2, cairo-gobject, epoxy,
+  # graphene) transitively.
   "libgtk-4-1 (>= 4.14)",
+  "libadwaita-1-0 (>= 1.6)",
   "libpango-1.0-0 (>= 1.44)",
   "libgdk-pixbuf-2.0-0 (>= 2.40)",
   "libcairo2 (>= 1.16)",
@@ -73,6 +80,10 @@ assets = [
   # Re-render the PNGs with `sh tools/render-icons.sh` after SVG edits.
   ["../../packaging/desktop/net.ynottony.ten.BiggestFan.desktop", "usr/share/applications/net.ynottony.ten.BiggestFan.desktop", "644"],
   ["../../packaging/icons/hicolor/scalable/apps/net.ynottony.ten.BiggestFan.svg", "usr/share/icons/hicolor/scalable/apps/net.ynottony.ten.BiggestFan.svg", "644"],
+  # Symbolic icons (HIG): the app one for shells and panels that want a
+  # theme-coloured glyph, the temperature one for the sensors placeholder.
+  ["../../packaging/icons/hicolor/symbolic/apps/net.ynottony.ten.BiggestFan-symbolic.svg", "usr/share/icons/hicolor/symbolic/apps/net.ynottony.ten.BiggestFan-symbolic.svg", "644"],
+  ["../../packaging/icons/hicolor/symbolic/apps/net.ynottony.ten.BiggestFan-temperature-symbolic.svg", "usr/share/icons/hicolor/symbolic/apps/net.ynottony.ten.BiggestFan-temperature-symbolic.svg", "644"],
   ["../../packaging/icons/hicolor/16x16/apps/net.ynottony.ten.BiggestFan.png", "usr/share/icons/hicolor/16x16/apps/net.ynottony.ten.BiggestFan.png", "644"],
   ["../../packaging/icons/hicolor/24x24/apps/net.ynottony.ten.BiggestFan.png", "usr/share/icons/hicolor/24x24/apps/net.ynottony.ten.BiggestFan.png", "644"],
   ["../../packaging/icons/hicolor/32x32/apps/net.ynottony.ten.BiggestFan.png", "usr/share/icons/hicolor/32x32/apps/net.ynottony.ten.BiggestFan.png", "644"],

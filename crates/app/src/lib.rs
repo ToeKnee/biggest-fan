@@ -17,5 +17,7 @@ pub mod dbus;
 pub mod engine_setup;
 pub mod fan_controls;
 pub mod power;
+pub mod sparkline;
 pub mod stress;
+pub mod theme;
 pub mod trend_graph;

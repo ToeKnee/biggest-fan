@@ -10,6 +10,9 @@
 //! Editing: **drag a handle** to move it (it snaps to whole degrees and
 //! whole percents, and can never cross its neighbours), **double-click**
 //! an empty spot to add a point, **right-click a handle** to delete one.
+//! The same edits have a keyboard path: Tab to the graph, **Left/Right**
+//! pick a handle, **Up/Down** nudge its speed, **Shift+Left/Right** its
+//! temperature, **Plus** adds a point and **Minus** removes one.
 //! Hovering a handle prints its speed and temperature beside it — on the
 //! plot rather than in a GTK tooltip, which would cover the curve.
 //! A drag is a draft: it is drawn in place of the fan's real curve and
@@ -25,8 +28,10 @@
 
 use crate::case_view::draw_centered;
 use crate::dbus;
-use crate::fan_controls::{escape_markup, push_mode};
+use crate::fan_controls::{push_mode, report_status};
+use crate::theme::{GraphPalette, Rgba};
 use biggest_fan_core as core;
+use glib::Propagation;
 use gtk4::prelude::*;
 use gtk4::{Box as GtkBox, Button, DrawingArea, Label, Orientation};
 use std::cell::{Cell, RefCell};
@@ -190,6 +195,37 @@ fn move_point(points: &mut [core::CurvePoint], index: usize, plot: Plot, x: f64,
     moved
 }
 
+/// Moves one point by a keyboard step, under the same rules a drag
+/// obeys: snapped to the edit grid, inside the domain, and strictly
+/// between its neighbours. Returns whether the point moved.
+fn nudge_point(points: &mut [core::CurvePoint], index: usize, d_temp_c: f64, d_speed: f64) -> bool {
+    let Some(point) = points.get(index) else {
+        return false;
+    };
+    let mut low = TEMP_MIN_C;
+    let mut high = TEMP_MAX_C;
+    if let Some(previous) = index.checked_sub(1).and_then(|lower| points.get(lower)) {
+        low = previous.temp_c + MIN_POINT_GAP_C;
+    }
+    if let Some(next) = points.get(index + 1) {
+        high = next.temp_c - MIN_POINT_GAP_C;
+    }
+    let temp_c = if low <= high {
+        snap(point.temp_c + d_temp_c, TEMP_SNAP_C).clamp(low, high)
+    } else {
+        point.temp_c
+    };
+    let speed = snap(point.speed + d_speed, SPEED_SNAP).clamp(0.0, 1.0);
+    let Some(point) = points.get_mut(index) else {
+        return false;
+    };
+    let moved = !((point.temp_c - temp_c).abs() < f64::EPSILON
+        && (point.speed - speed).abs() < f64::EPSILON);
+    point.temp_c = temp_c;
+    point.speed = speed;
+    moved
+}
+
 /// Adds a point under the pointer. Refused (returning `false`, leaving
 /// the points alone) when the spot is closer than [`MIN_POINT_GAP_C`] to
 /// an existing point, which is what keeps handles grabbable.
@@ -233,6 +269,9 @@ struct Frame<'a> {
     curve: Option<&'a core::FanCurve>,
     handles: Option<&'a [core::CurvePoint]>,
     focus: Option<usize>,
+    /// Whether the graph widget itself has keyboard focus (draws a ring
+    /// around the plot; the keyboard editing keys are in `wire_keyboard`).
+    focused: bool,
     operating: Option<OperatingPoint>,
     relief: Option<&'a core::FanCurve>,
 }
@@ -243,25 +282,65 @@ struct Frame<'a> {
 /// dashed temperature line plus a dot, and — while GPU throttle relief
 /// runs the fan above its curve — the curve actually running, over the
 /// saved one in hot orange.
-fn draw(cr: &cairo::Context, width: f64, height: f64, frame: &Frame<'_>) {
-    let Frame {
-        curve,
-        handles,
-        focus,
-        operating,
-        relief,
-    } = *frame;
-    cr.set_source_rgb(0.13, 0.13, 0.15);
+fn draw(cr: &cairo::Context, width: f64, height: f64, frame: &Frame<'_>, palette: &GraphPalette) {
+    let GraphPalette {
+        background,
+        text,
+        curve: curve_colour,
+        operating: operating_colour,
+        relief: relief_colour,
+    } = *palette;
+    cr.set_source_rgba(background.0, background.1, background.2, background.3);
     let _ = cr.paint();
 
     let plot = plot_box(width, height);
+    draw_grid(cr, plot, text);
+
+    // Keyboard focus ring: the graph is a focusable editing surface, so
+    // it has to show when it holds focus.
+    if frame.focused {
+        cr.set_line_width(2.0);
+        cr.set_source_rgba(curve_colour.0, curve_colour.1, curve_colour.2, 0.9);
+        cr.rectangle(
+            plot.x - 1.5,
+            plot.y - 1.5,
+            plot.width + 3.0,
+            plot.height + 3.0,
+        );
+        let _ = cr.stroke();
+    }
+
+    let Some(curve) = frame.curve else {
+        return;
+    };
+
+    draw_curve(cr, plot, curve, curve_colour);
+
+    // The throttle-relief curve the fan is really running, over the
+    // saved one in hot orange (the live marker lands on this line).
+    draw_relief(cr, plot, frame.relief, relief_colour);
+
+    // The curve's own points: hover one to read it, drag it to reshape
+    // the curve.
+    if let Some(handles) = frame.handles {
+        draw_handles(cr, plot, handles, frame.focus, palette);
+    }
+
+    if let Some(operating) = frame.operating {
+        draw_operating(cr, plot, operating, operating_colour);
+    }
+}
+
+/// The plot's frame, gridlines at the round temperatures, and corner
+/// labels marking the domain ends and the speed range.
+fn draw_grid(cr: &cairo::Context, plot: Plot, text: Rgba) {
     cr.set_line_width(1.0);
-    cr.set_source_rgba(0.55, 0.55, 0.58, 0.5);
+    cr.set_source_rgba(text.0, text.1, text.2, 0.5);
     cr.rectangle(plot.x, plot.y, plot.width, plot.height);
     let _ = cr.stroke();
 
     // Grid at the round temperatures; the frame already marks the edges.
-    cr.set_source_rgba(0.55, 0.55, 0.58, 0.2);
+    cr.set_source_rgba(text.0, text.1, text.2, 0.2);
     for temp_c in [40.0, 60.0, 80.0] {
         let x = x_for(plot, temp_c);
         cr.move_to(x, plot.y);
@@ -269,14 +348,13 @@ fn draw(cr: &cairo::Context, width: f64, height: f64, frame: &Frame<'_>) {
     }
     let _ = cr.stroke();
 
-    // Corner labels: the domain ends and the speed range.
     cr.select_font_face(
         "sans-serif",
         cairo::FontSlant::Normal,
         cairo::FontWeight::Normal,
     );
     cr.set_font_size(9.0);
-    cr.set_source_rgb(0.85, 0.85, 0.88);
+    cr.set_source_rgba(text.0, text.1, text.2, text.3);
     let _ = draw_centered(
         cr,
         plot.x,
@@ -291,18 +369,18 @@ fn draw(cr: &cairo::Context, width: f64, height: f64, frame: &Frame<'_>) {
     );
     let _ = draw_centered(cr, plot.x - 12.0, plot.y + 4.0, "100%");
     let _ = draw_centered(cr, plot.x - 12.0, plot.y + plot.height + 4.0, "0%");
+}
 
-    let Some(curve) = curve else {
-        return;
-    };
-
+/// The saved curve, stroked with a filled area under it down to the plot
+/// floor.
+fn draw_curve(cr: &cairo::Context, plot: Plot, curve: &core::FanCurve, colour: Rgba) {
     let points = curve_points(curve, plot);
     if let (Some(&(first_x, first_y)), Some(&(last_x, _))) = (points.first(), points.last()) {
         cr.move_to(first_x, first_y);
         for &(x, y) in points.iter().skip(1) {
             cr.line_to(x, y);
         }
-        cr.set_source_rgb(0.20, 0.50, 0.90);
+        cr.set_source_rgb(colour.0, colour.1, colour.2);
         cr.set_line_width(1.6);
         let _ = cr.stroke_preserve();
         // Close down to the plot floor and fill the area under the curve.
@@ -310,57 +388,68 @@ fn draw(cr: &cairo::Context, width: f64, height: f64, frame: &Frame<'_>) {
         cr.line_to(last_x, floor);
         cr.line_to(first_x, floor);
         cr.close_path();
-        cr.set_source_rgba(0.20, 0.50, 0.90, 0.12);
-        let _ = cr.fill();
-    }
-
-    // The throttle-relief curve the fan is really running, over the
-    // saved one in hot orange (the live marker lands on this line).
-    draw_relief(cr, plot, relief);
-
-    // The curve's own points: hover one to read it, drag it to reshape
-    // the curve. The focused handle gets a halo and a readout of what it
-    // asks for — its temperature and the speed there.
-    if let Some(handles) = handles {
-        for (index, point) in handles.iter().enumerate() {
-            let x = x_for(plot, point.temp_c);
-            let y = y_for(plot, point.speed);
-            let focused = focus == Some(index);
-            if focused {
-                cr.set_source_rgb(1.0, 1.0, 1.0);
-                cr.arc(x, y, 5.0, 0.0, std::f64::consts::TAU);
-                let _ = cr.fill();
-            }
-            cr.set_source_rgb(0.75, 0.88, 1.0);
-            cr.arc(x, y, 3.2, 0.0, std::f64::consts::TAU);
-            let _ = cr.fill();
-            cr.set_source_rgb(0.10, 0.25, 0.45);
-            cr.set_line_width(1.0);
-            let _ = cr.stroke();
-            if focused {
-                draw_readout(cr, plot, x, y, point);
-            }
-        }
-    }
-
-    if let Some((temp_c, commanded)) = operating {
-        let x = x_for(plot, temp_c);
-        cr.set_source_rgba(0.95, 0.75, 0.20, 0.45);
-        cr.set_line_width(1.0);
-        cr.set_dash(&[3.0, 3.0], 0.0);
-        cr.move_to(x, plot.y);
-        cr.line_to(x, plot.y + plot.height);
-        let _ = cr.stroke();
-        cr.set_dash(&[], 0.0);
-        cr.set_source_rgb(0.95, 0.75, 0.20);
-        cr.arc(x, y_for(plot, commanded), 3.0, 0.0, std::f64::consts::TAU);
+        cr.set_source_rgba(colour.0, colour.1, colour.2, 0.12);
         let _ = cr.fill();
     }
 }
 
+/// The curve's points as handles. The one the pointer is over or holding
+/// gets a halo and a readout of what it asks for — its temperature and
+/// the speed there.
+fn draw_handles(
+    cr: &cairo::Context,
+    plot: Plot,
+    handles: &[core::CurvePoint],
+    focus: Option<usize>,
+    palette: &GraphPalette,
+) {
+    let GraphPalette {
+        background,
+        text,
+        curve: curve_colour,
+        ..
+    } = *palette;
+    for (index, point) in handles.iter().enumerate() {
+        let x = x_for(plot, point.temp_c);
+        let y = y_for(plot, point.speed);
+        let focused = focus == Some(index);
+        if focused {
+            cr.set_source_rgba(text.0, text.1, text.2, text.3);
+            cr.arc(x, y, 5.0, 0.0, std::f64::consts::TAU);
+            let _ = cr.fill();
+        }
+        cr.set_source_rgb(curve_colour.0, curve_colour.1, curve_colour.2);
+        cr.arc(x, y, 3.2, 0.0, std::f64::consts::TAU);
+        let _ = cr.fill();
+        cr.set_source_rgb(background.0, background.1, background.2);
+        cr.set_line_width(1.0);
+        let _ = cr.stroke();
+        if focused {
+            draw_readout(cr, plot, x, y, point, palette);
+        }
+    }
+}
+
+/// The live operating point: a dashed temperature line plus a dot at the
+/// commanded speed.
+fn draw_operating(cr: &cairo::Context, plot: Plot, operating: OperatingPoint, colour: Rgba) {
+    let (temp_c, commanded) = operating;
+    let x = x_for(plot, temp_c);
+    cr.set_source_rgba(colour.0, colour.1, colour.2, 0.45);
+    cr.set_line_width(1.0);
+    cr.set_dash(&[3.0, 3.0], 0.0);
+    cr.move_to(x, plot.y);
+    cr.line_to(x, plot.y + plot.height);
+    let _ = cr.stroke();
+    cr.set_dash(&[], 0.0);
+    cr.set_source_rgb(colour.0, colour.1, colour.2);
+    cr.arc(x, y_for(plot, commanded), 3.0, 0.0, std::f64::consts::TAU);
+    let _ = cr.fill();
+}
+
 /// The curve GPU throttle relief is actually running, stroked in hot
 /// orange over the fan's saved curve.
-fn draw_relief(cr: &cairo::Context, plot: Plot, relief: Option<&core::FanCurve>) {
+fn draw_relief(cr: &cairo::Context, plot: Plot, relief: Option<&core::FanCurve>, colour: Rgba) {
     let Some(relief) = relief else {
         return;
     };
@@ -370,7 +459,7 @@ fn draw_relief(cr: &cairo::Context, plot: Plot, relief: Option<&core::FanCurve>)
         for &(x, y) in points.iter().skip(1) {
             cr.line_to(x, y);
         }
-        cr.set_source_rgb(0.95, 0.50, 0.25);
+        cr.set_source_rgb(colour.0, colour.1, colour.2);
         cr.set_line_width(2.0);
         let _ = cr.stroke();
     }
@@ -384,7 +473,14 @@ fn draw_relief(cr: &cairo::Context, plot: Plot, relief: Option<&core::FanCurve>)
 /// [`draw_centered`]) picks one font with no glyph fallback, so anything
 /// outside that font draws as an empty box — an arrow like U+2192 is not
 /// in every sans-serif.
-fn draw_readout(cr: &cairo::Context, plot: Plot, x: f64, y: f64, point: &core::CurvePoint) {
+fn draw_readout(
+    cr: &cairo::Context,
+    plot: Plot,
+    x: f64,
+    y: f64,
+    point: &core::CurvePoint,
+    palette: &GraphPalette,
+) {
     // The frame's axis labels left cairo at 9 px; this readout is the
     // number the user is here for, so it gets its own bigger size (the
     // next frame selects the small one again).
@@ -399,7 +495,12 @@ fn draw_readout(cr: &cairo::Context, plot: Plot, x: f64, y: f64, point: &core::C
     };
     let Ok(extents) = cr.text_extents(&label) else {
         // No metrics to place a box by; the text alone still says the job.
-        cr.set_source_rgb(1.0, 1.0, 1.0);
+        cr.set_source_rgba(
+            palette.text.0,
+            palette.text.1,
+            palette.text.2,
+            palette.text.3,
+        );
         let _ = draw_centered(cr, x, baseline, &label);
         return;
     };
@@ -410,7 +511,14 @@ fn draw_readout(cr: &cairo::Context, plot: Plot, x: f64, y: f64, point: &core::C
     } else {
         x.clamp(plot.x + half_box, plot.x + plot.width - half_box)
     };
-    cr.set_source_rgba(0.07, 0.08, 0.10, 0.9);
+    // The box is the plot background again: it erases the curve behind
+    // the text on any theme.
+    cr.set_source_rgba(
+        palette.background.0,
+        palette.background.1,
+        palette.background.2,
+        0.9,
+    );
     cr.rectangle(
         text_x - half_box,
         baseline + extents.y_bearing() - 2.0,
@@ -418,7 +526,12 @@ fn draw_readout(cr: &cairo::Context, plot: Plot, x: f64, y: f64, point: &core::C
         extents.height() + 4.0,
     );
     let _ = cr.fill();
-    cr.set_source_rgb(1.0, 1.0, 1.0);
+    cr.set_source_rgba(
+        palette.text.0,
+        palette.text.1,
+        palette.text.2,
+        palette.text.3,
+    );
     let _ = draw_centered(cr, text_x, baseline, &label);
 }
 
@@ -445,10 +558,7 @@ fn commit_points(
     let mode = match core::FanCurve::new(points.to_vec()) {
         Ok(curve) => core::FanMode::Auto { sensor, curve },
         Err(error) => {
-            status_label.set_markup(&format!(
-                "<span size=\"small\" foreground=\"#c0392b\">⚠ curve not changed: {}</span>",
-                escape_markup(&error.to_string())
-            ));
+            report_status(status_label, &format!("curve not changed: {error}"));
             return;
         }
     };
@@ -493,38 +603,20 @@ impl CurveGraph {
         // Deliberately no tooltip: the popup lands on top of the curve and
         // under the pointer while editing. Hovering a handle prints what it
         // asks for on the plot instead, and the gestures are in the README.
+        // The graph is focusable so the curve can be edited without a
+        // pointer (HIG: every pointer action needs a keyboard path).
+        area.set_focusable(true);
+        accessible_curve_keys(&area);
         let operating = Rc::new(RefCell::new(None));
         let draft: Draft = Rc::new(RefCell::new(None));
         let grabbed: Rc<Cell<Option<usize>>> = Rc::new(Cell::new(None));
         // Which handle the pointer is resting on (no drag involved).
         let hovered: Rc<Cell<Option<usize>>> = Rc::new(Cell::new(None));
-        // The keep offer shown while throttle relief lifts this fan's
-        // curve; `set_operating_point` (every tick) shows or hides it.
-        let save_row = GtkBox::new(Orientation::Horizontal, 6);
-        let save_button = Button::builder()
-            .label("Keep this curve")
-            .tooltip_text(
-                "make the curve the fan is actually running its saved curve; \
-                 relief keeps lifting from there while the card throttles, \
-                 and \"Save config\" writes it to disk",
-            )
-            .build();
-        {
-            let rc = Rc::clone(engine_rc);
-            let fan_id = fan_id.clone();
-            let status_label = status_label.clone();
-            let client = client.clone();
-            save_button.connect_clicked(move |_| {
-                save_relief_curve(&rc, &fan_id, &status_label, &client);
-            });
-        }
-        save_row.append(
-            &Label::builder()
-                .label("GPU relief is running this curve")
-                .build(),
-        );
-        save_row.append(&save_button);
-        save_row.set_visible(false);
+        // Which handle the keyboard picked, and whether the graph itself
+        // has keyboard focus (the focus ring).
+        let selected: Rc<Cell<Option<usize>>> = Rc::new(Cell::new(None));
+        let has_focus = Rc::new(Cell::new(false));
+        let save_row = relief_save_row(engine_rc, fan_id, status_label, client);
         let container = GtkBox::new(Orientation::Vertical, 2);
         container.append(&area);
         container.append(&save_row);
@@ -536,6 +628,8 @@ impl CurveGraph {
         let draw_draft = Rc::clone(&draft);
         let draw_grabbed = Rc::clone(&grabbed);
         let draw_hovered = Rc::clone(&hovered);
+        let draw_selected = Rc::clone(&selected);
+        let draw_has_focus = Rc::clone(&has_focus);
         area.set_draw_func(move |_area, cr, width, height| {
             // Take a copy of what is needed and release the engine
             // before drawing (same care as the case canvas).
@@ -570,11 +664,17 @@ impl CurveGraph {
                 &Frame {
                     curve: drafted.as_ref().or(curve.as_ref()),
                     handles: handles.as_deref(),
-                    // A held handle outranks a hovered one.
-                    focus: draw_grabbed.get().or_else(|| draw_hovered.get()),
+                    // A held handle outranks a keyboard-selected one,
+                    // which outranks a hovered one.
+                    focus: draw_grabbed
+                        .get()
+                        .or_else(|| draw_selected.get())
+                        .or_else(|| draw_hovered.get()),
+                    focused: draw_has_focus.get(),
                     operating: *draw_operating.borrow(),
                     relief: relief.as_ref(),
                 },
+                &GraphPalette::resolve(),
             );
         });
 
@@ -589,6 +689,15 @@ impl CurveGraph {
         );
         wire_point_edits(&area, engine_rc, fan_id, client, status_label);
         wire_hover(&area, engine_rc, fan_id, &draft, &hovered);
+        wire_keyboard(
+            &area,
+            engine_rc,
+            fan_id,
+            client,
+            status_label,
+            &selected,
+            &has_focus,
+        );
 
         Self {
             area,
@@ -619,6 +728,42 @@ impl CurveGraph {
         self.save_row.set_visible(relieved);
         self.area.queue_draw();
     }
+}
+
+/// The keep offer shown while throttle relief lifts a fan's curve;
+/// `set_operating_point` (every tick) shows or hides it.
+fn relief_save_row(
+    engine_rc: &Rc<RefCell<core::Engine>>,
+    fan_id: &core::FanId,
+    status_label: &Label,
+    client: &dbus::Client,
+) -> GtkBox {
+    let save_row = GtkBox::new(Orientation::Horizontal, 6);
+    let save_button = Button::builder()
+        .label("Keep this curve")
+        .tooltip_text(
+            "make the curve the fan is actually running its saved curve; \
+             relief keeps lifting from there while the card throttles, \
+             and \"Save config\" writes it to disk",
+        )
+        .build();
+    {
+        let rc = Rc::clone(engine_rc);
+        let fan_id = fan_id.clone();
+        let status_label = status_label.clone();
+        let client = client.clone();
+        save_button.connect_clicked(move |_| {
+            save_relief_curve(&rc, &fan_id, &status_label, &client);
+        });
+    }
+    save_row.append(
+        &Label::builder()
+            .label("GPU relief is running this curve")
+            .build(),
+    );
+    save_row.append(&save_button);
+    save_row.set_visible(false);
+    save_row
 }
 
 /// Keeps a throttle-lifted curve as the fan's own: the curve the fan is
@@ -781,10 +926,7 @@ fn wire_point_edits(
             return;
         };
         if !insert_point(&mut points, plot, x, y) {
-            add_status.set_markup(
-                "<span size=\"small\" foreground=\"#c0392b\">⚠ too close to another point on \
-                 the curve</span>",
-            );
+            report_status(&add_status, "too close to another point on the curve");
             return;
         }
         commit_points(&add_engine, &add_fan_id, &points, &add_status, &add_client);
@@ -807,9 +949,9 @@ fn wire_point_edits(
             return;
         };
         if points.len() <= MIN_POINTS {
-            del_status.set_markup(
-                "<span size=\"small\" foreground=\"#c0392b\">⚠ a curve keeps at least two \
-                 points — pick a preset for a simpler one</span>",
+            report_status(
+                &del_status,
+                "a curve keeps at least two points — pick a preset for a simpler one",
             );
             return;
         }
@@ -861,6 +1003,195 @@ fn wire_hover(
         }
     });
     area.add_controller(motion);
+}
+
+/// Names the graph for assistive technology and spells out its keyboard
+/// editing keys as the accessible description.
+fn accessible_curve_keys(area: &DrawingArea) {
+    area.update_property(&[gtk4::accessible::Property::Label("Curve graph")]);
+    area.update_property(&[gtk4::accessible::Property::Description(
+        "Left and Right select a curve point, Up and Down change its speed, \
+         Shift with Left or Right changes its temperature, Plus adds a point \
+         beside the selected one, Minus removes it",
+    )]);
+}
+
+/// Wires the keyboard editing path (HIG: every pointer action needs a
+/// keyboard equivalent). Tab reaches the graph; Left/Right pick a
+/// handle, Up/Down nudge its speed a percent, Shift+Left/Right nudge its
+/// temperature a degree, Plus inserts a point halfway to the next handle
+/// and Minus removes the selected one. Like the click gestures, every
+/// edit commits at once — a keypress has no half-finished state.
+fn wire_keyboard(
+    area: &DrawingArea,
+    engine_rc: &Rc<RefCell<core::Engine>>,
+    fan_id: &core::FanId,
+    client: &dbus::Client,
+    status_label: &Label,
+    selected: &Rc<Cell<Option<usize>>>,
+    has_focus: &Rc<Cell<bool>>,
+) {
+    // The focus ring follows the widget's focus; the selection goes away
+    // with it so a stale handle is never quietly nudged next visit.
+    let enter_area = area.clone();
+    let enter_flag = Rc::clone(has_focus);
+    let leave_area = area.clone();
+    let leave_flag = Rc::clone(has_focus);
+    let leave_selected = Rc::clone(selected);
+    let focus = gtk4::EventControllerFocus::new();
+    focus.connect_enter(move |_| {
+        enter_flag.set(true);
+        enter_area.queue_draw();
+    });
+    focus.connect_leave(move |_| {
+        leave_flag.set(false);
+        leave_selected.take();
+        leave_area.queue_draw();
+    });
+    area.add_controller(focus);
+
+    let editor = CurveEditor {
+        area: area.clone(),
+        engine: Rc::clone(engine_rc),
+        fan_id: fan_id.clone(),
+        client: client.clone(),
+        status: status_label.clone(),
+        selected: Rc::clone(selected),
+    };
+    let keys = gtk4::EventControllerKey::new();
+    keys.connect_key_pressed(move |_controller, key, _keycode, modifiers| {
+        editor.key_press(key, modifiers.contains(gtk4::gdk::ModifierType::SHIFT_MASK))
+    });
+    area.add_controller(keys);
+}
+
+/// Everything a keyboard curve edit touches: the graph to redraw, the
+/// engine to read and commit through, and the selected handle.
+struct CurveEditor {
+    area: DrawingArea,
+    engine: Rc<RefCell<core::Engine>>,
+    fan_id: core::FanId,
+    client: dbus::Client,
+    status: Label,
+    selected: Rc<Cell<Option<usize>>>,
+}
+
+impl CurveEditor {
+    /// One keypress on the focused graph: the keyboard curve edits (see
+    /// [`wire_keyboard`]). Every edit commits at once, like the click
+    /// gestures do.
+    fn key_press(&self, key: gtk4::gdk::Key, shift: bool) -> Propagation {
+        let area = &self.area;
+        let engine_rc = &self.engine;
+        let fan_id = &self.fan_id;
+        let client = &self.client;
+        let status_label = &self.status;
+        let selected = &*self.selected;
+        let Some(plot) = plot_of(area) else {
+            return Propagation::Proceed;
+        };
+        let Some(mut points) = auto_points(engine_rc, fan_id) else {
+            return Propagation::Proceed;
+        };
+        match key {
+            gtk4::gdk::Key::Left | gtk4::gdk::Key::Right => {
+                let backwards = key == gtk4::gdk::Key::Left;
+                let Some(index) = selected.get() else {
+                    // The first arrow picks an end handle.
+                    selected.set(Some(if backwards {
+                        points.len().saturating_sub(1)
+                    } else {
+                        0
+                    }));
+                    area.queue_draw();
+                    return Propagation::Stop;
+                };
+                if shift {
+                    let d_temp_c = if backwards { -TEMP_SNAP_C } else { TEMP_SNAP_C };
+                    if nudge_point(&mut points, index, d_temp_c, 0.0) {
+                        commit_points(engine_rc, fan_id, &points, status_label, client);
+                    }
+                } else {
+                    let next = if backwards {
+                        index.saturating_sub(1)
+                    } else {
+                        (index + 1).min(points.len().saturating_sub(1))
+                    };
+                    selected.set(Some(next));
+                }
+                area.queue_draw();
+                Propagation::Stop
+            }
+            gtk4::gdk::Key::Up | gtk4::gdk::Key::Down => {
+                let index = selected.get().unwrap_or(0);
+                selected.set(Some(index));
+                let d_speed = if key == gtk4::gdk::Key::Up {
+                    SPEED_SNAP
+                } else {
+                    -SPEED_SNAP
+                };
+                if nudge_point(&mut points, index, 0.0, d_speed) {
+                    commit_points(engine_rc, fan_id, &points, status_label, client);
+                }
+                area.queue_draw();
+                Propagation::Stop
+            }
+            gtk4::gdk::Key::plus | gtk4::gdk::Key::KP_Add => self.insert_beside(&mut points, plot),
+            gtk4::gdk::Key::minus | gtk4::gdk::Key::KP_Subtract => {
+                let index = selected.get().unwrap_or(0);
+                if points.len() <= MIN_POINTS {
+                    report_status(
+                        status_label,
+                        "a curve keeps at least two points — pick a preset for a simpler one",
+                    );
+                    return Propagation::Stop;
+                }
+                points.remove(index);
+                selected.set(Some(index.min(points.len() - 1)));
+                commit_points(engine_rc, fan_id, &points, status_label, client);
+                area.queue_draw();
+                Propagation::Stop
+            }
+            gtk4::gdk::Key::Escape => {
+                if selected.take().is_some() {
+                    area.queue_draw();
+                }
+                Propagation::Stop
+            }
+            _ => Propagation::Proceed,
+        }
+    }
+
+    /// Inserts a point halfway to the next handle (the previous one at
+    /// the far end) and selects it.
+    fn insert_beside(&self, points: &mut Vec<core::CurvePoint>, plot: Plot) -> Propagation {
+        let index = self.selected.get().unwrap_or(0);
+        let (lower, upper) = match points.get(index + 1) {
+            Some(_) => (index, index + 1),
+            None => (index.saturating_sub(1), index),
+        };
+        let (Some(low), Some(high)) = (points.get(lower), points.get(upper)) else {
+            return Propagation::Proceed;
+        };
+        let mid_temp = f64::midpoint(low.temp_c, high.temp_c);
+        let mid_speed = f64::midpoint(low.speed, high.speed);
+        if !insert_point(points, plot, x_for(plot, mid_temp), y_for(plot, mid_speed)) {
+            report_status(&self.status, "too close to another point on the curve");
+            return Propagation::Stop;
+        }
+        // The new point lands at `upper` (it sorts between the two it
+        // was placed between): select it.
+        self.selected.set(Some(upper));
+        commit_points(
+            &self.engine,
+            &self.fan_id,
+            points,
+            &self.status,
+            &self.client,
+        );
+        self.area.queue_draw();
+        Propagation::Stop
+    }
 }
 
 /// The points the graph is showing as handles: the live draft while a
@@ -1121,6 +1452,74 @@ mod tests {
     }
 
     #[test]
+    fn a_keyboard_nudge_snaps_and_stays_between_neighbours() {
+        let mut points = vec![
+            core::CurvePoint {
+                temp_c: 40.0,
+                speed: 0.2,
+            },
+            core::CurvePoint {
+                temp_c: 60.0,
+                speed: 0.5,
+            },
+            core::CurvePoint {
+                temp_c: 80.0,
+                speed: 0.8,
+            },
+        ];
+        assert!(nudge_point(&mut points, 1, 1.0, 0.01));
+        assert_eq!((points[1].temp_c, points[1].speed), (61.0, 0.51));
+        for _ in 0..40 {
+            nudge_point(&mut points, 1, 1.0, 0.0);
+        }
+        assert_eq!(points[1].temp_c, 78.0, "two degrees short of the next");
+        for _ in 0..80 {
+            nudge_point(&mut points, 1, -1.0, 0.0);
+        }
+        assert_eq!(points[1].temp_c, 42.0, "two degrees past the previous");
+    }
+
+    #[test]
+    fn a_keyboard_speed_nudge_clamps_at_the_ends() {
+        let mut points = vec![
+            core::CurvePoint {
+                temp_c: 40.0,
+                speed: 0.0,
+            },
+            core::CurvePoint {
+                temp_c: 60.0,
+                speed: 1.0,
+            },
+        ];
+        assert!(!nudge_point(&mut points, 0, 0.0, -0.01), "already at 0%");
+        assert!(!nudge_point(&mut points, 1, 0.0, 0.01), "already at 100%");
+        assert!(nudge_point(&mut points, 0, 0.0, 0.01));
+        assert!((points[0].speed - 0.01).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_squeezed_point_keeps_its_temperature_under_a_nudge() {
+        let mut points = vec![
+            core::CurvePoint {
+                temp_c: 50.0,
+                speed: 0.2,
+            },
+            core::CurvePoint {
+                temp_c: 51.5,
+                speed: 0.5,
+            },
+            core::CurvePoint {
+                temp_c: 53.0,
+                speed: 0.8,
+            },
+        ];
+        // Neighbours closer than twice the gap: no room to move.
+        assert!(nudge_point(&mut points, 1, 1.0, 0.05));
+        assert_eq!(points[1].temp_c, 51.5, "the temperature cannot budge");
+        assert!((points[1].speed - 0.55).abs() < 1e-9, "the speed can");
+    }
+
+    #[test]
     fn inserting_a_point_lands_in_temperature_order() {
         let p = plot();
         let mut points = ramp_curve().points().to_vec();
@@ -1212,9 +1611,11 @@ mod tests {
                     curve: Some(&curve),
                     handles: Some(curve.points()),
                     focus,
+                    focused: false,
                     operating: None,
                     relief: None,
                 },
+                &GraphPalette::DARK,
             );
         }
         let stride = usize::try_from(surface.stride()).expect("a positive stride");
@@ -1268,9 +1669,11 @@ mod tests {
                     curve: Some(&curve),
                     handles: Some(curve.points()),
                     focus: None,
+                    focused: false,
                     operating: None,
                     relief,
                 },
+                &GraphPalette::DARK,
             );
         }
         let stride = usize::try_from(surface.stride()).expect("a positive stride");

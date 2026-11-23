@@ -59,7 +59,7 @@ pub struct SensorDescriptor {
     pub kind: SensorSourceKind,
     /// What the hardware calls it, e.g. `k10temp Tccd1`.
     pub raw_label: String,
-    /// Best guess at a human readable name, e.g. `CPU CCD 1 temperature`.
+    /// Best guess at a human readable name, e.g. `CPU CCD 1`.
     /// Configuration can override this via the `[sensor_names]` table.
     pub default_name: String,
 }

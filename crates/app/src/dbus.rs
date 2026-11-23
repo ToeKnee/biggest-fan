@@ -396,7 +396,7 @@ pub fn drain_commands(engine: &mut core::Engine, commands: &Receiver<Command>) {
     }
 }
 
-/// What the service tells the GUI about, to show in the status line.
+/// What the service tells the GUI about, to show as a toast.
 #[derive(Debug)]
 pub enum Event {
     /// A human-readable confirmation or error from the service.
@@ -560,7 +560,7 @@ fn client_worker(
             match envelope {
                 Err(error) => {
                     events
-                        .send(Event::Status(format!("service unreachable: {error}")))
+                        .send(Event::Status(format!("Service unreachable: {error}")))
                         .ok();
                 }
                 Ok(envelope) => {
@@ -571,14 +571,10 @@ fn client_worker(
                         } else if let Some(config) = reply.config {
                             events.send(Event::Config(config)).ok();
                         } else if was_save {
-                            events
-                                .send(Event::Status(
-                                    "config applied and saved by the service".to_string(),
-                                ))
-                                .ok();
+                            events.send(Event::Status("Config saved".to_string())).ok();
                         }
                     } else if let Some(error) = reply.error {
-                        events.send(Event::Status(format!("service: {error}"))).ok();
+                        events.send(Event::Status(format!("Service: {error}"))).ok();
                     }
                 }
             }

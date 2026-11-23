@@ -3,15 +3,18 @@
 
 use crate::case_view;
 use crate::dbus;
-use crate::fan_controls::{FAN_TILE_CSS, FanControls, escape_markup};
+use crate::fan_controls::{FAN_TILE_CSS, FanControls};
+use crate::sparkline::Sparkline;
 use crate::stress;
 use biggest_fan_core as core;
 use glib::{ControlFlow, Propagation, SourceId};
 use gtk4::prelude::*;
 use gtk4::{
-    Application, ApplicationWindow, Box as GtkBox, Button, FlowBox, HeaderBar, Label, ListBox,
-    ListBoxRow, Orientation, PolicyType, ScrolledWindow, SpinButton, gio,
+    Align, Box as GtkBox, Button, FlowBox, FlowBoxChild, Label, ListBox, ListBoxRow, Orientation,
+    PolicyType, ScrolledWindow, SpinButton, gio,
 };
+use libadwaita as adw;
+use libadwaita::prelude::*;
 use std::cell::Cell;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -26,6 +29,9 @@ struct GuiState {
     fan_controls: RefCell<Vec<FanControls>>,
     /// The flow of fan row tiles (new rows are inserted into it).
     fans_flow: FlowBox,
+    /// Shown while the fan list has no visible rows (HIG placeholder:
+    /// icon, heading and guidance).
+    fans_placeholder: GtkBox,
     /// Fans parked as `hidden` (by Detect or a lost driver): a reveal
     /// button and one row per parked fan with a "Show" button, the way
     /// the sensor list treats hidden temperatures.
@@ -35,14 +41,18 @@ struct GuiState {
     /// The sensor readout list with its hide/show plumbing.
     sensor_panel: Rc<SensorPanel>,
     case_area: gtk4::DrawingArea,
-    status_label: Label,
+    /// One-shot results (detect, save, add, hide/show, errors) appear
+    /// here as transient toasts; there is no status bar (HIG).
+    toasts: adw::ToastOverlay,
+    /// Header spinner shown while a Detect is in flight; the Detect
+    /// button is insensitive until the answer arrives.
+    detect_spinner: gtk4::Spinner,
+    detect_button: Button,
+    detect_pending: Cell<bool>,
     /// Handle on the running root daemon; every change goes through it.
     client: dbus::Client,
     /// Answers from that daemon, drained on every tick.
     service_events: Rc<RefCell<mpsc::Receiver<dbus::Event>>>,
-    /// The Stress lab section, whose progress and results share this
-    /// status bar with the control loop (see `tick_once`).
-    stress: Rc<stress::StressPanel>,
     /// Tick counter behind the periodic service-config poll (the service
     /// owns the live config, so this mirror follows it).
     config_poll: Cell<u32>,
@@ -54,26 +64,28 @@ struct GuiState {
 /// Control-loop ticks between polls of the service's config.
 const SERVICE_CONFIG_POLL_TICKS: u32 = 5;
 
-/// One row of the "Sensors" readout list.
+/// One tile of the "Sensors" readout flow.
 struct SensorRow {
-    /// Resolved display name, rebuilt into the row text every tick.
+    /// Resolved display name, quoted in the hide/show toasts.
     name: String,
-    /// Live "name  42.5 °C" label.
+    /// Live temperature label ("42.5 °C").
     value: Label,
-    /// The row itself — hidden sensors leave the list until shown again.
-    row: ListBoxRow,
-    /// This sensor's hide/show button.
+    /// The tile's inline history of this temperature.
+    spark: Sparkline,
+    /// The tile itself — hidden sensors leave the flow until shown again.
+    row: FlowBoxChild,
+    /// This sensor's hide/show icon button.
     toggle: Button,
 }
 
-/// The "Sensors" readout list and its hide/show plumbing. Hiding a
+/// The "Sensors" readout tiles and their hide/show plumbing. Hiding a
 /// sensor is a display-only config flag ([`core::Engine::set_sensor_hidden`]):
 /// the engine keeps reading hidden sensors, so fans bound to them keep
 /// working, and the flag only reaches the service on the next Save
 /// config — same as hiding a detected fan.
 struct SensorPanel {
     engine: Rc<RefCell<core::Engine>>,
-    status: Label,
+    toasts: adw::ToastOverlay,
     rows: BTreeMap<core::SensorId, SensorRow>,
     /// "N hidden — show" button; reveals the hidden rows so a mistake
     /// can be undone.
@@ -82,21 +94,17 @@ struct SensorPanel {
 }
 
 impl SensorPanel {
-    /// Hides or shows one sensor: the flag goes to the mirror engine (and
-    /// from there into the config on the next save), the row follows.
-    fn set_hidden(&self, id: &core::SensorId, hide: bool) {
-        if let Err(error) = self.engine.borrow_mut().set_sensor_hidden(id, hide) {
-            self.status
-                .set_text(&format!("could not change {id}: {error}"));
+    /// Hides or shows one sensor and toasts the result with an **Undo**
+    /// button — the HIG's preferred pattern for reversible actions.
+    /// Needs the `Rc` so the toast's Undo callback can reach the panel.
+    fn set_hidden(self: &Rc<Self>, id: &core::SensorId, hide: bool) {
+        if !self.apply_hidden(id, hide) {
             return;
         }
         let Some(row) = self.rows.get(id) else {
             return;
         };
-        row.toggle.set_label(if hide { "Show" } else { "Hide" });
-        row.row.set_visible(!hide || self.showing_hidden.get());
-        self.refresh_reveal();
-        self.status.set_text(&if hide {
+        let toast = adw::Toast::new(&if hide {
             format!("{} hidden — press Save config to keep it hidden", row.name)
         } else {
             format!(
@@ -104,6 +112,48 @@ impl SensorPanel {
                 row.name
             )
         });
+        toast.set_button_label(Some("Undo"));
+        let panel = Rc::clone(self);
+        let undo_id = id.clone();
+        toast.connect_button_clicked(move |_| {
+            // Reverting quietly (no second toast) keeps the undo trail
+            // from stacking up on the overlay.
+            panel.apply_hidden(&undo_id, !hide);
+        });
+        self.toasts.add_toast(toast);
+    }
+
+    /// The hide/show plumbing on its own: the flag goes to the mirror
+    /// engine (and from there into the config on the next save), the row
+    /// follows. False when the engine refused (already toasted). The Undo
+    /// button calls this directly, skipping the toast.
+    fn apply_hidden(&self, id: &core::SensorId, hide: bool) -> bool {
+        if let Err(error) = self.engine.borrow_mut().set_sensor_hidden(id, hide) {
+            show_toast(&self.toasts, &format!("Could not change {id}: {error}"));
+            return false;
+        }
+        let Some(row) = self.rows.get(id) else {
+            return false;
+        };
+        // The icon shows the action: an eye-with-slash to hide a visible
+        // sensor, a plain eye to bring a hidden one back.
+        row.toggle.set_icon_name(if hide {
+            "view-reveal-symbolic"
+        } else {
+            "view-conceal-symbolic"
+        });
+        row.toggle.set_tooltip_text(Some(if hide {
+            "Show This Temperature"
+        } else {
+            "Hide This Temperature"
+        }));
+        accessible_name(
+            &row.toggle,
+            &format!("{} {}", if hide { "Show" } else { "Hide" }, row.name),
+        );
+        row.row.set_visible(!hide || self.showing_hidden.get());
+        self.refresh_reveal();
+        true
     }
 
     /// Flips the hidden rows' visibility as a group (the row-by-row
@@ -145,13 +195,18 @@ impl SensorPanel {
 /// handle, `client`), and its answers arrive as events on every tick.
 /// Handing the headers back to hardware control at exit is a no-op here:
 /// the daemon owns them.
+///
+/// # Panics
+///
+/// Never in practice: the only `expect` guards the `activate` signal
+/// firing on the Adwaita application built right above.
 #[must_use]
 pub fn run(
     engine: core::Engine,
     client: dbus::Client,
     service_events: mpsc::Receiver<dbus::Event>,
 ) -> glib::ExitCode {
-    let application = Application::builder()
+    let application = adw::Application::builder()
         .application_id("net.ynottony.ten.BiggestFan")
         // Each launch gets its own window and engine mirror. Without this,
         // GApplication would remote-activate an already-running instance —
@@ -162,6 +217,12 @@ pub fn run(
     let activate_engine = Rc::clone(&engine_rc);
     let activate_events = Rc::new(RefCell::new(service_events));
     application.connect_activate(move |application| {
+        add_packaged_icon_search_path();
+        // The signal comes from the application built above, so the
+        // downcast cannot fail.
+        let application = application
+            .downcast_ref::<adw::Application>()
+            .expect("activate fires on the Adwaita application we built");
         build_window(
             application,
             &activate_engine,
@@ -190,11 +251,12 @@ pub const SECTION_CLASS: &str = "section";
 /// The stylesheet the section classes expect, loaded next to the fan-tile
 /// one. The title rule spans the panel width; the top margin separates
 /// sections, except for the first heading in a column which needs none.
+/// The colours are libadwaita's own (the app runs under `adw::Application`).
 const SECTION_CSS: &str = "
 .section-title {
     margin-top: 16px;
     padding-bottom: 4px;
-    border-bottom: 1px solid alpha(@theme_fg_color, 0.35);
+    border-bottom: 1px solid alpha(@window_fg_color, 0.35);
 }
 
 .section-title:first-child {
@@ -206,25 +268,83 @@ const SECTION_CSS: &str = "
 }
 ";
 
-/// A section heading label: Pango does the larger bold text, the
-/// stylesheet the spacing and the rule underneath.
+/// The sensor-tile class: the fan tiles' soft card, sized down for a
+/// chip's name and live reading.
+pub const SENSOR_TILE_CLASS: &str = "sensor-tile";
+
+/// The stylesheet [`SENSOR_TILE_CLASS`] expects.
+const SENSOR_TILE_CSS: &str = "
+.sensor-tile {
+    background-color: alpha(@window_fg_color, 0.05);
+    border: 1px solid alpha(@window_fg_color, 0.16);
+    border-radius: 8px;
+    padding: 6px 10px;
+}
+";
+
+/// A section heading label: libadwaita's `title-4` typographic class
+/// does the larger bold text, the stylesheet the spacing and the rule
+/// underneath.
 #[must_use]
 pub fn section_title(text: &str) -> Label {
-    let title = Label::builder()
-        .label(format!(
-            "<span size=\"large\"><b>{}</b></span>",
-            escape_markup(text)
-        ))
-        .use_markup(true)
-        .xalign(0.0)
-        .build();
+    let title = Label::builder().label(text).xalign(0.0).build();
+    title.add_css_class("title-4");
     title.add_css_class(SECTION_TITLE_CLASS);
     title
 }
 
+/// Names a control for assistive technology: the visible labels are only
+/// visual neighbours, so the accessible name has to be set explicitly.
+pub(crate) fn accessible_name(widget: &impl IsA<gtk4::Accessible>, name: &str) {
+    widget.update_property(&[gtk4::accessible::Property::Label(name)]);
+}
+
+/// Shows a transient toast: the HIG home for one-shot results (ongoing
+/// state stays inline in the panels instead).
+fn show_toast(toasts: &adw::ToastOverlay, message: &str) {
+    toasts.add_toast(adw::Toast::new(message));
+}
+
+/// The app's own symbolic icons ship in `packaging/icons` and reach the
+/// system icon theme through the .deb. When running from the repo
+/// (`cargo run`) they are not installed, so add that directory to the
+/// icon search path; installed runs already find them and skip this.
+fn add_packaged_icon_search_path() {
+    let icons = std::env::current_dir()
+        .unwrap_or_default()
+        .join("packaging/icons");
+    if icons.is_dir()
+        && let Some(display) = gtk4::gdk::Display::default()
+    {
+        gtk4::IconTheme::for_display(&display).add_search_path(icons.to_string_lossy().as_ref());
+    }
+}
+
+/// The HIG placeholder for an empty section: a dim symbolic icon, a
+/// heading and one line of guidance, instead of a bare text line.
+fn placeholder(icon_name: &str, heading: &str, guidance: &str) -> GtkBox {
+    let section = GtkBox::new(Orientation::Vertical, 4);
+    let icon = gtk4::Image::from_icon_name(icon_name);
+    icon.set_pixel_size(32);
+    icon.set_halign(Align::Start);
+    icon.add_css_class("dim-label");
+    let title = Label::builder().label(heading).xalign(0.0).build();
+    title.add_css_class("heading");
+    let body = Label::builder()
+        .label(guidance)
+        .wrap(true)
+        .xalign(0.0)
+        .build();
+    body.add_css_class("dim-label");
+    section.append(&icon);
+    section.append(&title);
+    section.append(&body);
+    section
+}
+
 /// Installs the app's stylesheet (the fan-row tiles from
-/// `fan_controls::FAN_TILE_CSS` and the section classes defined above)
-/// on the display this window lives on.
+/// `fan_controls::FAN_TILE_CSS` and the section and sensor-tile classes
+/// defined above) on the display this window lives on.
 fn install_stylesheet() {
     let provider = gtk4::CssProvider::new();
     // A broken selector would be reported by GTK itself; the rows stay
@@ -232,6 +352,7 @@ fn install_stylesheet() {
     // would need the gtk `v4_12` feature.)
     provider.load_from_data(FAN_TILE_CSS);
     provider.load_from_data(SECTION_CSS);
+    provider.load_from_data(SENSOR_TILE_CSS);
     // The window exists before this runs, so a display always does.
     if let Some(display) = gtk4::gdk::Display::default() {
         gtk4::style_context_add_provider_for_display(
@@ -242,16 +363,104 @@ fn install_stylesheet() {
     }
 }
 
-/// Builds the window's header bar: Detect sits left of Save, both at the
-/// right-hand end.
-fn build_header_bar() -> (HeaderBar, Button, Button) {
-    let header = HeaderBar::new();
-    let save_button = Button::builder().label("Save config").build();
-    let detect_button = Button::builder().label("Detect fans").build();
-    // `pack_end` stacks right-to-left, so this puts Detect left of Save.
+/// Builds the window's header bar (HIG: few controls, actions at one
+/// end, menus at the other, everything tooltipped): Detect and Save as
+/// flat icon+label buttons, a spinner that only appears while a Detect
+/// is in flight, and a primary menu holding the rarely-touched
+/// refresh-rate spin.
+fn build_header_bar(
+    engine_rc: &Rc<RefCell<core::Engine>>,
+) -> (
+    adw::HeaderBar,
+    Button,
+    Button,
+    SpinButton,
+    gtk4::Spinner,
+    gtk4::MenuButton,
+) {
+    let header = adw::HeaderBar::new();
+    let detect_button = Button::builder()
+        .label("Detect fans")
+        .icon_name("view-refresh-symbolic")
+        .tooltip_text("Spin Up Headers and Park Unconnected Fans")
+        .build();
+    let save_button = Button::builder()
+        .label("Save config")
+        .icon_name("document-save-symbolic")
+        .tooltip_text("Write Settings to the Service Config (Ctrl+S)")
+        .build();
+    // The wait for Detect is short and has no result of its own: a
+    // spinner next to the button shows it instead of a status message.
+    let detect_spinner = gtk4::Spinner::new();
+    detect_spinner.set_visible(false);
+    // The refresh-rate spin is a setup control, not a per-visit action:
+    // it lives in the primary menu, keeping the bar itself spare.
+    let interval_spin = SpinButton::builder()
+        .digits(1)
+        .adjustment(&gtk4::Adjustment::new(1.0, 0.1, 30.0, 0.1, 1.0, 0.1))
+        .build();
+    interval_spin.set_alignment(1.0); // HIG: right-justified numbers.
+    let poll_ms = engine_rc.borrow().poll_interval_ms();
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "poll interval is tiny compared to u64::MAX"
+    )]
+    interval_spin.set_value(poll_ms as f64 / 1000.0);
+    let settings_box = GtkBox::new(Orientation::Horizontal, 8);
+    settings_box.set_margin_start(12);
+    settings_box.set_margin_end(12);
+    settings_box.set_margin_top(8);
+    settings_box.set_margin_bottom(8);
+    let interval_label = Label::builder()
+        .label("_Update every (s)")
+        .use_underline(true)
+        .mnemonic_widget(&interval_spin)
+        .build();
+    settings_box.append(&interval_label);
+    settings_box.append(&interval_spin);
+    // A popover menu (HIG primary menu): the refresh spin as a custom
+    // row, then the standard About item the HIG expects in every
+    // primary menu (its "app.about" action is added in `build_window`).
+    let menu_model = gio::Menu::new();
+    let settings_section = gio::Menu::new();
+    // A menu item with the `custom` attribute reserves a slot that
+    // `PopoverMenu::add_child` fills with a real widget. (A `custom.<id>`
+    // *action* would only make an empty button, not a slot.)
+    let settings_item = gio::MenuItem::new(None, None);
+    settings_item.set_attribute_value("custom", Some(&"settings".to_variant()));
+    settings_section.append_item(&settings_item);
+    let about_section = gio::Menu::new();
+    about_section.append(Some("About Biggest Fan"), Some("app.about"));
+    menu_model.append_section(None, &settings_section);
+    menu_model.append_section(None, &about_section);
+    let popover = gtk4::PopoverMenu::from_model(Some(&menu_model));
+    // If this ever returns false the spin row silently vanishes from the
+    // menu, so fail loudly in debug builds.
+    let settings_row_placed = popover.add_child(&settings_box, "settings");
+    debug_assert!(
+        settings_row_placed,
+        "settings row must match the custom menu item"
+    );
+    let menu = gtk4::MenuButton::builder()
+        .icon_name("open-menu-symbolic")
+        .tooltip_text("Main Menu (F10)")
+        .popover(&popover)
+        .build();
+    accessible_name(&menu, "Main Menu");
+    // `pack_end` stacks right-to-left: menu outermost, then Save, Detect,
+    // spinner.
+    header.pack_end(&menu);
     header.pack_end(&save_button);
     header.pack_end(&detect_button);
-    (header, save_button, detect_button)
+    header.pack_end(&detect_spinner);
+    (
+        header,
+        save_button,
+        detect_button,
+        interval_spin,
+        detect_spinner,
+        menu,
+    )
 }
 
 /// The left column: the case drawing under a "Case" heading with a
@@ -285,13 +494,63 @@ fn build_left_column(engine_rc: &Rc<RefCell<core::Engine>>) -> (ScrolledWindow, 
     (left_scroll, case_area)
 }
 
+/// Pin a paned's divider so the case side gets a third of its width.
+///
+/// An unset `Paned` position tracks the children's natural widths, which
+/// change as readings, fan rows and hidden lists come and go — the divider
+/// visibly drifts. Pinning at `width / 3` keeps the case stable and gives
+/// the controls the wider share. The pin re-applies whenever the width
+/// changes (window resize or maximize) and stops for good once the user
+/// drags the divider: a position change at an unchanged width can only
+/// come from the handle.
+///
+/// A poll watches for width changes because `notify::width` does not fire
+/// reliably on this paned (verified on GTK 4.24 under Wayland/GNOME).
+fn pin_divider_to_third(paned: &gtk4::Paned) {
+    let divider_auto = Rc::new(Cell::new(true));
+    let divider_expected = Rc::new(Cell::new(-1));
+    let divider_pinned_width = Rc::new(Cell::new(-1));
+    let poll_paned = paned.clone();
+    let (poll_auto, poll_expected, poll_pinned) = (
+        Rc::clone(&divider_auto),
+        Rc::clone(&divider_expected),
+        Rc::clone(&divider_pinned_width),
+    );
+    glib::timeout_add_local(Duration::from_millis(250), move || {
+        if !poll_auto.get() {
+            return ControlFlow::Break;
+        }
+        let width = gtk4::prelude::WidgetExt::width(&poll_paned);
+        if width > 0 && width != poll_pinned.get() {
+            let position = width / 3;
+            poll_expected.set(position);
+            poll_pinned.set(width);
+            poll_paned.set_position(position);
+        }
+        ControlFlow::Continue
+    });
+    paned.connect_notify_local(Some("position"), move |object, _| {
+        let paned = object
+            .downcast_ref::<gtk4::Paned>()
+            .expect("the position signal is detailed to this paned");
+        // A position change at the width we pinned at can only be the
+        // user grabbing the handle; their choice then wins for good.
+        if divider_auto.get()
+            && gtk4::prelude::WidgetExt::width(paned) == divider_pinned_width.get()
+            && paned.position() != divider_expected.get()
+        {
+            divider_auto.set(false);
+        }
+    });
+}
+
 fn build_window(
-    application: &Application,
+    application: &adw::Application,
     engine_rc: &Rc<RefCell<core::Engine>>,
     client: &dbus::Client,
     service_events: Rc<RefCell<mpsc::Receiver<dbus::Event>>>,
 ) {
-    let window = ApplicationWindow::builder()
+    let window = adw::ApplicationWindow::builder()
         .application(application)
         .title("Biggest Fan")
         // Start large (1080p-friendly) and maximised: the case drawing
@@ -303,22 +562,11 @@ fn build_window(
     window.set_maximized(true);
     install_stylesheet();
 
-    let (header, save_button, detect_button) = build_header_bar();
-    window.set_titlebar(Some(&header));
+    let (header, save_button, detect_button, interval_spin, detect_spinner, menu_button) =
+        build_header_bar(engine_rc);
 
     // Left: the case drawing plus a short legend.
     let (left_scroll, case_area) = build_left_column(engine_rc);
-
-    // Bottom bar: refresh-rate control and the live status line. The
-    // status line caps its requested width and ellipsizes long messages
-    // so notes never stretch the window. Built before the sensor panel:
-    // the panel reports hide/show results through it.
-    let status_label = Label::builder()
-        .xalign(0.0)
-        .hexpand(true)
-        .ellipsize(gtk4::pango::EllipsizeMode::End)
-        .max_width_chars(48)
-        .build();
 
     // Right: fan control rows and the sensor list.
     let right = GtkBox::new(Orientation::Vertical, 12);
@@ -326,11 +574,17 @@ fn build_window(
     right.set_margin_end(12);
     right.set_margin_bottom(8);
     let fan_panel = append_fans_panel(&right, engine_rc, &case_area, client);
-    let sensor_panel = append_sensors_panel(&right, engine_rc, &status_label);
-    let stress = wire_stress_panel(&window, &right);
+    let toast_overlay = adw::ToastOverlay::new();
+    let sensor_panel = append_sensors_panel(&right, engine_rc, &toast_overlay);
+    wire_stress_panel(&window, &right);
     let right_scroll = ScrolledWindow::builder()
         .vexpand(true)
-        .hscrollbar_policy(PolicyType::Never)
+        // `Automatic`, not `Never`: a `Never` pane propagates the content's
+        // minimum width to the Paned, which then clamps the divider to it —
+        // and that minimum breathes with the per-tick RPM/temperature text,
+        // so the divider drifts. A horizontal scrollbar only appears when
+        // the pane is genuinely too narrow.
+        .hscrollbar_policy(PolicyType::Automatic)
         .child(&right)
         .build();
 
@@ -340,22 +594,7 @@ fn build_window(
         .build();
     paned.set_start_child(Some(&left_scroll));
     paned.set_end_child(Some(&right_scroll));
-
-    // Bottom bar: the refresh-rate spin next to the status line built above.
-    let interval_spin = SpinButton::builder()
-        .digits(1)
-        .adjustment(&gtk4::Adjustment::new(1.0, 0.1, 30.0, 0.1, 1.0, 0.0))
-        .build();
-    let poll_ms = engine_rc.borrow().poll_interval_ms();
-    #[expect(
-        clippy::cast_precision_loss,
-        reason = "poll interval is tiny compared to u64::MAX"
-    )]
-    interval_spin.set_value(poll_ms as f64 / 1000.0);
-    let bottom = GtkBox::new(Orientation::Horizontal, 8);
-    bottom.append(&Label::builder().label("Update every (s):").build());
-    bottom.append(&interval_spin);
-    bottom.append(&status_label);
+    pin_divider_to_third(&paned);
 
     let root = GtkBox::new(Orientation::Vertical, 6);
     // Keep panels off the window edges.
@@ -364,27 +603,44 @@ fn build_window(
     root.set_margin_top(12);
     root.set_margin_bottom(12);
     root.append(&paned);
-    root.append(&bottom);
-    window.set_child(Some(&root));
+    // `AdwApplicationWindow` has no titlebar slot — calling
+    // `gtk_window_set_titlebar()` on one aborts the process — so the
+    // header bar is the first child of the content and draws its own
+    // window controls.
+    let content = GtkBox::new(Orientation::Vertical, 0);
+    content.append(&header);
+    content.append(&root);
+    // The toast overlay covers the whole window so toasts float at the
+    // bottom centre, wherever the panels are (HIG feedback pattern).
+    // `AdwApplicationWindow` takes its content through `set_content`;
+    // the plain `set_child` aborts on it, like `set_titlebar` does.
+    toast_overlay.set_child(Some(&content));
+    window.set_content(Some(&toast_overlay));
 
     let state = Rc::new(GuiState {
         engine: Rc::clone(engine_rc),
         fan_controls: RefCell::new(fan_panel.controls),
         fans_flow: fan_panel.fans_flow,
+        fans_placeholder: fan_panel.fans_placeholder,
         hidden_fans_list: fan_panel.hidden_fans_list,
         hidden_fans_reveal: fan_panel.hidden_fans_reveal,
         showing_hidden_fans: Cell::new(false),
         sensor_panel,
         case_area,
-        status_label,
+        toasts: toast_overlay,
+        detect_spinner,
+        detect_button: detect_button.clone(),
+        detect_pending: Cell::new(false),
         client: client.clone(),
         service_events,
-        stress,
         config_poll: Cell::new(0),
         service_config: RefCell::new(String::new()),
     });
     let tick_source = Rc::new(RefCell::new(None::<SourceId>));
     schedule_tick(&state, &tick_source);
+
+    // An empty Fans section gets the HIG placeholder instead of blank space.
+    refresh_fans_placeholder(&state);
 
     // Hidden fans: the reveal line shows or hides the parked-fan rows,
     // each of which has a Show button that revives its fan.
@@ -413,19 +669,88 @@ fn build_window(
     // Refresh-rate spin: update the engine and reschedule the tick.
     wire_interval_spin(&interval_spin, engine_rc, &state, &tick_source);
 
+    wire_window_actions(application, &window, &state, &menu_button);
+
     window.present();
+}
+
+/// Wires the window-level actions the HIG expects: the primary menu's
+/// standard About item, and the standard shortcuts — F10 opens the
+/// primary menu, Ctrl+S saves the config, Ctrl+W closes the window,
+/// Ctrl+Q quits.
+fn wire_window_actions(
+    application: &adw::Application,
+    window: &adw::ApplicationWindow,
+    state: &Rc<GuiState>,
+    menu_button: &gtk4::MenuButton,
+) {
+    let about_action = gio::SimpleAction::new("about", None);
+    let about_window = window.clone();
+    about_action.connect_activate(move |_, _| {
+        // `AboutDialog` (libadwaita 1.6) replaces the deprecated
+        // `AboutWindow`; it presents over the main window.
+        let about = adw::AboutDialog::builder()
+            .application_name("Biggest Fan")
+            .application_icon("net.ynottony.ten.BiggestFan")
+            .version(env!("CARGO_PKG_VERSION"))
+            .comments(
+                "Watch every temperature your machine reports — CPU, GPU, memory, drives and more — and drive each fan header from the sensor that matters, with editable curves and hysteresis, so the fans run no faster than they need to.",
+            )
+            .build();
+        about.present(Some(&about_window));
+    });
+    application.add_action(&about_action);
+
+    let keys = gtk4::EventControllerKey::new();
+    let shortcut_state = Rc::clone(state);
+    let shortcut_window = window.clone();
+    let shortcut_menu = menu_button.clone();
+    keys.connect_key_pressed(move |_, key, _keycode, modifiers| {
+        // HIG: F10 opens the primary menu, wherever focus is.
+        if key == gtk4::gdk::Key::F10 {
+            shortcut_menu.set_active(true);
+            return Propagation::Stop;
+        }
+        if !modifiers.contains(gtk4::gdk::ModifierType::CONTROL_MASK) {
+            return Propagation::Proceed;
+        }
+        match key {
+            gtk4::gdk::Key::s => {
+                on_save_clicked(&shortcut_state);
+                Propagation::Stop
+            }
+            gtk4::gdk::Key::w | gtk4::gdk::Key::q => {
+                shortcut_window.close();
+                Propagation::Stop
+            }
+            _ => Propagation::Proceed,
+        }
+    });
+    window.add_controller(keys);
 }
 
 /// One round of fan detection, run by the service: it spins every header
 /// up briefly and parks the ones with nothing connected (no RPM) or whose
 /// driver refuses the spin-up; the findings arrive as a `Detected` event
 /// (see `drain_service_events`) and park the matching rows here. The
-/// change is kept only after Save config.
+/// change is kept only after Save config. While it runs, the header
+/// spinner turns and the Detect button is insensitive.
 fn on_detect_clicked(state: &GuiState) {
+    state.detect_pending.set(true);
+    state.detect_button.set_sensitive(false);
+    state.detect_spinner.start();
+    state.detect_spinner.set_visible(true);
     state.client.send(dbus::FanRequest::Detect);
-    state
-        .status_label
-        .set_text("the service is spinning every header up…");
+}
+
+/// Ends the Detect wait once its answer (or an error) has arrived.
+fn detect_finished(state: &GuiState) {
+    if !state.detect_pending.replace(false) {
+        return;
+    }
+    state.detect_spinner.stop();
+    state.detect_spinner.set_visible(false);
+    state.detect_button.set_sensitive(true);
 }
 
 /// Hides the control rows of fans that left the managed set.
@@ -435,6 +760,7 @@ fn hide_control_rows(state: &GuiState, ids: &[core::FanId]) {
             controls.hide_row();
         }
     }
+    refresh_fans_placeholder(state);
     state.case_area.queue_draw();
 }
 
@@ -459,9 +785,7 @@ fn add_fan_to_panel(state: &Rc<GuiState>, fan_id: &core::FanId) {
                 .find(|(managed_id, _)| managed_id == fan_id)
                 .map_or_else(|| fan_id.to_string(), |(_, name)| name),
             Err(error) => {
-                state
-                    .status_label
-                    .set_text(&format!("could not add {fan_id}: {error}"));
+                show_toast(&state.toasts, &format!("Could not add {fan_id}: {error}"));
                 return;
             }
         }
@@ -479,10 +803,23 @@ fn add_fan_to_panel(state: &Rc<GuiState>, fan_id: &core::FanId) {
     state.fans_flow.insert(&controls.container, -1);
     state.fan_controls.borrow_mut().push(controls);
     refresh_hidden_fans(state);
+    refresh_fans_placeholder(state);
     state.case_area.queue_draw();
-    state.status_label.set_text(&format!(
-        "{display_name} added — the service has taken over its header"
-    ));
+    show_toast(
+        &state.toasts,
+        &format!("{display_name} added — the service has taken over its header"),
+    );
+}
+
+/// Shows the Fans placeholder while no control row is visible (the HIG
+/// placeholder pattern for an empty list).
+fn refresh_fans_placeholder(state: &GuiState) {
+    let any_visible = state
+        .fan_controls
+        .borrow()
+        .iter()
+        .any(|controls| controls.container.is_visible());
+    state.fans_placeholder.set_visible(!any_visible);
 }
 
 /// Rebuilds the hidden-fans rows and the reveal line from the engine's
@@ -503,7 +840,7 @@ fn refresh_hidden_fans(state: &Rc<GuiState>) {
         );
         let show = Button::builder()
             .label("Show")
-            .tooltip_text("take this fan back under control — it keeps its settings")
+            .tooltip_text("Take This Fan Back Under Control")
             .build();
         row_box.append(&show);
         let row = ListBoxRow::new();
@@ -530,19 +867,16 @@ fn refresh_hidden_fans(state: &Rc<GuiState>) {
 
 /// Asks the service to apply and save the GUI's current config (mode and
 /// name changes from the controls, placement from the canvas); the
-/// service's config file is the live one.
+/// service's config file is the live one. The confirmation arrives as a
+/// `Status` event and lands in a toast.
 fn on_save_clicked(state: &GuiState) {
     let engine = state.engine.borrow();
     match core::config::to_text(&engine.current_config()) {
-        Ok(toml_text) => {
-            state.client.send(dbus::FanRequest::Save { toml_text });
-            state
-                .status_label
-                .set_text("the service is applying and saving the config…");
-        }
-        Err(error) => state
-            .status_label
-            .set_text(&format!("could not serialise the config: {error}")),
+        Ok(toml_text) => state.client.send(dbus::FanRequest::Save { toml_text }),
+        Err(error) => show_toast(
+            &state.toasts,
+            &format!("Could not serialise the config: {error}"),
+        ),
     }
 }
 
@@ -551,15 +885,22 @@ fn drain_service_events(state: &Rc<GuiState>) {
     let guard = state.service_events.borrow_mut();
     while let Ok(event) = guard.try_recv() {
         match event {
-            dbus::Event::Status(message) => state.status_label.set_text(&message),
+            dbus::Event::Status(message) => {
+                // A Status answer while a Detect is in flight is its
+                // failure path (the success path answers `Detected`).
+                detect_finished(state);
+                show_toast(&state.toasts, &message);
+            }
             dbus::Event::Detected(ids) => {
+                detect_finished(state);
                 let ids: Vec<core::FanId> = ids.into_iter().map(core::FanId::new).collect();
                 state.engine.borrow_mut().park_fans(&ids);
                 hide_control_rows(state, &ids);
                 refresh_hidden_fans(state);
                 if ids.is_empty() {
-                    state.status_label.set_text(
-                        "the service found nothing to disable — every managed header spun up",
+                    show_toast(
+                        &state.toasts,
+                        "Nothing to disable — every managed header spun up",
                     );
                 } else {
                     let headers = ids
@@ -567,9 +908,20 @@ fn drain_service_events(state: &Rc<GuiState>) {
                         .map(ToString::to_string)
                         .collect::<Vec<_>>()
                         .join(", ");
-                    state.status_label.set_text(&format!(
-                        "{headers} disabled by the service — press Save config to keep them out"
+                    let toast = adw::Toast::new(&format!(
+                        "{headers} disabled — press Save config to keep them out"
                     ));
+                    toast.set_button_label(Some("Undo"));
+                    let undo_state = Rc::clone(state);
+                    toast.connect_button_clicked(move |_| {
+                        // Undo takes every parked header back under
+                        // management; each `add_fan_to_panel` confirms
+                        // its own fan with a toast of its own.
+                        for id in &ids {
+                            add_fan_to_panel(&undo_state, id);
+                        }
+                    });
+                    state.toasts.add_toast(toast);
                 }
             }
             dbus::Event::Config(text) => {
@@ -587,9 +939,10 @@ fn drain_service_events(state: &Rc<GuiState>) {
                     .and_then(|config| state.engine.borrow_mut().apply_config(config))
                 {
                     *state.service_config.borrow_mut() = String::new();
-                    state
-                        .status_label
-                        .set_text(&format!("service config did not apply: {error}"));
+                    show_toast(
+                        &state.toasts,
+                        &format!("Service config did not apply: {error}"),
+                    );
                 } else {
                     // A hand-edited service config can hide or show fans;
                     // the hidden-fans line follows it.
@@ -625,11 +978,12 @@ fn wire_interval_spin(
 }
 
 /// The "Fans" panel: one control row per managed fan (in a flow
-/// new rows can be inserted into) and the parked-as-hidden fans
-/// behind a reveal line.
+/// new rows can be inserted into), a placeholder while none are visible,
+/// and the parked-as-hidden fans behind a reveal line.
 struct FanPanel {
     controls: Vec<FanControls>,
     fans_flow: FlowBox,
+    fans_placeholder: GtkBox,
     hidden_fans_list: ListBox,
     hidden_fans_reveal: Button,
 }
@@ -637,14 +991,13 @@ struct FanPanel {
 /// Appends the Stress lab panel to `right` and ties its stress threads
 /// to the window: closing the window raises their stop flags, so no
 /// load outlives the window that started it.
-fn wire_stress_panel(window: &ApplicationWindow, right: &GtkBox) -> Rc<stress::StressPanel> {
+fn wire_stress_panel(window: &adw::ApplicationWindow, right: &GtkBox) {
     let stress_panel = stress::append_stress_panel(right);
     let close_panel = Rc::clone(&stress_panel);
     window.connect_close_request(move |_window| {
         close_panel.stop_all();
         Propagation::Proceed
     });
-    stress_panel
 }
 
 /// Appends the fan section (header, one control row per managed fan,
@@ -672,6 +1025,14 @@ fn append_fans_panel(
     fans_flow.set_max_children_per_line(2);
     fans_flow.set_selection_mode(gtk4::SelectionMode::None);
     section.append(&fans_flow);
+    // Empty state (HIG placeholder): shown while no fan row is visible,
+    // so the section never reads as broken or still loading.
+    let fans_placeholder = placeholder(
+        "net.ynottony.ten.BiggestFan-symbolic",
+        "No fans under control",
+        "Press Detect fans to find them.",
+    );
+    section.append(&fans_placeholder);
     let fan_ids_and_names = engine_rc.borrow().managed_fans();
     let mut fan_controls = Vec::new();
     for (fan_id, name) in fan_ids_and_names {
@@ -682,9 +1043,7 @@ fn append_fans_panel(
     // Hidden fans get the hidden-sensors treatment: collapsed behind a
     // named count line, each with a Show button that takes it back under
     // control — no config editing needed.
-    let hidden_fans_reveal = Button::builder()
-        .tooltip_text("show the hidden fans again, so one can be taken back under control")
-        .build();
+    let hidden_fans_reveal = Button::builder().tooltip_text("Show Hidden Fans").build();
     let hidden_fans_list = ListBox::new();
     hidden_fans_list.set_selection_mode(gtk4::SelectionMode::None);
     hidden_fans_list.set_visible(false);
@@ -694,64 +1053,111 @@ fn append_fans_panel(
     FanPanel {
         controls: fan_controls,
         fans_flow,
+        fans_placeholder,
         hidden_fans_list,
         hidden_fans_reveal,
     }
 }
 
-/// Appends the sensor section (header, a readout and a hide button per
-/// discovered sensor, then the hidden-count line) to `panel`.
+/// Appends the sensor section (header, a small tile with the live
+/// reading and a hide button per discovered sensor, then the
+/// hidden-count line) to `panel`.
 fn append_sensors_panel(
     panel: &GtkBox,
     engine_rc: &Rc<RefCell<core::Engine>>,
-    status: &Label,
+    toasts: &adw::ToastOverlay,
 ) -> Rc<SensorPanel> {
     panel.append(&section_title("Sensors"));
     let section = GtkBox::new(Orientation::Vertical, 8);
     section.add_css_class(SECTION_CLASS);
-    let sensor_list = ListBox::new();
-    sensor_list.set_selection_mode(gtk4::SelectionMode::None);
+    // Small tiles instead of full-width rows: a chip's name and reading
+    // need little room, and a board can expose dozens of them.
+    let sensor_flow = FlowBox::new();
+    sensor_flow.set_selection_mode(gtk4::SelectionMode::None);
+    sensor_flow.set_min_children_per_line(1);
+    sensor_flow.set_max_children_per_line(8);
+    sensor_flow.set_homogeneous(false);
+    sensor_flow.set_column_spacing(8);
+    sensor_flow.set_row_spacing(8);
     let mut rows = BTreeMap::new();
     let sensors = engine_rc.borrow().sensors().to_vec();
     for sensor in sensors {
         let name = engine_rc.borrow().sensor_name(&sensor.id);
-        let value = Label::builder().xalign(0.0).hexpand(true).build();
-        value.set_text(&format!("{name}  —"));
-        let toggle = Button::builder()
-            .label("Hide")
-            .tooltip_text(
-                "hide this temperature from the list — it still drives any fan bound to it",
-            )
-            .build();
-        let row_box = GtkBox::new(Orientation::Horizontal, 8);
-        row_box.append(&value);
-        row_box.append(&toggle);
-        let row = ListBoxRow::new();
-        row.set_child(Some(&row_box));
-        // A sensor hidden by the config starts out of the list.
+        // A sensor hidden by the config starts out of the flow.
         let hidden = engine_rc.borrow().sensor_hidden(&sensor.id);
-        row.set_visible(!hidden);
-        toggle.set_label(if hidden { "Show" } else { "Hide" });
-        sensor_list.append(&row);
+        let tile = FlowBoxChild::new();
+        tile.add_css_class(SENSOR_TILE_CLASS);
+        // Name and hide button share the top line (button at the right),
+        // the live reading gets the line below to itself.
+        let name_label = Label::builder()
+            .label(&name)
+            .xalign(0.0)
+            .hexpand(true)
+            .build();
+        name_label.add_css_class("dim-label");
+        let value = Label::builder().xalign(0.0).build();
+        value.set_text("—");
+        // Fixed budget for the live reading ("99.9 °C" -> "100.0 °C"):
+        // a constant natural width keeps the sensor flow from re-wrapping
+        // its tiles on every tick.
+        value.set_width_chars(12);
+        let spark = Sparkline::new();
+        let toggle = Button::builder()
+            .icon_name(if hidden {
+                "view-reveal-symbolic"
+            } else {
+                "view-conceal-symbolic"
+            })
+            .tooltip_text("Hide This Temperature")
+            .build();
+        toggle.add_css_class("flat");
+        accessible_name(
+            &toggle,
+            &format!("{} {name}", if hidden { "Show" } else { "Hide" }),
+        );
+        let top_row = GtkBox::new(Orientation::Horizontal, 6);
+        top_row.append(&name_label);
+        top_row.append(&toggle);
+        // The live reading and its sparkline share the bottom line.
+        let value_row = GtkBox::new(Orientation::Horizontal, 6);
+        value_row.append(&value);
+        value_row.append(spark.widget());
+        let tile_box = GtkBox::new(Orientation::Vertical, 2);
+        tile_box.append(&top_row);
+        tile_box.append(&value_row);
+        tile.set_child(Some(&tile_box));
+        tile.set_visible(!hidden);
+        sensor_flow.append(&tile);
         rows.insert(
             sensor.id,
             SensorRow {
                 name,
                 value,
-                row,
+                spark,
+                row: tile,
                 toggle,
             },
         );
     }
-    section.append(&sensor_list);
+    section.append(&sensor_flow);
+    if rows.is_empty() {
+        // Empty state (HIG placeholder) for a machine whose temperature
+        // chips the core could not read.
+        let empty = placeholder(
+            "net.ynottony.ten.BiggestFan-temperature-symbolic",
+            "No temperature sensors found",
+            "Check that the hardware-monitor (hwmon) kernel modules are loaded.",
+        );
+        section.append(&empty);
+    }
     let reveal = Button::builder()
-        .tooltip_text("show the hidden sensors again, so they can be kept visible")
+        .tooltip_text("Show Hidden Sensors")
         .build();
     section.append(&reveal);
     panel.append(&section);
     let sensor_panel = Rc::new(SensorPanel {
         engine: Rc::clone(engine_rc),
-        status: status.clone(),
+        toasts: toasts.clone(),
         rows,
         reveal: reveal.clone(),
         showing_hidden: Cell::new(false),
@@ -804,21 +1210,17 @@ fn tick_once(state: &Rc<GuiState>) {
     let report = match state.engine.borrow_mut().tick() {
         Ok(report) => report,
         Err(error) => {
-            state
-                .status_label
-                .set_text(&format!("control loop error: {error}"));
+            show_toast(&state.toasts, &format!("Control loop error: {error}"));
             return;
         }
     };
 
-    let mut notes = Vec::new();
     for controls in state.fan_controls.borrow().iter() {
         match report.fans.iter().find(|fan| fan.id == *controls.fan_id()) {
             Some(status) => {
+                // Notes (a fail-safe, a refused write) show on the row
+                // itself — ongoing state stays inline, not in a toast.
                 controls.update(status);
-                if let Some(note) = &status.note {
-                    notes.push(note.clone());
-                }
             }
             None => {
                 // The control loop parked this fan (for example its driver
@@ -832,17 +1234,12 @@ fn tick_once(state: &Rc<GuiState>) {
             let temp = sensor
                 .temp_c
                 .map_or_else(|| "no reading".to_string(), |temp| format!("{temp:.1} °C"));
-            row.value.set_text(&format!("{}  {temp}", row.name));
+            row.value.set_text(&temp);
+            if let Some(temp_c) = sensor.temp_c {
+                row.spark.record(temp_c);
+            }
         }
     }
+    refresh_fans_placeholder(state);
     state.case_area.queue_draw();
-
-    // One writer decides what the status bar says: a fan's note (a
-    // fail-safe, a refused write) outranks the Stress lab's progress,
-    // and the lab only keeps the bar while it has something to report.
-    if !notes.is_empty() {
-        state.status_label.set_text(&notes.join(" · "));
-    } else if let Some(line) = state.stress.status_line() {
-        state.status_label.set_text(&line);
-    }
 }

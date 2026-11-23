@@ -265,9 +265,9 @@ mod tests {
         let found = source.discover().expect("discovery");
         assert_eq!(found.len(), 2);
         assert_eq!(found[0].id.as_str(), "k10temp-t1");
-        assert_eq!(found[0].default_name, "CPU temperature");
+        assert_eq!(found[0].default_name, "CPU Package");
         assert_eq!(found[0].raw_label, "k10temp Tctl");
-        assert_eq!(found[1].default_name, "CPU CCD 1 temperature");
+        assert_eq!(found[1].default_name, "CPU CCD 1");
 
         let readings = source.read_all().expect("read_all");
         assert_eq!(readings[&sid("k10temp-t1")], 45.0);

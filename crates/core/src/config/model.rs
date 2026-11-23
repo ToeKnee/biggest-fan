@@ -14,7 +14,7 @@
 //! max_step_up_per_tick = 0.5     # rocket: how quickly speed may rise
 //!
 //! [sensor_names]
-//! "k10temp-t3" = "CPU CCD 1 temperature"
+//! "k10temp-t3" = "CPU CCD 1"
 //!
 //! [[fans]]
 //! id = "nct6795-p1"
@@ -178,7 +178,7 @@ mod tests {
             max_step_up_per_tick = 0.4
 
             [sensor_names]
-            "k10temp-t3" = "CPU CCD 1 temperature"
+            "k10temp-t3" = "CPU CCD 1"
 
             [[fans]]
             id = "nct6795-p1"
@@ -203,7 +203,7 @@ mod tests {
             "the rocket step is configurable too"
         );
         assert!(!config.quiet, "the example logs every tick");
-        assert_eq!(config.sensor_names["k10temp-t3"], "CPU CCD 1 temperature");
+        assert_eq!(config.sensor_names["k10temp-t3"], "CPU CCD 1");
         assert!(
             config.hidden_sensors.is_empty(),
             "the example hides no sensors"
@@ -362,10 +362,7 @@ mod tests {
             fail_safe_speed: 1.0,
             quiet: false,
             hysteresis: HysteresisConfig::default(),
-            sensor_names: BTreeMap::from([(
-                "k10temp-t1".to_string(),
-                "CPU temperature".to_string(),
-            )]),
+            sensor_names: BTreeMap::from([("k10temp-t1".to_string(), "CPU Package".to_string())]),
             hidden_sensors: Vec::new(),
             fans: vec![
                 FanConfig {

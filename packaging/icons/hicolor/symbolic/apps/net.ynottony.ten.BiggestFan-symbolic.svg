@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Biggest Fan symbolic app icon (HIG): the case-view fan as its guard
+     — ring, hub and four spokes — in the single-colour symbolic style.
+     GTK recolours the #2e3436 fill to match the current theme. The
+     full-color icon's seven swept blades blur into a blob at the 16 px
+     symbolic grid, so this uses the guard motif that survives it. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
+  <g fill="#2e3436">
+    <!-- Hub. -->
+    <circle cx="8" cy="8" r="1.9"/>
+    <!-- Four spokes, 1.3 wide, hub to ring, on the diagonals. -->
+    <rect x="7.35" y="2.4" width="1.3" height="11.2" transform="rotate(45 8 8)"/>
+    <rect x="7.35" y="2.4" width="1.3" height="11.2" transform="rotate(135 8 8)"/>
+    <!-- Guard ring as a filled donut (symbolic icons avoid strokes so
+         theme recolouring and scaling stay crisp). -->
+    <path fill-rule="evenodd" d="M8 1.25 A6.75 6.75 0 1 0 8 14.75
+             A6.75 6.75 0 1 0 8 1.25 Z
+             M8 2.75 A5.25 5.25 0 1 1 8 13.25 A5.25 5.25 0 1 1 8 2.75 Z"/>
+  </g>
+</svg>

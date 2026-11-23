@@ -4,7 +4,7 @@ A smart fan controller app.
 
 Read temperatures from lm-sensor and nvidia graphics cards and control fans speed.
 
-Map sensors names to human readable names ("CPU temperature" instead of "k10temp Tcctl", "CPU CCD 1 temperature" instead of "k10temp Tccd1" etc.)
+Map sensors names to human readable names ("CPU Package" instead of "k10temp Tcctl", "CPU CCD 1" instead of "k10temp Tccd1" etc.)
 Map fans to a graphical representation of a modern PC case.
 Different fans should be able to be controlled be different sensors.
 Fans can be to be turned off, run at a constant speed or automatically respond to sensors.
@@ -17,8 +17,11 @@ Has adjustable update time (default to 1 second refresh)
 
 - Rust toolchain supporting edition 2024
 - Linux (the core reads and writes hwmon files under `/sys/class/hwmon`)
-- GTK 4 development packages, e.g. on Debian/Ubuntu:
-  `sudo apt install libgtk-4-dev pkg-config`
+- GTK 4 and libadwaita (≥ 1.6) development packages, e.g. on
+  Debian/Ubuntu: `sudo apt install libgtk-4-dev libadwaita-1-dev pkg-config`
+  (the GUI is an Adwaita app: `adw::Application`, header bar, toasts; the
+  graphs read the user's accent colour from `StyleManager`, which needs
+  libadwaita 1.6)
 - For NVIDIA GPU temperatures: the system NVIDIA driver provides
   `libnvidia-ml.so` (loaded at runtime via NVML). Both binaries always
   attempt NVML: without NVIDIA management no NVIDIA sensors or coolers
@@ -29,7 +32,7 @@ Has adjustable update time (default to 1 second refresh)
 | Path                | Crate                    | What it is                                                                                                                                                                                                                      |
 | ------------------- | ------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `crates/core`       | `biggest-fan-core`       | Library: sensor discovery (hwmon + NVML), human naming, fan/PWM control, config (TOML), case layout, and the control-loop `Engine` with hysteresis.                                                                             |
-| `crates/app`        | `biggest-fan`            | Library plus two binaries: `biggest-fan` (GTK 4 GUI — case view + fan controls — and the `scan`, `init-config`, `detect-fans` one-shot commands) and `biggest-fan-daemon` (headless control loop, for systemd).                 |
+| `crates/app`        | `biggest-fan`            | Library plus two binaries: `biggest-fan` (GTK 4/libadwaita GUI — case view + fan controls — and the `scan`, `init-config`, `detect-fans` one-shot commands) and `biggest-fan-daemon` (headless control loop, for systemd).      |
 | `crates/stress-lab` | `biggest-fan-stress-lab` | Library plus developer CLI `stress-lab`: hand-written CPU (AVX-512) and GPU (Vulkan compute) stressors and a CSV temp/fan/PWM monitor. The library also drives the GUI's Stress lab panel; the CLI binary stays developer-only. |
 | `packaging/desktop` | —                        | The `net.ynottony.ten.BiggestFan.desktop` launcher installed by the .deb.                                                                                                                                                       |
 | `packaging/icons`   | —                        | The app icon (scalable SVG source + generated PNG sizes) installed into the hicolor theme by the .deb.                                                                                                                          |
@@ -109,7 +112,7 @@ max_step_per_tick = 0.1     # feather: max speed drop per tick (0 or 1.0 = none)
 max_step_up_per_tick = 0.5  # rocket: max speed rise per tick (0 or 1.0 = at once)
 
 [sensor_names]            # human readable overrides, keyed by sensor id
-"k10temp-t3" = "CPU CCD 1 temperature"
+"k10temp-t3" = "CPU CCD 1"
 
 [[fans]]
 id = "nct6795-p1"         # the header this fan drives, from `biggest-fan scan`
@@ -178,7 +181,7 @@ under the park point cannot start the fans, so it parks the cooler instead
   super-IO chips (a real in-case temperature is never exactly 0 °C).
 - Sensors are listed most useful first: CPU, then GPU, then
   motherboard/drive temperatures, then case/chassis temperatures.
-- Useless temperatures can be hidden from the GUI's sensor list (per-row
+- Useless temperatures can be hidden from the GUI's sensor list (per-tile
   hide button, or `hidden_sensors` in the config). Hiding is display-only:
   hidden sensors are still read every tick, and a fan bound to a hidden
   temperature keeps working exactly as before — the hidden rows come back
@@ -235,9 +238,9 @@ whose _all_ fans move together. Coolers are
 managed exactly like sysfs fans: off / fixed / auto with curves,
 hysteresis; `init-config` binds one to the GPU's NVML
 temperature automatically. On the case view a cooler is drawn as a card —
-a rectangle whose size the fan row's shape/width/height controls set
-(`rect = [width, height]` in the config) — not a circle, since it spans
-the whole graphics card.
+a rectangle whose size the fan row's _extra settings_
+shape/width/height controls set (`rect = [width, height]` in the config)
+— not a circle, since it spans the whole graphics card.
 
 Differences from sysfs headers:
 
@@ -355,8 +358,16 @@ save changes to it over D-Bus. The window is laid out as four sections
 under ruled headings — **Case** (the drawing and its legend) on the left,
 **Fans**, **Sensors** and **Stress lab** down the right — each section's
 content indented under its heading. Each fan row can rename the fan inline, pick
-mode, sensor and a preset curve (Quiet, Balanced, Performance). Every Auto
-fan's curve is drawn as a small graph — speed against sensor temperature —
+mode (segmented _Off / Constant speed / Automatic_ buttons), sensor and a
+preset curve (Quiet, Balanced, Performance). One-shot results — detect,
+save, fan added, sensors hidden or shown, service errors — arrive as
+transient toasts over the window (no status bar), while ongoing state
+(fan notes, stress progress) stays inline in its panel; _Detect fans_
+shows a spinner in the header bar while it runs. Ctrl+S saves the config,
+Ctrl+W (or Ctrl+Q) closes the window, and the primary menu holds the
+refresh-rate spin and "About Biggest Fan". Every Auto fan's curve is
+drawn as a small graph —
+speed against sensor temperature —
 with a dot at the speed and temperature the fan is actually at right now
 (off-curve dots show a ramp or hold band at work). Every row uses the same
 20–100 °C domain, so the curves compare straight down the list. The graph
@@ -365,30 +376,42 @@ is where the curve is edited: **hover a point** to print its exact
 degrees and whole percents and can never cross its neighbours),
 **double-click** an empty spot to add a point, **right-click a point** to
 delete one (two points is the floor — pick a preset for a simpler curve).
-A drag is only committed to the fan and the service when you let go, so a
+The same edits have a keyboard path: Tab to the graph (it gets a focus
+ring), **Left/Right** pick a point, **Up/Down** nudge its speed a percent,
+**Shift+Left/Right** nudge its temperature a degree, **Plus** adds a point
+halfway to the next one and **Minus** removes the selected one; Esc
+clears the selection. A drag is only committed to the fan and the service
+when you let go, so a
 half-dragged curve never drives anything; the dropdown then reads
 "Custom", and picking a preset replaces what you drew. While runtime GPU
 throttle relief lifts a preset cooler above its saved curve, the graph
 draws the lifted curve over the saved one in orange and offers a "Keep
 this curve" button to make it the fan's real curve (saved-curve nudges
 need no offer — they arrive as the fan's curve). Beside it
-every fan also charts its last 5 minutes — speed % (blue) against the
-same 0–100 scale as governing sensor °C (yellow) — so changes over time
-stay visible after the numbers have scrolled past in the status line.
-The **Sensors** readout has a hide button on every row: hidden
-temperatures leave the list behind a "Show N hidden temperatures" line
+every fan also charts its last 5 minutes — speed % (blue, dashed) against
+the same 0–100 scale as governing sensor °C (amber, solid; the styles are
+legended in the corner) — so changes over time
+stay visible after the row's live numbers have moved on.
+The **Sensors** readout is a flow of small tiles — chip name, live
+temperature with a 5-minute sparkline, and a hide button each: hiding
+(or showing) one offers **Undo** on its toast. Hidden temperatures leave the flow
+behind a "Show N hidden temperatures" line
 (kept in `hidden_sensors` when the config is saved), but stay read — a
 fan bound to a hidden temperature keeps working and charts normally.
 The **Fans** panel treats hidden fans the same way: fans parked by
 Detect (or a driver that refuses control) collapse behind a
 "Show N hidden fans" line, and a parked fan's _Show_ button takes it
-back under management with its name and settings. Both lines appear
+back under management with its name and settings (the Detect toast also
+offers **Undo**). Both lines appear
 only while something is hidden.
 Each row
-can also set the "rpm reading ×" tach correction and the "never below %"
-speed floor under _extra settings_ (some tachometers report exactly double:
+can also set the "rpm reading ×" tach correction, the "never below %"
+speed floor and the case-view placement controls (airflow, shape and
+size) under _extra settings_ (some tachometers report exactly double:
 0.5 halves the reading; the floor keeps an AIO pump turning however quiet
-its curve is). The window opens at
+its curve is). The graphs follow the system theme: the light/dark palette
+and the user's accent colour (the curve and speed series), with fixed
+amber and orange for the live point and throttle relief. The window opens at
 1600×900 maximised; fans you have not placed yet are laid out on a grid
 inside the case drawing, and while every fan still sits on that grid the
 canvas shows a "drag a shape to move it" hint near its bottom edge — it
@@ -465,9 +488,8 @@ The GUI carries a **Stress lab** panel at the bottom of the right column:
 _toggle_ **CPU load** / **GPU load** to run the stressors as in-process
 threads (they share the library with the CLI below), pick how many
 seconds to run and the guard temperature, and watch the case view react.
-Finished runs report their throughput in the status bar at the bottom of
-the window (the same one the fan notes use; a fan's own note outranks
-the lab's progress), the
+Finished runs report their throughput on the panel's own status line
+under the buttons, the
 guard aborts the load if k10temp or the GPU gets too hot, and closing
 the window always stops the load. Run the GUI itself in release mode
 (`cargo run --release -p biggest-fan`) — a debug build runs the
@@ -539,7 +561,8 @@ sudo dpkg -i target/debian/biggest-fan_*_amd64.deb
 The .deb ships both binaries, the systemd unit, the D-Bus policy file,
 the GUI launcher (`packaging/desktop/`) and app icons
 (`packaging/icons/`: SVG + PNG sizes 16–512, regenerated from the SVG
-with `sh tools/render-icons.sh`), and this README, with the GPL text in
+with `sh tools/render-icons.sh`, plus the symbolic SVGs — the app icon
+and the temperature glyph the sensors placeholder uses), and this README, with the GPL text in
 its copyright file. Its maintainer scripts (`maintainer-scripts` in
 `[package.metadata.deb]`, files under `packaging/deb-scripts/`) enable
 and start the service and refresh the hicolor icon cache on install, and

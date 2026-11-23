@@ -6,6 +6,7 @@
 //! past in the status line.
 
 use crate::case_view::draw_centered;
+use crate::theme::{GraphPalette, Rgba};
 use biggest_fan_core as core;
 use gtk4::DrawingArea;
 use gtk4::prelude::*;
@@ -31,6 +32,10 @@ const MAX_SAMPLES: usize = 4000;
 /// The shared vertical scale: temperatures (°C) and speed (%) both fit
 /// a 0–100 axis, so the two series need no separate scales.
 const SCALE_MAX: f64 = 100.0;
+
+/// The speed series' dash pattern: the second channel that tells the
+/// two series apart besides colour.
+const SPEED_DASH: &[f64] = &[5.0, 3.0];
 
 /// The plot rectangle inside the widget (everything outside is label
 /// margins), shared shape with the curve graph's own copy.
@@ -148,10 +153,12 @@ fn segments(
     lines
 }
 
-/// Strokes every segment of one series.
-fn draw_series(cr: &cairo::Context, lines: &[Vec<(f64, f64)>], colour: (f64, f64, f64)) {
-    cr.set_source_rgb(colour.0, colour.1, colour.2);
+/// Strokes every segment of one series. `dash` gives the series its
+/// line style, so the two differ by more than colour (HIG accessibility).
+fn draw_series(cr: &cairo::Context, lines: &[Vec<(f64, f64)>], colour: Rgba, dash: &[f64]) {
+    cr.set_source_rgba(colour.0, colour.1, colour.2, colour.3);
     cr.set_line_width(1.4);
+    cr.set_dash(dash, 0.0);
     for line in lines {
         if let (Some(&(first_x, first_y)), Some(_)) = (line.first(), line.get(1)) {
             cr.move_to(first_x, first_y);
@@ -161,18 +168,33 @@ fn draw_series(cr: &cairo::Context, lines: &[Vec<(f64, f64)>], colour: (f64, f64
             let _ = cr.stroke();
         }
     }
+    cr.set_dash(&[], 0.0);
 }
 
 /// Draws the graph: frame, minute grid, mid-line at 50, the two
-/// histories (speed blue underneath, temperature yellow on top, since
-/// the sensor trace is the one users hunt for) and the corner labels.
-fn draw(cr: &cairo::Context, width: f64, height: f64, history: &FanHistory) {
-    cr.set_source_rgb(0.13, 0.13, 0.15);
+/// histories (speed accent-blue dashed underneath, temperature
+/// warning-amber solid on top, since the sensor trace is the one users
+/// hunt for), the corner labels and a small style legend.
+fn draw(
+    cr: &cairo::Context,
+    width: f64,
+    height: f64,
+    history: &FanHistory,
+    palette: &GraphPalette,
+) {
+    let GraphPalette {
+        background,
+        text,
+        curve,
+        operating,
+        relief: _,
+    } = *palette;
+    cr.set_source_rgba(background.0, background.1, background.2, background.3);
     let _ = cr.paint();
 
     let plot = plot_box(width, height);
     cr.set_line_width(1.0);
-    cr.set_source_rgba(0.55, 0.55, 0.58, 0.5);
+    cr.set_source_rgba(text.0, text.1, text.2, 0.5);
     cr.rectangle(plot.x, plot.y, plot.width, plot.height);
     let _ = cr.stroke();
 
@@ -181,7 +203,7 @@ fn draw(cr: &cairo::Context, width: f64, height: f64, history: &FanHistory) {
     // Grid: one vertical line per minute back from the right edge (the
     // line at the far left edge would sit on the frame), and a
     // horizontal line at the halfway scale point.
-    cr.set_source_rgba(0.55, 0.55, 0.58, 0.2);
+    cr.set_source_rgba(text.0, text.1, text.2, 0.2);
     for minute_back in 1..HISTORY_MINUTES {
         let grid_time = (-GRID_STEP_S).mul_add(f64::from(minute_back), now_s);
         let x = x_for(plot, now_s, grid_time);
@@ -201,7 +223,7 @@ fn draw(cr: &cairo::Context, width: f64, height: f64, history: &FanHistory) {
         cairo::FontWeight::Normal,
     );
     cr.set_font_size(9.0);
-    cr.set_source_rgb(0.85, 0.85, 0.88);
+    cr.set_source_rgba(text.0, text.1, text.2, text.3);
     let _ = draw_centered(
         cr,
         plot.x,
@@ -216,13 +238,34 @@ fn draw(cr: &cairo::Context, width: f64, height: f64, history: &FanHistory) {
     draw_series(
         cr,
         &segments(samples, now_s, plot, |sample| sample.percent),
-        (0.20, 0.50, 0.90),
+        curve,
+        SPEED_DASH,
     );
     draw_series(
         cr,
         &segments(samples, now_s, plot, |sample| sample.temp_c),
-        (0.95, 0.75, 0.20),
+        operating,
+        &[],
     );
+
+    // Legend (top-right, over the traces): the line styles spelled out,
+    // so the series are distinguishable without the colours.
+    let legend_right = plot.x + plot.width;
+    cr.set_line_width(1.4);
+    cr.set_source_rgba(operating.0, operating.1, operating.2, operating.3);
+    cr.move_to(legend_right - 34.0, plot.y + 7.0);
+    cr.line_to(legend_right - 23.0, plot.y + 7.0);
+    let _ = cr.stroke();
+    cr.set_source_rgba(text.0, text.1, text.2, text.3);
+    let _ = draw_centered(cr, legend_right - 14.0, plot.y + 10.0, "°C");
+    cr.set_source_rgba(curve.0, curve.1, curve.2, curve.3);
+    cr.set_dash(SPEED_DASH, 0.0);
+    cr.move_to(legend_right - 34.0, plot.y + 17.0);
+    cr.line_to(legend_right - 23.0, plot.y + 17.0);
+    let _ = cr.stroke();
+    cr.set_dash(&[], 0.0);
+    cr.set_source_rgba(text.0, text.1, text.2, text.3);
+    let _ = draw_centered(cr, legend_right - 14.0, plot.y + 20.0, "%");
 }
 
 /// The per-fan history graph. It records from each tick's `FanStatus`
@@ -241,10 +284,7 @@ impl TrendGraph {
         area.set_width_request(220);
         area.set_height_request(90);
         area.set_hexpand(true);
-        area.set_tooltip_text(Some(
-            "last 5 minutes: fan speed % (blue) and governing sensor °C \
-             (yellow), on a shared 0–100 scale; gaps mean unread readings",
-        ));
+        area.set_tooltip_text(Some("Last 5 Minutes: Sensor °C Solid, Fan Speed % Dashed"));
         let history = Rc::new(RefCell::new(FanHistory::default()));
 
         let draw_history = Rc::clone(&history);
@@ -254,6 +294,7 @@ impl TrendGraph {
                 f64::from(width),
                 f64::from(height),
                 &draw_history.borrow(),
+                &GraphPalette::resolve(),
             );
         });
         Self { area, history }

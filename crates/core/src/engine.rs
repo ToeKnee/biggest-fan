@@ -2588,7 +2588,7 @@ mod tests {
         let FanMode::Auto { sensor, .. } = &config.fans[0].mode else {
             panic!("auto expected");
         };
-        // "CPU temperature" (Tctl), not alphabetically-first "CPU CCD 1".
+        // "CPU Package" (Tctl), not alphabetically-first "CPU CCD 1".
         assert_eq!(sensor.as_str(), "k10temp-t1");
     }
 
@@ -2654,9 +2654,9 @@ mod tests {
         assert_eq!(
             names,
             [
-                "CPU temperature",
-                "NCT 6795 SYSTIN",
-                "NVMe drive temperature",
+                "CPU Package",
+                "Motherboard",
+                "NVMe drive",
                 "NCT 6795 Chassis",
             ]
         );

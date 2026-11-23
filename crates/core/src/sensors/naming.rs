@@ -78,9 +78,9 @@ pub enum SensorCategory {
 /// ```
 /// use biggest_fan_core::sensors::{SensorCategory, sensor_category};
 ///
-/// assert_eq!(sensor_category("k10temp", "CPU temperature"), SensorCategory::Cpu);
-/// assert_eq!(sensor_category("nvidia", "GPU temperature"), SensorCategory::Gpu);
-/// assert_eq!(sensor_category("nvml", "NVIDIA GeForce RTX 4070 SUPER temperature"), SensorCategory::Gpu);
+/// assert_eq!(sensor_category("k10temp", "CPU Package"), SensorCategory::Cpu);
+/// assert_eq!(sensor_category("nvidia", "GPU"), SensorCategory::Gpu);
+/// assert_eq!(sensor_category("nvml", "NVIDIA GeForce RTX 4070 SUPER"), SensorCategory::Gpu);
 /// assert_eq!(sensor_category("nct6795", "NCT 6795 Chassis"), SensorCategory::Case);
 /// ```
 #[must_use]
@@ -102,6 +102,9 @@ pub fn sensor_category(chip: &str, display_name: &str) -> SensorCategory {
     } else if name.contains("case") || combined.contains("chassis") || combined.contains("amb") {
         SensorCategory::Case
     } else if chip == "acpitz"
+        || chip == "spd5118"
+        || chip.starts_with("r8169")
+        || chip.starts_with("mt7925")
         || chip.starts_with("nvme")
         || chip.starts_with("iwlwifi")
         || name.contains("nvme")
@@ -128,8 +131,12 @@ pub fn sensor_category(chip: &str, display_name: &str) -> SensorCategory {
 /// ```
 /// use biggest_fan_core::sensors::default_sensor_name;
 ///
-/// assert_eq!(default_sensor_name("k10temp", 1, "Tctl"), "CPU temperature");
-/// assert_eq!(default_sensor_name("k10temp", 3, "Tccd1"), "CPU CCD 1 temperature");
+/// assert_eq!(default_sensor_name("k10temp", 1, "Tctl"), "CPU Package");
+/// assert_eq!(default_sensor_name("k10temp", 3, "Tccd1"), "CPU CCD 1");
+/// assert_eq!(default_sensor_name("spd5118", 1, ""), "RAM");
+/// assert_eq!(default_sensor_name("r8169_0_800:00", 1, ""), "Ethernet card");
+/// assert_eq!(default_sensor_name("mt7925_phy0", 1, ""), "Wi-Fi/Bluetooth card");
+/// assert_eq!(default_sensor_name("it87", 2, "SYSTIN"), "Motherboard");
 /// assert_eq!(default_sensor_name("it87", 2, "MB"), "IT87 MB");
 /// ```
 #[must_use]
@@ -138,23 +145,32 @@ pub fn default_sensor_name(chip: &str, index: usize, raw_label: &str) -> String 
     match chip {
         // AMD Ryzen CPU temperatures reported by k10temp/zenpower.
         "k10temp" | "zenpower" => match label {
-            "Tctl" => "CPU temperature".to_string(),
-            "Tdie" => "CPU die temperature".to_string(),
+            "Tctl" => "CPU Package".to_string(),
+            "Tdie" => "CPU Die".to_string(),
             rest if rest.starts_with("Tccd") => {
                 let ccd = &rest["Tccd".len()..];
                 if ccd.is_empty() {
-                    "CPU CCD temperature".to_string()
+                    "CPU CCD".to_string()
                 } else {
-                    format!("CPU CCD {ccd} temperature")
+                    format!("CPU CCD {ccd}")
                 }
             }
             _ => format!("CPU sensor {index} ({chip})"),
         },
-        "nvidia" => "GPU temperature".to_string(),
-        "nvme" => "NVMe drive temperature".to_string(),
-        chip if chip.starts_with("nvme") => "NVMe drive temperature".to_string(),
-        "acpitz" => "Motherboard temperature".to_string(),
-        chip if chip.starts_with("iwlwifi") => "Wi-Fi card temperature".to_string(),
+        "nvidia" => "GPU".to_string(),
+        "nvme" => "NVMe drive".to_string(),
+        chip if chip.starts_with("nvme") => "NVMe drive".to_string(),
+        "acpitz" => "Motherboard".to_string(),
+        chip if chip.starts_with("iwlwifi") => "Wi-Fi card".to_string(),
+        // DDR5 DIMM SPD hub temperature sensors (one chip per module).
+        "spd5118" => "RAM".to_string(),
+        // Realtek RTL8169-family NICs report their die temperature via
+        // hwmon; the chip name carries the PCI instance (`r8169_0_800:00`).
+        chip if chip.starts_with("r8169") => "Ethernet card".to_string(),
+        // MediaTek MT7925 Wi-Fi 7 + Bluetooth card temperature.
+        chip if chip.starts_with("mt7925") => "Wi-Fi/Bluetooth card".to_string(),
+        // Super-IO "system input" label: the motherboard's own temperature.
+        _ if label == "SYSTIN" => "Motherboard".to_string(),
         _ => {
             let chip = friendly_chip_name(chip);
             if label.is_empty() {

@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Biggest Fan symbolic temperature icon: a thermometer silhouette with
+     two graduation ticks, in the single-colour symbolic style (GTK
+     recolours #2e3436). Used by the sensors panel's empty state. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
+  <g fill="#2e3436">
+    <!-- Tube with a rounded top flowing into the bulb. -->
+    <path d="M6.5 4 a1.5 1.5 0 0 1 3 0 v4.4 a3 3 0 1 1 -3 0 Z"/>
+    <!-- Graduation ticks beside the tube. -->
+    <rect x="4.3" y="5" width="1.2" height="0.9"/>
+    <rect x="4.3" y="7" width="1.2" height="0.9"/>
+  </g>
+</svg>
