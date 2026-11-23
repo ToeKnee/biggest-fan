@@ -146,7 +146,10 @@ and the ramp is asymmetric — up like a rocket, down like a feather. Raising
 speed is the safe direction, so it runs at `max_step_up_per_tick` (0.5 gets
 to full speed within two ticks of a heat spike, without slamming from idle
 in one step); the way back down crawls at `max_step_per_tick`, so fans go
-quiet slowly instead of pumping up and down. Setting either to 0 or 1.0
+quiet slowly instead of pumping up and down. Once a drop is allowed, the fan
+keeps taking feather steps every tick until it reaches the curve, even if
+the sensor sits still; the hold band only re-anchors when the drop lands.
+Setting either to 0 or 1.0
 removes that limit (failsafes bypass both). If an auto fan's sensor stops
 reporting, the fan goes to `fail_safe_speed`.
 

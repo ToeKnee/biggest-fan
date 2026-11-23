@@ -261,8 +261,10 @@ struct FanRuntime {
     /// Speed fraction the engine last commanded (on the previous tick, or
     /// by an immediate mode change in [`Engine::set_fan_mode`]).
     last_commanded: f64,
-    /// Temperature that last *raised* the speed; the speed may not fall
-    /// until the sensor drops `temp_band_c` below this.
+    /// Temperature the hold band is anchored at: set when the speed rises,
+    /// and again when a drop lands on the curve speed (a feather step
+    /// still in progress keeps the anchor). The speed may not fall until
+    /// the sensor drops `temp_band_c` below this.
     hold_temp_c: Option<f64>,
     /// Extra cooling while this fan's GPU card thermal throttles
     /// (GPU coolers only — see [`ThrottleRelief`]).
@@ -549,7 +551,7 @@ impl Engine {
         let mut note = throttle_note;
         let mut governing_temp_c = None;
         let base = entry.runtime.last_commanded;
-        let mut target = base;
+        let target;
         // A fan with a speed floor — an AIO pump that must never stop — can
         // be taken nowhere near the floor by a curve, a slider or a ramp.
         let floor = entry.fan_config.min_speed.clamp(0.0, 1.0);
@@ -594,36 +596,7 @@ impl Engine {
                             self.config_dirty = true;
                         }
                         let desired = relief_speed(curve, temp_c, entry.runtime.throttle_relief);
-                        if desired > base {
-                            target = desired;
-                            entry.runtime.hold_temp_c = Some(temp_c);
-                        } else if desired < base {
-                            // Hold the speed until the sensor falls a full
-                            // band below the temperature that raised it.
-                            let allowed = entry
-                                .runtime
-                                .hold_temp_c
-                                .is_none_or(|hold| temp_c <= hold - hysteresis.temp_band_c);
-                            if allowed {
-                                target = desired;
-                                entry.runtime.hold_temp_c = Some(temp_c);
-                            } else {
-                                target = base;
-                            }
-                        }
-                        // Rate-limit auto changes: up like a rocket, down
-                        // like a feather. Raising speed is the safe
-                        // direction, so it runs at the roomy rocket step;
-                        // the way back down is the feather step, so a fan
-                        // that no longer needs to shout goes quiet slowly
-                        // instead of pumping up and down.
-                        if target > base {
-                            if hysteresis.max_step_up_per_tick > 0.0 {
-                                target = approach(base, target, hysteresis.max_step_up_per_tick);
-                            }
-                        } else if hysteresis.max_step_per_tick > 0.0 {
-                            target = approach(base, target, hysteresis.max_step_per_tick);
-                        }
+                        target = ramp_speed(&mut entry.runtime, base, desired, temp_c, hysteresis);
                     }
                 }
             }
@@ -1485,6 +1458,52 @@ fn approach(from: f64, to: f64, step: f64) -> f64 {
     }
 }
 
+/// One auto tick's speed change: apply the curve's `desired` speed through
+/// the hold band, then rate-limit it — up like a rocket, down like a
+/// feather. Raising speed is the safe direction, so it runs at the roomy
+/// rocket step; the way back down is the feather step, so a fan that no
+/// longer needs to shout goes quiet slowly instead of pumping up and down.
+///
+/// The hold band keeps a raised speed from falling until the sensor drops
+/// `temp_band_c` below the anchor. The anchor moves when the speed rises,
+/// and again when a drop lands on the curve speed — a feather step still
+/// in progress keeps the anchor so the next tick may drop again;
+/// re-anchoring mid-ramp to a sensor that has not moved would fail its own
+/// band check and stall the fan above its curve.
+fn ramp_speed(
+    runtime: &mut FanRuntime,
+    base: f64,
+    desired: f64,
+    temp_c: f64,
+    hysteresis: HysteresisConfig,
+) -> f64 {
+    let mut target = base;
+    if desired > base {
+        target = desired;
+        runtime.hold_temp_c = Some(temp_c);
+    } else if desired < base {
+        // Hold the speed until the sensor falls a full band below the
+        // temperature the hold is anchored at.
+        let allowed = runtime
+            .hold_temp_c
+            .is_none_or(|hold| temp_c <= hold - hysteresis.temp_band_c);
+        if allowed {
+            target = desired;
+        }
+    }
+    if target > base {
+        if hysteresis.max_step_up_per_tick > 0.0 {
+            target = approach(base, target, hysteresis.max_step_up_per_tick);
+        }
+    } else if hysteresis.max_step_per_tick > 0.0 {
+        target = approach(base, target, hysteresis.max_step_per_tick);
+    }
+    if desired < base && target <= desired {
+        runtime.hold_temp_c = Some(temp_c);
+    }
+    target
+}
+
 /// The runtime preset relief for a throttled GPU cooler: a curve that is
 /// exactly a quiet or balanced preset runs the preset one space up;
 /// anything else (a custom curve, or the hardest preset) gets no runtime
@@ -1909,6 +1928,57 @@ mod tests {
         assert!((report.fans[0].commanded_speed - 0.3).abs() < 1e-9);
         let report = engine.tick().expect("tick 4");
         assert!((report.fans[0].commanded_speed - 0.2).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_slow_feather_step_falls_every_tick_until_it_reaches_the_curve() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        fixture(dir.path());
+        let mut engine = engine_with(
+            dir.path(),
+            crate::config::model::HysteresisConfig {
+                temp_band_c: 2.0,
+                max_step_per_tick: 0.01, // a very slow feather
+                max_step_up_per_tick: 1.0,
+            },
+        );
+
+        // 79 °C on the fixture curve wants 0.98; the rocket step gets
+        // there in one tick, anchoring the hold band at 79 °C.
+        set_cpu_temp(dir.path(), 79_000);
+        let report = engine.tick().expect("tick 1");
+        assert!((report.fans[0].commanded_speed - 0.98).abs() < 1e-9);
+
+        // 52 °C wants 0.44 — far below the 79 °C anchor, so the drop is
+        // allowed. The feather must fall 0.01 every tick all the way to
+        // the curve; re-anchoring the hold mid-ramp used to fail the next
+        // tick's band check against a sensor that never moved, stalling
+        // the fan at 0.97.
+        set_cpu_temp(dir.path(), 52_000);
+        let mut previous = 0.98;
+        let mut speed = 0.98;
+        for tick in 2..=80 {
+            speed = engine.tick().expect("cooling tick").fans[0].commanded_speed;
+            if (speed - 0.44).abs() < 1e-9 {
+                break;
+            }
+            assert!(
+                (previous - speed - 0.01).abs() < 1e-9,
+                "tick {tick}: expected one feather step down from {previous}, got {speed}"
+            );
+            previous = speed;
+        }
+        assert!(
+            (speed - 0.44).abs() < 1e-9,
+            "the feather must reach the curve, not stall inside the band"
+        );
+
+        // The hold band still works once the fan is on the curve: 51 °C
+        // is inside 2 °C of the 52 °C the drop landed at, so the speed
+        // holds instead of chasing the sensor down.
+        set_cpu_temp(dir.path(), 51_000);
+        let report = engine.tick().expect("held tick");
+        assert!((report.fans[0].commanded_speed - 0.44).abs() < 1e-9);
     }
 
     #[test]
