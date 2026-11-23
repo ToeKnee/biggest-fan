@@ -1,5 +1,6 @@
 - All comments should be relevant to the current state of the app, not how it used to be or old libraries.
   It is okay to refernce bugs/work arounds in other crates or products.
+- Prefer one agent only. Sub-agents work, but they are very slow as they have to swap context on this machine too often.
 - Safety is important
 - Code should be reliable
   - NEVER use `allow`, if you have to allow something, use `expect` with a reason
@@ -7,6 +8,7 @@
   - Avoid using unwrap where possible
   - Keep dependancies up to date
   - `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+  - Avoid unsafe code where possible
 - Code should be readable
   - Use human readable variable names
   - Structure the code in a way that is easy to understand
@@ -28,4 +30,4 @@
 - Update the Readme.md with developer focused information.
 - Also check `rustfmt --edition 2024`
 - Keep crates up to date!
-- Use GTK as the GUI toolkit
+- Use GTK/libadwaita as the GUI toolkit
