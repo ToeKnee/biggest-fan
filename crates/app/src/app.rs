@@ -3,7 +3,7 @@
 
 use crate::case_view;
 use crate::dbus;
-use crate::fan_controls::{FAN_FLOW_CLASS, FAN_TILE_CSS, FanControls};
+use crate::fan_controls::{FAN_TILE_CSS, FanControls, escape_markup};
 use crate::stress;
 use biggest_fan_core as core;
 use glib::{ControlFlow, Propagation, SourceId};
@@ -173,14 +173,60 @@ pub fn run(
     code
 }
 
+/// The section heading class: larger bold text with a rule underneath.
+///
+/// Sections — Case, Fans, Sensors, Stress lab — read as separate blocks
+/// down their columns instead of one long stack, with each body (see
+/// [`SECTION_CLASS`]) sitting indented under its heading.
+pub const SECTION_TITLE_CLASS: &str = "section-title";
+/// The section body class: content indented under its heading.
+pub const SECTION_CLASS: &str = "section";
+
+/// The stylesheet the section classes expect, loaded next to the fan-tile
+/// one. The title rule spans the panel width; the top margin separates
+/// sections, except for the first heading in a column which needs none.
+const SECTION_CSS: &str = "
+.section-title {
+    margin-top: 16px;
+    padding-bottom: 4px;
+    border-bottom: 1px solid alpha(@theme_fg_color, 0.35);
+}
+
+.section-title:first-child {
+    margin-top: 0;
+}
+
+.section {
+    padding-left: 8px;
+}
+";
+
+/// A section heading label: Pango does the larger bold text, the
+/// stylesheet the spacing and the rule underneath.
+#[must_use]
+pub fn section_title(text: &str) -> Label {
+    let title = Label::builder()
+        .label(format!(
+            "<span size=\"large\"><b>{}</b></span>",
+            escape_markup(text)
+        ))
+        .use_markup(true)
+        .xalign(0.0)
+        .build();
+    title.add_css_class(SECTION_TITLE_CLASS);
+    title
+}
+
 /// Installs the app's stylesheet (the fan-row tiles from
-/// `fan_controls::FAN_TILE_CSS`) on the display this window lives on.
+/// `fan_controls::FAN_TILE_CSS` and the section classes defined above)
+/// on the display this window lives on.
 fn install_stylesheet() {
     let provider = gtk4::CssProvider::new();
     // A broken selector would be reported by GTK itself; the rows stay
     // usable plain either way. (`load_from_data`; `load_from_string`
     // would need the gtk `v4_12` feature.)
     provider.load_from_data(FAN_TILE_CSS);
+    provider.load_from_data(SECTION_CSS);
     // The window exists before this runs, so a display always does.
     if let Some(display) = gtk4::gdk::Display::default() {
         gtk4::style_context_add_provider_for_display(
@@ -201,6 +247,37 @@ fn build_header_bar() -> (HeaderBar, Button, Button) {
     header.pack_end(&save_button);
     header.pack_end(&detect_button);
     (header, save_button, detect_button)
+}
+
+/// The left column: the case drawing under a "Case" heading with a
+/// short legend, inside its own scrolled pane. Returns the pane and the
+/// drawing area the fan rows repaint.
+fn build_left_column(engine_rc: &Rc<RefCell<core::Engine>>) -> (ScrolledWindow, gtk4::DrawingArea) {
+    let case_area = case_view::install(Rc::clone(engine_rc));
+    let legend = Label::builder()
+        .label(
+            "Circles: blue intake · red exhaust · yellow internal.\nA rectangle is a whole graphics card.\nThe wedge shows commanded speed.",
+        )
+        .wrap(true)
+        .max_width_chars(38)
+        .build();
+    let left = GtkBox::new(Orientation::Vertical, 8);
+    // Each column keeps breathing room inside its pane and a wide gutter
+    // around the divider: content touching the split reads as cut off.
+    left.set_margin_start(12);
+    left.set_margin_end(24);
+    left.set_margin_bottom(8);
+    left.append(&section_title("Case"));
+    let case_section = GtkBox::new(Orientation::Vertical, 8);
+    case_section.add_css_class(SECTION_CLASS);
+    case_section.append(&case_area);
+    case_section.append(&legend);
+    left.append(&case_section);
+    let left_scroll = ScrolledWindow::builder()
+        .hscrollbar_policy(PolicyType::Never)
+        .child(&left)
+        .build();
+    (left_scroll, case_area)
 }
 
 fn build_window(
@@ -225,21 +302,7 @@ fn build_window(
     window.set_titlebar(Some(&header));
 
     // Left: the case drawing plus a short legend.
-    let case_area = case_view::install(Rc::clone(engine_rc));
-    let legend = Label::builder()
-        .label(
-            "Circles: blue intake · red exhaust · yellow internal.\nA rectangle is a whole graphics card.\nThe wedge shows commanded speed.",
-        )
-        .wrap(true)
-        .max_width_chars(38)
-        .build();
-    let left = GtkBox::new(Orientation::Vertical, 8);
-    left.append(&case_area);
-    left.append(&legend);
-    let left_scroll = ScrolledWindow::builder()
-        .hscrollbar_policy(PolicyType::Never)
-        .child(&left)
-        .build();
+    let (left_scroll, case_area) = build_left_column(engine_rc);
 
     // Bottom bar: refresh-rate control and the live status line. The
     // status line caps its requested width and ellipsizes long messages
@@ -254,6 +317,9 @@ fn build_window(
 
     // Right: fan control rows and the sensor list.
     let right = GtkBox::new(Orientation::Vertical, 12);
+    right.set_margin_start(24);
+    right.set_margin_end(12);
+    right.set_margin_bottom(8);
     let fan_panel = append_fans_panel(&right, engine_rc, &case_area, client);
     let sensor_panel = append_sensors_panel(&right, engine_rc, &status_label);
     let stress = wire_stress_panel(&window, &right);
@@ -535,23 +601,23 @@ fn append_fans_panel(
     case_area: &gtk4::DrawingArea,
     client: &dbus::Client,
 ) -> FanPanel {
-    panel.append(
-        &Label::builder()
-            .label("<b>Fans</b>")
-            .use_markup(true)
-            .xalign(0.0)
-            .build(),
-    );
+    panel.append(&section_title("Fans"));
     // The fan rows are flow tiles: one per line on a 1080p-sized panel,
     // two side by side once the panel is wide enough for a 4K screen.
     // Each tile's minimum content width (the two graphs side by side)
     // is what decides where the flow breaks.
+    let section = GtkBox::new(Orientation::Vertical, 8);
+    section.add_css_class(SECTION_CLASS);
     let fans_flow = FlowBox::new();
-    fans_flow.add_css_class(FAN_FLOW_CLASS);
+    // The gap between tiles (and between tiles and the section edge):
+    // the flow's own spacing, not child padding — padding on the flow's
+    // cells proved too subtle next to the tiled borders.
+    fans_flow.set_row_spacing(24);
+    fans_flow.set_column_spacing(16);
     fans_flow.set_min_children_per_line(1);
     fans_flow.set_max_children_per_line(2);
     fans_flow.set_selection_mode(gtk4::SelectionMode::None);
-    panel.append(&fans_flow);
+    section.append(&fans_flow);
     let fan_ids_and_names = engine_rc.borrow().managed_fans();
     let mut fan_controls = Vec::new();
     for (fan_id, name) in fan_ids_and_names {
@@ -570,7 +636,8 @@ fn append_fans_panel(
     add_row.append(&Label::builder().label("Add:").build());
     add_row.append(&unclaimed_combo);
     add_row.append(&add_button);
-    panel.append(&add_row);
+    section.append(&add_row);
+    panel.append(&section);
     let panel = FanPanel {
         controls: fan_controls,
         fans_flow,
@@ -606,13 +673,9 @@ fn append_sensors_panel(
     engine_rc: &Rc<RefCell<core::Engine>>,
     status: &Label,
 ) -> Rc<SensorPanel> {
-    panel.append(
-        &Label::builder()
-            .label("<b>Sensors</b>")
-            .use_markup(true)
-            .xalign(0.0)
-            .build(),
-    );
+    panel.append(&section_title("Sensors"));
+    let section = GtkBox::new(Orientation::Vertical, 8);
+    section.add_css_class(SECTION_CLASS);
     let sensor_list = ListBox::new();
     sensor_list.set_selection_mode(gtk4::SelectionMode::None);
     let mut rows = BTreeMap::new();
@@ -647,11 +710,12 @@ fn append_sensors_panel(
             },
         );
     }
-    panel.append(&sensor_list);
+    section.append(&sensor_list);
     let reveal = Button::builder()
         .tooltip_text("show the hidden sensors again, so they can be kept visible")
         .build();
-    panel.append(&reveal);
+    section.append(&reveal);
+    panel.append(&section);
     let sensor_panel = Rc::new(SensorPanel {
         engine: Rc::clone(engine_rc),
         status: status.clone(),

@@ -344,7 +344,10 @@ hands the fans back too). Only stop the service when another controller
 joins the service on the system bus, mirrors the _service's_ config
 (which is the live one), and forwards mode, sensor and curve preset, fan
 name, tach correction, speed floor, detection, refresh-rate and
-save changes to it over D-Bus. Each fan row can rename the fan inline, pick
+save changes to it over D-Bus. The window is laid out as four sections
+under ruled headings — **Case** (the drawing and its legend) on the left,
+**Fans**, **Sensors** and **Stress lab** down the right — each section's
+content indented under its heading. Each fan row can rename the fan inline, pick
 mode, sensor and a preset curve (Quiet, Balanced, Performance). Every Auto
 fan's curve is drawn as a small graph — speed against sensor temperature —
 with a dot at the speed and temperature the fan is actually at right now

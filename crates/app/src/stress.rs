@@ -11,6 +11,7 @@
 //! guard trips, the thread wraps up, and the status bar at the bottom
 //! of the window says which temperature hit the limit.
 
+use crate::app::{SECTION_CLASS, section_title};
 use biggest_fan_stress_lab::{cpu, gpu, thermal};
 use gtk4::glib::{self, ControlFlow};
 use gtk4::prelude::*;
@@ -252,14 +253,10 @@ fn collect(
 /// to the window's status bar through [`StressPanel::status_line`].
 #[must_use]
 pub fn append_stress_panel(panel: &GtkBox) -> Rc<StressPanel> {
-    panel.append(
-        &Label::builder()
-            .label("<b>Stress lab</b>")
-            .use_markup(true)
-            .xalign(0.0)
-            .build(),
-    );
-    panel.append(
+    panel.append(&section_title("Stress lab"));
+    let section = GtkBox::new(Orientation::Vertical, 8);
+    section.add_css_class(SECTION_CLASS);
+    section.append(
         &Label::builder()
             .label(
                 "Heat up the machine and watch the fans respond; a thermal guard stops the \
@@ -323,7 +320,8 @@ pub fn append_stress_panel(panel: &GtkBox) -> Rc<StressPanel> {
         }
     });
 
-    panel.append(&row);
+    section.append(&row);
+    panel.append(&section);
 
     // Half-second status tick: elapsed time while a stressor runs, and the
     // result once its thread has wrapped up. Like the control-loop tick,

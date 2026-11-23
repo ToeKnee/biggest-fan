@@ -35,23 +35,15 @@ const SHAPE_RECTANGLE: &str = "rectangle";
 /// reads softly on both light and dark themes.
 pub const FAN_TILE_CLASS: &str = "fan-tile";
 
-/// Style class for the panel container that lays the fan tiles out as
-/// a flow: one tile per line on a 1080p-sized panel, two side by side
-/// once it is wide enough (the two graphs per tile set the break).
-pub const FAN_FLOW_CLASS: &str = "fan-flow";
-
-/// The stylesheet [`FAN_TILE_CLASS`] and [`FAN_FLOW_CLASS`] expect,
-/// installed on the GUI's display when a window is built.
+/// The stylesheet [`FAN_TILE_CLASS`] expects, installed on the GUI's
+/// display when a window is built. The gap between tiles is the flow's
+/// own row/column spacing, set in `app::append_fans_panel`.
 pub const FAN_TILE_CSS: &str = "
 .fan-tile {
     background-color: alpha(@theme_fg_color, 0.05);
     border: 1px solid alpha(@theme_fg_color, 0.16);
     border-radius: 10px;
     padding: 10px 12px;
-}
-
-.fan-flow > flowboxchild {
-    padding: 6px;
 }
 ";
 
