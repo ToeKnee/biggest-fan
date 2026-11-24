@@ -3,9 +3,11 @@ resolver = "3"
 members = ["crates/core", "crates/app", "crates/stress-lab"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.9.0"
 edition = "2024"
 license = "GPL-3.0-or-later"
+authors = ["Anthony Batchelor <tony@ynottony.net>"]
+keywords = ["fan", "temperature", "cooling", "lm-sensors"]
 
 [workspace.dependencies]
 biggest-fan-core = { path = "crates/core" }

@@ -4,6 +4,8 @@ description = "Sensor discovery, fan control and the control loop behind Biggest
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+authors.workspace = true
+keywords.workspace = true
 
 [dependencies]
 nvml-wrapper = "0.13.0"

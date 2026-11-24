@@ -4,6 +4,8 @@ description = "Developer lab: AVX-512 CPU and Vulkan GPU stressors plus a hardwa
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+authors.workspace = true
+keywords.workspace = true
 
 [[bin]]
 name = "stress-lab"
