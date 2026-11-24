@@ -67,8 +67,8 @@ impl Default for HysteresisConfig {
     fn default() -> Self {
         Self {
             temp_band_c: 2.0,
-            max_step_per_tick: 0.1,
-            max_step_up_per_tick: 0.5,
+            max_step_per_tick: 0.01,
+            max_step_up_per_tick: 1.0,
         }
     }
 }
@@ -150,7 +150,7 @@ impl Default for AppConfig {
         Self {
             poll_interval_ms: 1000,
             fail_safe_speed: 1.0,
-            quiet: false,
+            quiet: true,
             hysteresis: HysteresisConfig::default(),
             sensor_names: BTreeMap::new(),
             hidden_sensors: Vec::new(),
